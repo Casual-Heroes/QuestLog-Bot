@@ -1,0 +1,82 @@
+# Ignore Python compiled files
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+.claude
+
+# Ignore Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+
+# Ignore temporary files
+*.temp
+*.tmp
+*.log
+*.bak
+*.swp
+log
+
+# Static vendor files
+staticfiles/admin/LICENSE*
+staticfiles/admin/README.md
+staticfiles/admin/img/README.txt
+staticfiles/admin/img/LICENSE
+staticfiles/admin/js/vendor/jquery/LICENSE.txt
+staticfiles/admin/js/vendor/select2/LICENSE.md
+staticfiles/admin/js/vendor/xregexp/LICENSE.txt
+staticfiles/admin/css/vendor/select2/LICENSE-SELECT2.md
+
+# Custom Files and Folders to Ignore
+find_corrupted_members.py
+fix_corrupted_members.py
+purge_corrupted_import.py
+RATE_LIMIT_FIXES.md
+RATE_LIMIT_FIXES.md
+cleanup_duplicate_xp.py
+XP_SYSTEM_SUMMARY.md
+test_xp_import.py
+TICKETING_SYSTEM_SPEC.md
+/Archive
+/installscripts
+/migrations
+/docs
+/auth
+
+# Ignore generated files (e.g., from web scraping or data processing)
+*.db
+*.png
+*.jpg
+*.xlsx
+*.csv
+*.jpeg
+*.svg
+*.json
+*.gif
+*.css
+*.js
+*.download
+*.webp
+*.ipynb
+*_files/ 
+*db.sqlite3
+.git_backup/
+testapi.py
+testampsettings.py
+teststats.py
+.settings.py
+**/settings.py
+**/wsgi.py
+*.sql
+
+# Ignore environments
+.env
+env/
+venv/
+.venv/
+chwebsiteprj/
+.git_backup/
+/hosting
+/wardenprj
+/warden
+

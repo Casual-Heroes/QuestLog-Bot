@@ -1,0 +1,23 @@
+# Warden Bot - Requirements
+# Python 3.10+ required
+
+# Discord
+py-cord>=2.6.0
+
+# Database
+SQLAlchemy>=2.0.0
+mysql-connector-python>=8.0.0
+
+# Environment
+python-dotenv>=1.0.0
+
+# Payments (optional - for premium subscriptions)
+stripe>=7.0.0
+
+# Utilities
+aiohttp>=3.9.0
+
+# Development (optional)
+# pytest>=7.0.0
+# black>=24.0.0
+# ruff>=0.1.0
