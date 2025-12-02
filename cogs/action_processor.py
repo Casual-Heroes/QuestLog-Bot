@@ -224,6 +224,10 @@ class ActionProcessorCog(commands.Cog):
             return await self._action_force_feature(guild, payload)
         elif action_type == ActionType.CLEAR_FEATURED:
             return await self._action_clear_featured(guild, payload)
+        elif action_type == ActionType.TEST_CHANNEL_EMBED:
+            return await self._action_test_channel_embed(guild, payload)
+        elif action_type == ActionType.TEST_FORUM_EMBED:
+            return await self._action_test_forum_embed(guild, payload)
         elif action_type == ActionType.CHECK_GAMES:
             return await self._action_check_games(guild, payload)
 
@@ -792,6 +796,67 @@ class ActionProcessorCog(commands.Cog):
             "cleared": cleared_count,
             "messages_deleted": deleted_messages
         }
+
+    async def _action_test_channel_embed(self, guild: discord.Guild, payload: dict) -> dict:
+        """Send a test embed to the selected test channel."""
+        import discord
+
+        # Get channel_id from payload (sent from website)
+        channel_id = payload.get('channel_id')
+        if not channel_id:
+            raise ValueError("No channel_id provided in payload")
+
+        channel = self.bot.get_channel(int(channel_id))
+        if not channel:
+            raise ValueError(f"Channel {channel_id} not found")
+
+        # Create test embed
+        embed = discord.Embed(
+            title="🧪 Test Channel Embed",
+            description="This is a test of the feature announcement channel embed. If you can see this, the channel embed is working correctly!",
+            color=0x00FF00,  # Green
+            timestamp=discord.utils.utcnow()
+        )
+        embed.add_field(name="Status", value="✅ Working", inline=True)
+        embed.add_field(name="Channel", value=channel.mention, inline=True)
+        embed.set_footer(text="Test triggered from website")
+
+        await channel.send(embed=embed)
+
+        return {"success": True, "message": "Test embed sent to channel"}
+
+    async def _action_test_forum_embed(self, guild: discord.Guild, payload: dict) -> dict:
+        """Send a test embed to the selected test forum channel."""
+        import discord
+
+        # Get channel_id from payload (sent from website)
+        channel_id = payload.get('channel_id')
+        if not channel_id:
+            raise ValueError("No channel_id provided in payload")
+
+        forum = self.bot.get_channel(int(channel_id))
+        if not forum:
+            raise ValueError(f"Channel {channel_id} not found")
+
+        # Create test embed
+        embed = discord.Embed(
+            title="🧪 Test Forum Embed",
+            description="This is a test of the intro forum embed. If you can see this, the forum embed is working correctly!",
+            color=0xFFFF00,  # Yellow
+            timestamp=discord.utils.utcnow()
+        )
+        embed.add_field(name="Status", value="✅ Working", inline=True)
+        embed.add_field(name="Forum", value=forum.mention, inline=True)
+        embed.set_footer(text="Test triggered from website")
+
+        # For forums, we need to create a thread with the embed
+        thread = await forum.create_thread(
+            name="Test Forum Embed",
+            content="Test embed from website",
+            embed=embed
+        )
+
+        return {"success": True, "message": "Test embed sent to forum"}
 
     async def _action_check_games(self, guild: discord.Guild, payload: dict) -> dict:
         """Manually trigger game discovery check using all enabled search configs."""

@@ -111,6 +111,8 @@ class ActionType(str, Enum):
     # Discovery/Self-Promo
     FORCE_FEATURE = "force_feature"
     CLEAR_FEATURED = "clear_featured"
+    TEST_CHANNEL_EMBED = "test_channel_embed"
+    TEST_FORUM_EMBED = "test_forum_embed"
     CHECK_GAMES = "check_games"
 
     # Flair Management
@@ -590,6 +592,7 @@ class FeaturedPool(Base):
     # Original message info (for reference)
     original_message_id = Column(BigInteger, nullable=True)
     original_channel_id = Column(BigInteger, nullable=True)
+    forum_thread_id = Column(BigInteger, nullable=True)  # For forum-based entries
 
     # Pool management
     entered_at = Column(BigInteger, default=lambda: int(time.time()))
@@ -608,22 +611,32 @@ class FeaturedPool(Base):
 
 
 class FeaturedCreator(Base):
-    """Permanent record of featured creators for public display (Hall of Fame)."""
+    """
+    Global record of featured creators for public display (Hall of Fame).
+    One entry per Discord user, regardless of how many guilds they're in.
+    """
     __tablename__ = "featured_creators"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    guild_id = Column(BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"))
-    user_id = Column(BigInteger, nullable=False)
+    user_id = Column(BigInteger, primary_key=True)  # Discord user ID (global unique)
+
+    # Multi-guild tracking
+    guilds = Column(Text, nullable=False, default='[]')  # JSON array of guild_ids: [123, 456, 789]
+    primary_guild_id = Column(BigInteger, nullable=True)  # Which guild's intro to display
+    auto_select_primary = Column(Boolean, default=True)  # Auto-update primary to most recent?
+
+    # Activity tracking
+    is_active = Column(Boolean, default=True)  # False if they left all guilds
+    inactive_since = Column(BigInteger, nullable=True)  # Timestamp when they left all guilds
 
     # Discord profile data (cached for display)
     username = Column(String(255))
     display_name = Column(String(255))
     avatar_url = Column(Text)  # Discord profile picture
 
-    # Featured data
-    first_featured_at = Column(BigInteger)  # When they were first featured
-    last_featured_at = Column(BigInteger)  # Most recent feature
-    times_featured = Column(Integer, default=1)  # How many times featured
+    # Featured data - GLOBAL across all guilds
+    first_featured_at = Column(BigInteger)  # When they were first featured (any guild)
+    last_featured_at = Column(BigInteger)  # Most recent feature (any guild)
+    times_featured_total = Column(Integer, default=0)  # Total times featured across ALL guilds
 
     # Social links (from their featured pool entries)
     twitch_url = Column(Text, nullable=True)
@@ -631,15 +644,16 @@ class FeaturedCreator(Base):
     twitter_url = Column(Text, nullable=True)
     tiktok_url = Column(Text, nullable=True)
     instagram_url = Column(Text, nullable=True)
+    bsky_url = Column(Text, nullable=True)
     other_links = Column(Text, nullable=True)  # JSON array of other links
 
     # Content/bio
     bio = Column(Text, nullable=True)  # Latest featured content/bio
 
-    # Source tracking (new forum-based system)
+    # Source tracking (forum-based system)
     source = Column(String(50), default='forum')  # Source: 'forum', 'selfpromo', 'manual'
-    forum_thread_id = Column(BigInteger, nullable=True)  # Discord forum thread ID
-    forum_tag_name = Column(String(255), nullable=True)  # Forum tag when featured (e.g., Self-Promo Intro)
+    forum_thread_id = Column(BigInteger, nullable=True)  # Discord forum thread ID (from primary guild)
+    forum_tag_name = Column(String(255), nullable=True)  # Forum tag when featured
 
     # Discord connected accounts (from Discord API)
     discord_connections = Column(Text, nullable=True)  # JSON: {platform: {type, id, name, verified}}
@@ -649,10 +663,9 @@ class FeaturedCreator(Base):
     updated_at = Column(BigInteger, default=lambda: int(time.time()))
 
     __table_args__ = (
-        UniqueConstraint('guild_id', 'user_id', name='unique_guild_user'),
-        Index("idx_featured_creators_guild", "guild_id"),
         Index("idx_featured_creators_user", "user_id"),
         Index("idx_featured_creators_last", "last_featured_at"),
+        Index("idx_featured_creators_active", "is_active"),
     )
 
 
@@ -662,8 +675,10 @@ class DiscoveryConfig(Base):
 
     guild_id = Column(BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"), primary_key=True)
 
-    # Feature toggle
-    enabled = Column(Boolean, default=False)
+    # Feature toggles
+    enabled = Column(Boolean, default=False)  # Master toggle for discovery system
+    channel_enabled = Column(Boolean, default=True)  # Enable channel-based discovery
+    forum_enabled = Column(Boolean, default=False)  # Enable forum-based discovery
 
     # Channel configuration
     selfpromo_channel_id = Column(BigInteger, nullable=True)  # Where users post (bot ignores regular posts)

@@ -55,7 +55,7 @@ def get_today_start_timestamp() -> int:
 
 def extract_links(text: str) -> list:
     """Extract all URLs from text."""
-    url_pattern = re.compile(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+')
+    url_pattern = re.compile(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+/]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+')
     return url_pattern.findall(text)
 
 
@@ -77,6 +77,8 @@ def detect_platform(url: str) -> str:
         return 'tiktok'
     elif 'instagram.com' in domain:
         return 'instagram'
+    elif 'bsky.app' in domain:
+        return 'bsky'
     elif 'discord.gg' in domain or 'discord.com/invite' in url_lower:
         return 'discord'
     elif 'github.com' in domain:
@@ -85,6 +87,84 @@ def detect_platform(url: str) -> str:
         return 'reddit'
     else:
         return 'other'
+
+
+def get_or_create_global_creator(session, user_id: int, guild_id: int):
+    """
+    Get or create a global FeaturedCreator entry for a user.
+
+    Returns:
+        tuple: (creator, is_new) where is_new=True if created, False if existed
+    """
+    creator = session.get(FeaturedCreator, user_id)
+
+    if creator:
+        # Add guild if not already in list
+        guilds = json.loads(creator.guilds) if creator.guilds else []
+        if guild_id not in guilds:
+            guilds.append(guild_id)
+            creator.guilds = json.dumps(guilds)
+
+            # Auto-update primary to most recent if enabled
+            if creator.auto_select_primary:
+                creator.primary_guild_id = guild_id
+
+        # Reactivate if they were inactive
+        if not creator.is_active:
+            creator.is_active = True
+            creator.inactive_since = None
+
+        return creator, False  # exists
+    else:
+        # Create new global creator
+        now = int(time.time())
+        creator = FeaturedCreator(
+            user_id=user_id,
+            guilds=json.dumps([guild_id]),
+            primary_guild_id=guild_id,
+            auto_select_primary=True,
+            is_active=True,
+            inactive_since=None,
+            times_featured_total=0,
+            created_at=now,
+            updated_at=now
+        )
+        session.add(creator)
+        return creator, True  # new
+
+
+def remove_guild_from_creator(session, user_id: int, guild_id: int):
+    """
+    Remove a guild from a creator's guilds list.
+    If no guilds remain, mark creator as inactive.
+
+    Returns:
+        bool: True if creator marked inactive, False otherwise
+    """
+    creator = session.get(FeaturedCreator, user_id)
+
+    if not creator:
+        return False
+
+    # Remove guild from list
+    guilds = json.loads(creator.guilds) if creator.guilds else []
+    if guild_id in guilds:
+        guilds.remove(guild_id)
+        creator.guilds = json.dumps(guilds)
+
+        # If no guilds remain, mark as inactive
+        if len(guilds) == 0:
+            creator.is_active = False
+            creator.inactive_since = int(time.time())
+            logger.info(f"Marked creator {user_id} as inactive (no guilds remaining)")
+            return True
+        else:
+            # If they had auto-select and lost their primary guild, pick a new one
+            if creator.auto_select_primary and creator.primary_guild_id == guild_id:
+                creator.primary_guild_id = guilds[0]  # Pick first remaining guild
+                logger.info(f"Updated primary guild for creator {user_id} to {guilds[0]}")
+
+    return False
 
 
 class DiscoveryCog(commands.Cog):
@@ -97,6 +177,7 @@ class DiscoveryCog(commands.Cog):
         self.forum_scanner_task.start()
         self.creator_of_week_task.start()
         self.creator_of_month_task.start()
+        self.cleanup_inactive_creators_task.start()
 
     def cog_unload(self):
         self.featured_selection_task.cancel()
@@ -104,6 +185,7 @@ class DiscoveryCog(commands.Cog):
         self.forum_scanner_task.cancel()
         self.creator_of_week_task.cancel()
         self.creator_of_month_task.cancel()
+        self.cleanup_inactive_creators_task.cancel()
 
     # ========== EVENT LISTENERS ==========
 
@@ -235,16 +317,8 @@ class DiscoveryCog(commands.Cog):
                     delete_after=20
                 )
 
-                # Quick Discord embed feature (Discord-only, doesn't add to website)
-                if config.selfpromo_quick_feature:
-                    await self._post_quick_feature_embed(
-                        guild=message.guild,
-                        channel=message.channel,
-                        author=message.author,
-                        content=content,
-                        link_url=link_url,
-                        platform=platform
-                    )
+                # Removed deprecated quick feature - now only adds to pool
+                # Features will only be shown when selected from the pool
 
                 logger.info(f"Added {message.author} to featured pool in guild {message.guild.id} (cost: {token_cost} hero_tokens)")
 
@@ -271,36 +345,115 @@ class DiscoveryCog(commands.Cog):
             links['tiktok'] = link_url
         elif 'instagram.com' in link_lower:
             links['instagram'] = link_url
+        elif 'bsky.app' in link_lower:
+            links['bsky'] = link_url
         else:
             links['other'] = link_url
 
         return links
 
     async def _add_to_featured_creators_hall(self, guild_id: int, member: discord.Member, winner: FeaturedPool):
-        """Add or update creator in permanent featured creators list."""
+        """Add or update creator in permanent featured creators list (GLOBAL model)."""
         with db_session_scope() as session:
             now = int(time.time())
 
-            # Check if creator already exists
-            creator = session.query(FeaturedCreator).filter_by(
-                guild_id=guild_id,
-                user_id=member.id
-            ).first()
+            # Get or create global creator entry
+            creator, is_new = get_or_create_global_creator(session, member.id, guild_id)
 
             # Extract social links from winner.link_url
             social_links = self._parse_social_links(winner.link_url)
 
-            if creator:
-                # Update existing creator
-                creator.last_featured_at = now
-                creator.times_featured += 1
-                creator.avatar_url = member.display_avatar.url
-                creator.display_name = member.display_name
-                creator.username = member.name
-                creator.bio = winner.content or creator.bio
-                creator.updated_at = now
+            # Update creator data
+            creator.last_featured_at = now
+            creator.times_featured_total += 1  # GLOBAL count
+            creator.avatar_url = member.display_avatar.url
+            creator.display_name = member.display_name
+            creator.username = member.name
+            creator.bio = winner.content or creator.bio
+            creator.updated_at = now
 
-                # Update social links (only if new ones provided)
+            # Set forum_thread_id if this was a forum post
+            if hasattr(winner, 'forum_thread_id') and winner.forum_thread_id:
+                creator.forum_thread_id = winner.forum_thread_id
+                creator.source = 'forum'
+
+            # Set first_featured_at if new
+            if is_new:
+                creator.first_featured_at = now
+
+            # Update social links (only if new ones provided)
+            if social_links.get('twitch'):
+                creator.twitch_url = social_links['twitch']
+            if social_links.get('youtube'):
+                creator.youtube_url = social_links['youtube']
+            if social_links.get('twitter'):
+                creator.twitter_url = social_links['twitter']
+            if social_links.get('tiktok'):
+                creator.tiktok_url = social_links['tiktok']
+            if social_links.get('instagram'):
+                creator.instagram_url = social_links['instagram']
+            if social_links.get('bsky'):
+                creator.bsky_url = social_links['bsky']
+            if social_links.get('other'):
+                creator.other_links = social_links['other']
+
+            session.commit()
+
+            action = "Added" if is_new else "Updated"
+            logger.info(f"[Discovery] [guild_id:{guild_id}] {action} {member.display_name} in GLOBAL featured creators hall (total: {creator.times_featured_total})")
+
+    # async def edit_featured_creators_hall(self, guild_id: int, member: discord.Member, winner: FeaturedPool):
+    #     """Add or update creator in permanent featured creators list."""
+    #     with db_session_scope() as session:
+    #         now = int(time.time())
+
+    #         # Check if creator already exists
+    #         creator = session.query(FeaturedCreator).filter_by(
+    #             guild_id=guild_id,
+    #             user_id=member.id
+    #         ).first()
+
+    #         # Extract social links from winner.link_url
+    #         social_links = self._parse_social_links(winner.link_url)
+
+    #         if creator:
+    #             # Update existing creator
+    #             creator.last_featured_at = now
+    #             creator.times_featured += 1
+          
+
+    @commands.Cog.listener()
+    async def on_message_edit(self, before: discord.Message, after: discord.Message):
+        """
+        Update creator info when they edit their forum intro post (GLOBAL model).
+        """
+        # Ignore bots and non-forum threads
+        if after.author.bot or not after.guild or not isinstance(after.channel, discord.Thread):
+            return
+
+        try:
+            # Check if this is a forum thread
+            if not hasattr(after.channel, 'parent') or not isinstance(after.channel.parent, discord.ForumChannel):
+                return
+
+            with db_session_scope() as session:
+                # Get global creator (check if this thread is their primary)
+                creator = session.get(FeaturedCreator, after.author.id)
+
+                if not creator:
+                    return  # Not a tracked creator
+
+                # Only update if this is their primary guild's forum thread
+                if creator.forum_thread_id != after.channel.id:
+                    return
+
+                # Update bio and social links with edited content
+                social_links = self._parse_social_links(after.content)
+
+                creator.bio = after.content
+                creator.updated_at = int(time.time())
+
+                # Update social links
                 if social_links.get('twitch'):
                     creator.twitch_url = social_links['twitch']
                 if social_links.get('youtube'):
@@ -311,36 +464,136 @@ class DiscoveryCog(commands.Cog):
                     creator.tiktok_url = social_links['tiktok']
                 if social_links.get('instagram'):
                     creator.instagram_url = social_links['instagram']
+                if social_links.get('bsky'):
+                    creator.bsky_url = social_links['bsky']
                 if social_links.get('other'):
                     creator.other_links = social_links['other']
 
-                logger.info(f"[Discovery] [guild_id:{guild_id}] Updated {member.display_name} in featured creators hall (times: {creator.times_featured})")
-            else:
-                # Create new creator entry
-                creator = FeaturedCreator(
-                    guild_id=guild_id,
-                    user_id=member.id,
-                    username=member.name,
-                    display_name=member.display_name,
-                    avatar_url=member.display_avatar.url,
-                    first_featured_at=now,
-                    last_featured_at=now,
-                    times_featured=1,
-                    twitch_url=social_links.get('twitch'),
-                    youtube_url=social_links.get('youtube'),
-                    twitter_url=social_links.get('twitter'),
-                    tiktok_url=social_links.get('tiktok'),
-                    instagram_url=social_links.get('instagram'),
-                    other_links=social_links.get('other'),
-                    bio=winner.content,
-                    discord_connections=None,  # TODO: Implement OAuth flow
-                    created_at=now,
-                    updated_at=now
-                )
-                session.add(creator)
-                logger.info(f"[Discovery] [guild_id:{guild_id}] Added {member.display_name} to featured creators hall (first time)")
+                session.commit()
+                logger.info(f"[Forum Edit] Updated GLOBAL creator {after.author.display_name} (primary guild: {creator.primary_guild_id})")
 
-            session.commit()
+        except Exception as e:
+            logger.error(f"[Forum Edit] Error updating creator: {e}", exc_info=True)
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member):
+        """
+        Handle when a member leaves a guild - remove guild from their creator entry.
+        If they leave all guilds, mark as inactive (14-day grace period before deletion).
+        """
+        try:
+            with db_session_scope() as session:
+                marked_inactive = remove_guild_from_creator(session, member.id, member.guild.id)
+                session.commit()
+
+                if marked_inactive:
+                    logger.info(f"[Member Remove] User {member.id} left all guilds, marked inactive")
+                else:
+                    logger.info(f"[Member Remove] User {member.id} left guild {member.guild.id}")
+
+        except Exception as e:
+            logger.error(f"[Member Remove] Error handling member removal: {e}", exc_info=True)
+
+    @commands.Cog.listener()
+    async def on_thread_create(self, thread: discord.Thread):
+        """
+        Handle new forum threads - add to featured pool if it's a Self-Promo Intro.
+        This is the primary way to catch new forum posts (more reliable than periodic scanning).
+        """
+        try:
+            # Only process forum threads
+            if not hasattr(thread, 'parent') or not isinstance(thread.parent, discord.ForumChannel):
+                return
+
+            # Check if this is a configured intro forum
+            with db_session_scope() as session:
+                config = session.query(DiscoveryConfig).filter_by(
+                    guild_id=thread.guild.id,
+                    intro_forum_channel_id=thread.parent.id
+                ).first()
+
+                if not config or not config.forum_enabled:
+                    return  # Not a configured forum or forum discovery disabled
+
+                # Check if thread has "Self-Promo Intro" tag
+                has_intro_tag = any(
+                    tag.name.lower() == "self-promo intro" for tag in thread.applied_tags
+                )
+
+                if not has_intro_tag:
+                    logger.debug(f"[Thread Create] Thread {thread.id} doesn't have Self-Promo Intro tag")
+                    return
+
+                # Get the starter message (pycord forum threads)
+                # Try with retry logic since message might not be immediately available
+                starter_message = None
+                max_retries = 3
+
+                for attempt in range(max_retries):
+                    if hasattr(thread, 'starter_message') and thread.starter_message:
+                        starter_message = thread.starter_message
+                        break
+                    else:
+                        # Fetch the first message from thread history
+                        async for message in thread.history(limit=1, oldest_first=True):
+                            starter_message = message
+                            break
+
+                    if starter_message:
+                        break
+
+                    # If we didn't get it and have retries left, wait and try again
+                    if attempt < max_retries - 1:
+                        logger.debug(f"[Thread Create] Attempt {attempt + 1}/{max_retries}: Could not get starter message for thread {thread.id}, retrying...")
+                        await asyncio.sleep(1.5)  # Wait 1.5 seconds before retry
+
+                if not starter_message:
+                    logger.warning(f"[Thread Create] Could not get starter message for thread {thread.id} after {max_retries} attempts")
+                    return
+
+                # Add to featured pool
+                await self._add_forum_post_to_pool(
+                    guild_id=thread.guild.id,
+                    thread=thread,
+                    message=starter_message,
+                    config=config
+                )
+
+                logger.info(f"[Thread Create] Added new forum post from {starter_message.author.display_name} to pool (guild {thread.guild.id})")
+
+        except Exception as e:
+            logger.error(f"[Thread Create] Error handling new thread: {e}", exc_info=True)
+
+    @commands.Cog.listener()
+    async def on_thread_delete(self, thread: discord.Thread):
+        """
+        Handle when a forum thread is deleted - just clear the thread ID, don't mark inactive.
+        Deleting a thread doesn't mean they left the guild!
+        """
+        try:
+            # Only process forum threads
+            if not hasattr(thread, 'parent') or not isinstance(thread.parent, discord.ForumChannel):
+                return
+
+            with db_session_scope() as session:
+                # Find creator with this forum thread
+                creator = session.query(FeaturedCreator).filter_by(
+                    forum_thread_id=thread.id
+                ).first()
+
+                if not creator:
+                    return  # Not a tracked thread
+
+                # Just clear the forum thread ID - they might repost a new intro
+                # Don't mark them inactive or remove the guild - they're still in the server!
+                creator.forum_thread_id = None
+                creator.updated_at = int(time.time())
+                session.commit()
+
+                logger.info(f"[Thread Delete] Cleared forum thread for user {creator.user_id} in guild {thread.guild.id if thread.guild else 'unknown'}")
+
+        except Exception as e:
+            logger.error(f"[Thread Delete] Error handling thread deletion: {e}", exc_info=True)
 
     async def select_and_feature_winner(self, guild_id: int) -> dict:
         """
@@ -459,14 +712,8 @@ class DiscoveryCog(commands.Cog):
                     timestamp=discord.utils.utcnow()
                 )
 
-                # Set profile picture as thumbnail
-                embed.set_thumbnail(url=member.display_avatar.url)
-
-                # Set author with name
-                embed.set_author(
-                    name=member.display_name,
-                    icon_url=member.display_avatar.url
-                )
+                # Set author with name (without icon for cleaner look)
+                embed.set_author(name=member.display_name)
 
                 # Link field
                 if winner.link_url:
@@ -537,6 +784,9 @@ class DiscoveryCog(commands.Cog):
                     value=f"<t:{winner.selected_at}:R>",
                     inline=True
                 )
+
+                # Set profile picture at bottom for bigger, cleaner look
+                embed.set_image(url=member.display_avatar.url)
 
                 embed.set_footer(text=f"🎉 Congratulations!")
 
@@ -1079,6 +1329,41 @@ class DiscoveryCog(commands.Cog):
     async def before_creator_of_month_task(self):
         await self.bot.wait_until_ready()
 
+    @tasks.loop(hours=24)  # Run daily
+    async def cleanup_inactive_creators_task(self):
+        """
+        Cleanup task: Delete creators who have been inactive for 14+ days.
+        A creator is marked inactive when they leave all guilds.
+        """
+        logger.info("[Cleanup] Starting inactive creators cleanup...")
+
+        GRACE_PERIOD_SECONDS = 14 * 24 * 3600  # 14 days
+        now = int(time.time())
+
+        with db_session_scope() as session:
+            # Find creators who have been inactive for 14+ days
+            expired_creators = session.query(FeaturedCreator).filter(
+                FeaturedCreator.is_active == False,
+                FeaturedCreator.inactive_since != None,
+                FeaturedCreator.inactive_since < (now - GRACE_PERIOD_SECONDS)
+            ).all()
+
+            if not expired_creators:
+                logger.info("[Cleanup] No expired creators to delete")
+                return
+
+            # Delete expired creators
+            for creator in expired_creators:
+                logger.info(f"[Cleanup] Deleting creator {creator.user_id} (inactive since {creator.inactive_since})")
+                session.delete(creator)
+
+            session.commit()
+            logger.info(f"[Cleanup] Deleted {len(expired_creators)} expired creators")
+
+    @cleanup_inactive_creators_task.before_loop
+    async def before_cleanup_inactive_creators_task(self):
+        await self.bot.wait_until_ready()
+
     async def _scan_guild_intro_forum(self, guild_id: int):
         """Scan a guild's intro forum and add/update creators."""
         with db_session_scope() as session:
@@ -1096,72 +1381,147 @@ class DiscoveryCog(commands.Cog):
                 logger.warning(f"[Forum Scanner] Invalid forum channel for guild {guild_id}")
                 return
 
-            # Iterate through active threads
+            # Scan forum threads (pycord only has cached threads in forum.threads)
+            # For better coverage, also listen to on_thread_create event
             processed = 0
-            for thread in forum.threads:
-                # Check if thread has "Self-Promo Intro" tag (case-insensitive)
-                has_intro_tag = any(
-                    tag.name.lower() == "self-promo intro" for tag in thread.applied_tags
-                )
+            try:
+                all_threads = list(forum.threads)
+                logger.info(f"[Forum Scanner] Found {len(all_threads)} cached threads in forum {forum.name} ({forum.id})")
 
-                if not has_intro_tag:
-                    continue
+                for thread in all_threads:
+                    # Debug: log thread info
+                    tag_names = [tag.name for tag in thread.applied_tags]
+                    logger.debug(f"[Forum Scanner] Thread: {thread.name} ({thread.id}), Tags: {tag_names}, Archived: {thread.archived}")
 
-                # Skip archived threads
-                if thread.archived:
-                    continue
-
-                try:
-                    # Get starter message (first post in thread)
-                    starter_message = await thread.fetch_message(thread.id)
-
-                    # Process creator (returns True if newly added)
-                    is_new = await self._process_forum_creator(
-                        guild_id=guild_id,
-                        thread=thread,
-                        message=starter_message,
-                        config=config
+                    # Check if thread has "Self-Promo Intro" tag (case-insensitive)
+                    has_intro_tag = any(
+                        tag.name.lower() == "self-promo intro" for tag in thread.applied_tags
                     )
-                    processed += 1
 
-                    # Post Discord embed if this is a new creator and announcement channel is configured
-                    if is_new and config.intro_announcement_channel_id:
-                        try:
-                            announcement_channel = guild.get_channel(config.intro_announcement_channel_id)
-                            if announcement_channel:
-                                # Generate Discord thread URL
-                                thread_url = f"https://discord.com/channels/{guild_id}/{thread.id}"
+                    if not has_intro_tag:
+                        continue
 
-                                # Post embed to Discord
-                                await self._post_forum_creator_embed(
-                                    guild=guild,
-                                    channel=announcement_channel,
-                                    author=starter_message.author,
-                                    content=starter_message.content,
-                                    thread_url=thread_url
-                                )
-                        except Exception as embed_error:
-                            logger.error(f"[Forum Scanner] Failed to post embed for thread {thread.id}: {embed_error}")
+                    # Skip archived threads
+                    if thread.archived:
+                        continue
 
-                except discord.NotFound:
-                    logger.debug(f"[Forum Scanner] Thread {thread.id} starter message not found")
-                except Exception as e:
-                    logger.error(f"[Forum Scanner] Error processing thread {thread.id}: {e}", exc_info=True)
+                    try:
+                        # Get starter message (pycord forum threads)
+                        # Try with retry logic since message might not be immediately available
+                        starter_message = None
+                        max_retries = 2  # Fewer retries for background scanner
 
-            if processed > 0:
-                logger.info(f"[Forum Scanner] Processed {processed} intro threads for guild {guild_id}")
+                        for attempt in range(max_retries):
+                            if hasattr(thread, 'starter_message') and thread.starter_message:
+                                starter_message = thread.starter_message
+                                break
+                            else:
+                                # Fetch the first message from thread history
+                                async for message in thread.history(limit=1, oldest_first=True):
+                                    starter_message = message
+                                    break
+
+                            if starter_message:
+                                break
+
+                            # If we didn't get it and have retries left, wait and try again
+                            if attempt < max_retries - 1:
+                                logger.debug(f"[Forum Scanner] Attempt {attempt + 1}/{max_retries}: Could not get starter message for thread {thread.id}, retrying...")
+                                await asyncio.sleep(1.0)
+
+                        if not starter_message:
+                            logger.debug(f"[Forum Scanner] Could not get starter message for thread {thread.id} after {max_retries} attempts")
+                            continue
+
+                        # Add to featured pool (not directly to Hall of Fame!)
+                        # This way they go through random selection like channel posts
+                        await self._add_forum_post_to_pool(
+                            guild_id=guild_id,
+                            thread=thread,
+                            message=starter_message,
+                            config=config
+                        )
+                        processed += 1
+
+                    except Exception as e:
+                        logger.error(f"[Forum Scanner] Error processing thread {thread.id}: {e}", exc_info=True)
+
+                if processed > 0:
+                    logger.info(f"[Forum Scanner] Processed {processed} intro threads for guild {guild_id}")
+                else:
+                    logger.info(f"[Forum Scanner] No unprocessed intro threads found for guild {guild_id}")
+
+            except Exception as e:
+                logger.error(f"[Forum Scanner] Error fetching threads for guild {guild_id}: {e}", exc_info=True)
 
             # Update last scan time
             import time
             config.last_intro_scan_at = int(time.time())
             session.commit()
 
+    async def _add_forum_post_to_pool(self, guild_id: int, thread: discord.Thread, message: discord.Message, config=None):
+        """
+        Add forum intro post to the featured pool for random selection.
+        This replaces direct Hall of Fame addition.
+        """
+        author = message.author
+        content = message.content[:1000]  # Limit to 1000 chars
+
+        # Extract links
+        links = extract_links(content)
+        link_url = links[0] if links else None
+        platform = detect_platform(link_url) if link_url else 'forum'
+
+        with db_session_scope() as session:
+            now = int(time.time())
+
+            # Check if this thread is already in the pool
+            existing = session.query(FeaturedPool).filter_by(
+                guild_id=guild_id,
+                user_id=author.id,
+                forum_thread_id=thread.id
+            ).first()
+
+            if existing:
+                # Update existing pool entry
+                existing.content = content
+                existing.link_url = link_url
+                existing.platform = platform
+                existing.updated_at = now
+                logger.debug(f"[Forum Pool] Updated pool entry for {author.display_name} in guild {guild_id}")
+            else:
+                # Add to pool with long duration (forum posts don't expire)
+                pool_duration = config.pool_entry_duration_hours if config else 720  # Default 30 days for forum
+                pool_entry = FeaturedPool(
+                    guild_id=guild_id,
+                    user_id=author.id,
+                    content=content,
+                    link_url=link_url,
+                    platform=platform,
+                    entered_at=now,
+                    expires_at=now + (pool_duration * 3600),
+                    forum_thread_id=thread.id,
+                    was_selected=False
+                )
+                session.add(pool_entry)
+                logger.info(f"[Forum Pool] Added {author.display_name} to featured pool from forum (guild {guild_id})")
+
+                # Send post response message to the thread
+                if config and config.post_response:
+                    try:
+                        await thread.send(config.post_response)
+                        logger.debug(f"[Forum Pool] Sent post response to thread {thread.id}")
+                    except Exception as e:
+                        logger.error(f"[Forum Pool] Failed to send post response: {e}")
+
+            session.commit()
+
     async def _process_forum_creator(self, guild_id: int, thread: discord.Thread, message: discord.Message, config=None):
         """
-        Add or update a creator from forum intro post.
+        DEPRECATED: This function is no longer used for forum scanning.
+        Forum posts now go to FeaturedPool first, then to Hall of Fame when selected.
 
-        Returns:
-            bool: True if creator was newly added, False if updated
+        Kept for potential manual creator addition in the future.
         """
         author = message.author
         content = message.content
@@ -1177,71 +1537,47 @@ class DiscoveryCog(commands.Cog):
         with db_session_scope() as session:
             now = int(time.time())
 
-            # Check if creator already exists
-            creator = session.query(FeaturedCreator).filter_by(
-                guild_id=guild_id,
-                user_id=author.id
-            ).first()
+            # Get or create global creator entry
+            creator, is_new_creator = get_or_create_global_creator(session, author.id, guild_id)
 
-            is_new_creator = creator is None
+            # Update creator data from forum post
+            creator.avatar_url = author.display_avatar.url
+            creator.display_name = author.display_name
+            creator.username = author.name
+            creator.bio = content
+            creator.source = 'forum'
+            creator.updated_at = now
 
-            if creator:
-                # Update existing creator
-                creator.last_featured_at = now
-                creator.times_featured += 1
-                creator.avatar_url = author.display_avatar.url
-                creator.display_name = author.display_name
-                creator.username = author.name
-                creator.bio = content
+            # Set first_featured_at if new
+            if is_new_creator:
+                creator.first_featured_at = now
+
+            # If this is their primary guild OR auto_select enabled, update forum data
+            if creator.primary_guild_id == guild_id or creator.auto_select_primary:
                 creator.forum_thread_id = thread.id
                 creator.forum_tag_name = tag_name
-                creator.source = 'forum'
-                creator.updated_at = now
+                creator.last_featured_at = now
 
-                # Update social links (only if new ones provided)
-                if social_links.get('twitch'):
-                    creator.twitch_url = social_links['twitch']
-                if social_links.get('youtube'):
-                    creator.youtube_url = social_links['youtube']
-                if social_links.get('twitter'):
-                    creator.twitter_url = social_links['twitter']
-                if social_links.get('tiktok'):
-                    creator.tiktok_url = social_links['tiktok']
-                if social_links.get('instagram'):
-                    creator.instagram_url = social_links['instagram']
-                if social_links.get('other'):
-                    creator.other_links = social_links['other']
-
-                logger.debug(f"[Forum Scanner] Updated creator {author.display_name} in guild {guild_id}")
-            else:
-                # Create new creator
-                creator = FeaturedCreator(
-                    guild_id=guild_id,
-                    user_id=author.id,
-                    username=author.name,
-                    display_name=author.display_name,
-                    avatar_url=author.display_avatar.url,
-                    first_featured_at=now,
-                    last_featured_at=now,
-                    times_featured=1,
-                    twitch_url=social_links.get('twitch'),
-                    youtube_url=social_links.get('youtube'),
-                    twitter_url=social_links.get('twitter'),
-                    tiktok_url=social_links.get('tiktok'),
-                    instagram_url=social_links.get('instagram'),
-                    other_links=social_links.get('other'),
-                    bio=content,
-                    source='forum',
-                    forum_thread_id=thread.id,
-                    forum_tag_name=tag_name,
-                    discord_connections=None,
-                    created_at=now,
-                    updated_at=now
-                )
-                session.add(creator)
-                logger.info(f"[Forum Scanner] Added new creator {author.display_name} to guild {guild_id}")
+            # Update social links (only if new ones provided)
+            if social_links.get('twitch'):
+                creator.twitch_url = social_links['twitch']
+            if social_links.get('youtube'):
+                creator.youtube_url = social_links['youtube']
+            if social_links.get('twitter'):
+                creator.twitter_url = social_links['twitter']
+            if social_links.get('tiktok'):
+                creator.tiktok_url = social_links['tiktok']
+            if social_links.get('instagram'):
+                creator.instagram_url = social_links['instagram']
+            if social_links.get('bsky'):
+                creator.bsky_url = social_links['bsky']
+            if social_links.get('other'):
+                creator.other_links = social_links['other']
 
             session.commit()
+
+            action = "Added new" if is_new_creator else "Updated"
+            logger.info(f"[Forum Scanner] {action} GLOBAL creator {author.display_name} (guild {guild_id}, primary: {creator.primary_guild_id})")
             return is_new_creator
 
     async def _post_quick_feature_embed(
@@ -1262,6 +1598,7 @@ class DiscoveryCog(commands.Cog):
                 'twitter': '🐦',
                 'tiktok': '🎵',
                 'instagram': '📸',
+                'bsy': '🦋',
                 'other': '🔗'
             }
 
@@ -1330,6 +1667,9 @@ class DiscoveryCog(commands.Cog):
                 social_field_value.append(f"🎵 [TikTok]({social_links['tiktok']})")
             if social_links.get('instagram'):
                 social_field_value.append(f"📸 [Instagram]({social_links['instagram']})")
+            if social_links.get('bsky'):
+                social_field_value.append(f"🦋 [bsky]({social_links['bsky']})")
+
 
             if social_field_value:
                 embed.add_field(
@@ -1389,8 +1729,10 @@ class DiscoveryCog(commands.Cog):
                 logger.warning(f"[COTW] All creators already featured for guild {guild_id}")
                 return
 
-            # Select random creator
-            selected = random.choice(creators)
+            # Select creator with highest times_featured_total count (featured globally)
+            # This rewards creators who have been randomly featured the most
+            selected = max(creators, key=lambda c: c.times_featured_total)
+            logger.info(f"[COTW] Selected {selected.display_name} with {selected.times_featured_total} total features")
 
             # Get current week and year
             now = datetime.datetime.utcnow()
@@ -1440,9 +1782,18 @@ class DiscoveryCog(commands.Cog):
                 links.append(f"[TikTok]({selected.tiktok_url})")
             if selected.instagram_url:
                 links.append(f"[Instagram]({selected.instagram_url})")
+            if selected.bsky_url:
+                links.append(f"[bsky]({selected.bsky})")
 
             if links:
                 embed.add_field(name="🔗 Links", value=" • ".join(links), inline=False)
+
+            # Show times_featured_total count (global)
+            embed.add_field(
+                name="⭐ Total Features",
+                value=f"Featured **{selected.times_featured_total}x** across all guilds!",
+                inline=True
+            )
 
             embed.set_footer(text=f"Week {week}, {year} • Sponsored by Casual Heroes")
 
@@ -1501,8 +1852,10 @@ class DiscoveryCog(commands.Cog):
                 logger.warning(f"[COTM] All creators already featured for guild {guild_id}")
                 return
 
-            # Select random creator
-            selected = random.choice(creators)
+            # Select creator with highest times_featured_total count (featured globally)
+            # This rewards creators who have been randomly featured the most
+            selected = max(creators, key=lambda c: c.times_featured_total)
+            logger.info(f"[COTM] Selected {selected.display_name} with {selected.times_featured_total} total features")
 
             # Get current month and year
             now = datetime.datetime.utcnow()
@@ -1554,9 +1907,18 @@ class DiscoveryCog(commands.Cog):
                 links.append(f"[TikTok]({selected.tiktok_url})")
             if selected.instagram_url:
                 links.append(f"[Instagram]({selected.instagram_url})")
+            if selected.bsky_url:
+                links.append(f"[bsky]({selected.bsky})")
 
             if links:
                 embed.add_field(name="🔗 Links", value=" • ".join(links), inline=False)
+
+            # Show times_featured_total count (global)
+            embed.add_field(
+                name="⭐ Total Features",
+                value=f"Featured **{selected.times_featured_total}x** across all guilds!",
+                inline=True
+            )
 
             embed.set_footer(text=f"{month_name} {year} • Sponsored by Casual Heroes")
 
@@ -2000,6 +2362,168 @@ class DiscoveryCog(commands.Cog):
                 embed.add_field(name=name, value=value, inline=False)
 
         await ctx.respond(embed=embed, ephemeral=True)
+
+    @discovery.command(name="set-primary-guild", description="Set which guild's intro to display globally")
+    async def set_primary_guild(self, ctx: discord.ApplicationContext):
+        """
+        Set which guild's intro should be displayed on your global Hall of Fame profile.
+        By default, your most recent intro is used (auto-select).
+        """
+        with db_session_scope() as session:
+            # Get creator
+            creator = session.get(FeaturedCreator, ctx.author.id)
+
+            if not creator:
+                await ctx.respond(
+                    "You don't have a Hall of Fame entry yet.\n\n"
+                    "Post an intro in a forum or use `/promo featured` to get featured!",
+                    ephemeral=True
+                )
+                return
+
+            # Get list of guilds they're in
+            guilds_list = json.loads(creator.guilds) if creator.guilds else []
+
+            if not guilds_list:
+                await ctx.respond(
+                    "You're not in any tracked guilds.",
+                    ephemeral=True
+                )
+                return
+
+            # Build guild selection embed
+            embed = discord.Embed(
+                title="🏆 Set Your Primary Guild",
+                description=(
+                    f"**Current Primary:** {creator.primary_guild_id}\n"
+                    f"**Auto-Select:** {'Enabled ✅' if creator.auto_select_primary else 'Disabled ❌'}\n\n"
+                    "Choose which guild's intro should be displayed on your Hall of Fame profile.\n\n"
+                    "**Your Guilds:**"
+                ),
+                color=discord.Color.gold()
+            )
+
+            for guild_id in guilds_list:
+                guild = self.bot.get_guild(guild_id)
+                guild_name = guild.name if guild else f"Guild {guild_id}"
+                is_primary = "⭐ **PRIMARY**" if guild_id == creator.primary_guild_id else ""
+                embed.add_field(
+                    name=f"{guild_name} {is_primary}",
+                    value=f"Guild ID: `{guild_id}`",
+                    inline=False
+                )
+
+            embed.add_field(
+                name="💡 How to Change",
+                value=(
+                    "To change your primary guild, use:\n"
+                    "`/discovery set-primary <guild_id>`\n\n"
+                    "To enable auto-select (always use most recent):\n"
+                    "`/discovery auto-select true`"
+                ),
+                inline=False
+            )
+
+            await ctx.respond(embed=embed, ephemeral=True)
+
+    @discovery.command(name="set-primary", description="Set your primary guild by ID")
+    @discord.option(
+        name="guild_id",
+        description="The guild ID to set as primary",
+        required=True
+    )
+    async def set_primary(
+        self,
+        ctx: discord.ApplicationContext,
+        guild_id: str
+    ):
+        """Set which guild's intro should be displayed globally."""
+        try:
+            guild_id_int = int(guild_id)
+        except ValueError:
+            await ctx.respond("Invalid guild ID. Please provide a valid number.", ephemeral=True)
+            return
+
+        with db_session_scope() as session:
+            # Get creator
+            creator = session.get(FeaturedCreator, ctx.author.id)
+
+            if not creator:
+                await ctx.respond(
+                    "You don't have a Hall of Fame entry yet.",
+                    ephemeral=True
+                )
+                return
+
+            # Check if they're in this guild
+            guilds_list = json.loads(creator.guilds) if creator.guilds else []
+
+            if guild_id_int not in guilds_list:
+                await ctx.respond(
+                    f"You're not in guild {guild_id_int}.\n\n"
+                    "Use `/discovery set-primary-guild` to see your guilds.",
+                    ephemeral=True
+                )
+                return
+
+            # Update primary guild
+            creator.primary_guild_id = guild_id_int
+            creator.auto_select_primary = False  # Disable auto-select when manually set
+            creator.updated_at = int(time.time())
+            session.commit()
+
+            guild = self.bot.get_guild(guild_id_int)
+            guild_name = guild.name if guild else f"Guild {guild_id_int}"
+
+            await ctx.respond(
+                f"✅ **Primary guild set!**\n\n"
+                f"Your Hall of Fame profile will now display your intro from **{guild_name}**.\n"
+                f"Auto-select has been disabled.\n\n"
+                f"To re-enable auto-select, use `/discovery auto-select true`",
+                ephemeral=True
+            )
+
+    @discovery.command(name="auto-select", description="Enable/disable auto-select for primary guild")
+    @discord.option(
+        name="enabled",
+        description="Enable or disable auto-select",
+        required=True
+    )
+    async def auto_select(
+        self,
+        ctx: discord.ApplicationContext,
+        enabled: bool
+    ):
+        """Enable or disable automatic primary guild selection."""
+        with db_session_scope() as session:
+            # Get creator
+            creator = session.get(FeaturedCreator, ctx.author.id)
+
+            if not creator:
+                await ctx.respond(
+                    "You don't have a Hall of Fame entry yet.",
+                    ephemeral=True
+                )
+                return
+
+            # Update auto-select
+            creator.auto_select_primary = enabled
+            creator.updated_at = int(time.time())
+            session.commit()
+
+            if enabled:
+                await ctx.respond(
+                    "✅ **Auto-select enabled!**\n\n"
+                    "Your Hall of Fame profile will now automatically display your most recent intro.",
+                    ephemeral=True
+                )
+            else:
+                await ctx.respond(
+                    "✅ **Auto-select disabled!**\n\n"
+                    f"Your Hall of Fame profile will continue displaying your intro from guild {creator.primary_guild_id}.\n"
+                    "Use `/discovery set-primary <guild_id>` to change it manually.",
+                    ephemeral=True
+                )
 
     @discovery.command(name="servers", description="Browse servers in discovery network (PRO)")
     @discord.option(
