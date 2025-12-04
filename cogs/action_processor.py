@@ -235,6 +235,12 @@ class ActionProcessorCog(commands.Cog):
         elif action_type == ActionType.FLAIR_ASSIGN:
             return await self._action_flair_assign(guild, payload)
 
+        # Template Management
+        elif action_type == ActionType.CHANNEL_CREATE:
+            return await self._action_channel_create(guild, payload)
+        elif action_type == ActionType.ROLE_CREATE:
+            return await self._action_role_create(guild, payload)
+
         else:
             raise ValueError(f"Unknown action type: {action_type}")
 
@@ -1304,6 +1310,262 @@ class ActionProcessorCog(commands.Cog):
         return {
             "success": True,
             "message": f"Assigned flair '{flair_name}' to {member.display_name}"
+        }
+
+    # ═══════════════════════════════════════════════════════════════
+    # TEMPLATE ACTIONS
+    # ═══════════════════════════════════════════════════════════════
+
+    async def _action_channel_create(self, guild: discord.Guild, payload: dict) -> dict:
+        """Create channels from a template with category-level role permissions."""
+        import json
+
+        template_data = json.loads(payload["template_data"])
+        categories_data = template_data if isinstance(template_data, list) else []
+
+        created_channels = []
+        errors = []
+
+        # Map permission names to discord.Permissions attributes
+        PERM_MAP = {
+            'view_channel': 'view_channel', 'manage_channels': 'manage_channels',
+            'manage_permissions': 'manage_permissions', 'manage_webhooks': 'manage_webhooks',
+            'create_instant_invite': 'create_instant_invite', 'send_messages': 'send_messages',
+            'send_messages_in_threads': 'send_messages_in_threads',
+            'create_public_threads': 'create_public_threads', 'create_private_threads': 'create_private_threads',
+            'embed_links': 'embed_links', 'attach_files': 'attach_files', 'add_reactions': 'add_reactions',
+            'use_external_emojis': 'use_external_emojis', 'use_external_stickers': 'use_external_stickers',
+            'mention_everyone': 'mention_everyone', 'manage_messages': 'manage_messages',
+            'manage_threads': 'manage_threads', 'read_message_history': 'read_message_history',
+            'send_tts_messages': 'send_tts_messages', 'use_application_commands': 'use_application_commands',
+            'connect': 'connect', 'speak': 'speak', 'stream': 'stream',
+            'use_voice_activation': 'use_voice_activation', 'priority_speaker': 'priority_speaker',
+            'mute_members': 'mute_members', 'deafen_members': 'deafen_members', 'move_members': 'move_members',
+        }
+
+        def build_overwrites(role_overrides):
+            """Build permission overwrites from role_overrides list."""
+            overwrites = {}
+            if role_overrides:
+                for override in role_overrides:
+                    role_id = int(override.get("role_id"))
+                    allow_perms = override.get("allow", [])
+                    deny_perms = override.get("deny", [])
+
+                    # Find the role in the guild
+                    if role_id == guild.id:
+                        role = guild.default_role
+                    else:
+                        role = guild.get_role(role_id)
+
+                    if not role:
+                        logger.warning(f"Role {role_id} not found in guild {guild.name}, skipping")
+                        continue
+
+                    # Create permission overwrite
+                    overwrite = discord.PermissionOverwrite()
+
+                    # Set allowed permissions
+                    for perm_name in allow_perms:
+                        if perm_name in PERM_MAP:
+                            setattr(overwrite, PERM_MAP[perm_name], True)
+
+                    # Set denied permissions
+                    for perm_name in deny_perms:
+                        if perm_name in PERM_MAP:
+                            setattr(overwrite, PERM_MAP[perm_name], False)
+
+                    overwrites[role] = overwrite
+            return overwrites
+
+        # Process each category with its channels
+        for category_data in categories_data:
+            category_name = category_data.get("category_name")
+            category_role_overrides = category_data.get("role_overrides", [])
+            channels = category_data.get("channels", [])
+
+            if not category_name:
+                continue
+
+            # Build category permission overwrites
+            category_overwrites = build_overwrites(category_role_overrides)
+
+            # Create or find category
+            existing_category = discord.utils.get(guild.categories, name=category_name)
+            if existing_category:
+                category = existing_category
+                logger.info(f"Using existing category '{category_name}' in {guild.name}")
+            else:
+                try:
+                    # Create category with role permissions
+                    category = await guild.create_category(category_name, overwrites=category_overwrites)
+                    logger.info(f"Created category '{category_name}' with {len(category_overwrites)} role permissions in {guild.name}")
+                except Exception as e:
+                    logger.error(f"Failed to create category '{category_name}': {e}")
+                    errors.append(f"Category '{category_name}': {str(e)}")
+                    continue
+
+            # Create channels in this category (they inherit category permissions)
+            for channel_data in channels:
+                try:
+                    name = channel_data["name"]
+                    channel_type = channel_data.get("type", "text")
+                    topic = channel_data.get("topic")
+
+                    # Map channel type names to discord.ChannelType
+                    type_map = {
+                        "text": discord.ChannelType.text,
+                        "voice": discord.ChannelType.voice,
+                        "announcement": discord.ChannelType.news,
+                        "stage": discord.ChannelType.stage_voice,
+                        "forum": discord.ChannelType.forum,
+                    }
+
+                    discord_type = type_map.get(channel_type, discord.ChannelType.text)
+
+                    # Create channel - permissions inherited from category automatically
+                    if discord_type == discord.ChannelType.text:
+                        channel = await guild.create_text_channel(
+                            name=name,
+                            category=category,
+                            topic=topic,
+                            reason=f"Created from template under category '{category_name}'"
+                        )
+                    elif discord_type == discord.ChannelType.voice:
+                        channel = await guild.create_voice_channel(
+                            name=name,
+                            category=category,
+                            reason=f"Created from template under category '{category_name}'"
+                        )
+                    elif discord_type == discord.ChannelType.news:
+                        channel = await guild.create_text_channel(
+                            name=name,
+                            category=category,
+                            topic=topic,
+                            reason=f"Created from template under category '{category_name}'"
+                    )
+                        await channel.edit(type=discord.ChannelType.news)
+                    elif discord_type == discord.ChannelType.stage_voice:
+                        channel = await guild.create_stage_channel(
+                            name=name,
+                            category=category,
+                            reason=f"Created from template under category '{category_name}'"
+                        )
+                    elif discord_type == discord.ChannelType.forum:
+                        channel = await guild.create_forum_channel(
+                            name=name,
+                            category=category,
+                            topic=topic,
+                            reason=f"Created from template under category '{category_name}'"
+                        )
+                    else:
+                        channel = await guild.create_text_channel(
+                            name=name,
+                            category=category,
+                            topic=topic,
+                            reason=f"Created from template under category '{category_name}'"
+                        )
+
+                    created_channels.append(channel.name)
+                    logger.info(f"Created channel '{name}' ({channel_type}) in category '{category_name}' in {guild.name}")
+
+                except Exception as e:
+                    logger.error(f"Failed to create channel '{channel_data.get('name', 'unknown')}': {e}")
+                    errors.append(f"Channel '{channel_data.get('name', 'unknown')}': {str(e)}")
+
+        message = f"Created {len(created_channels)} channel(s)"
+        if errors:
+            message += f" with {len(errors)} error(s)"
+
+        return {
+            "success": len(created_channels) > 0 or len(errors) == 0,
+            "message": message,
+            "created": created_channels,
+            "errors": errors if errors else None
+        }
+
+    async def _action_role_create(self, guild: discord.Guild, payload: dict) -> dict:
+        """Create roles from a template."""
+        import json
+
+        template_data = json.loads(payload["template_data"])
+        roles = template_data if isinstance(template_data, list) else []
+
+        created_roles = []
+        errors = []
+
+        # Map permission names to discord.Permissions attributes
+        ROLE_PERM_MAP = {
+            'administrator': 'administrator', 'manage_guild': 'manage_guild', 'manage_roles': 'manage_roles',
+            'manage_channels': 'manage_channels', 'kick_members': 'kick_members', 'ban_members': 'ban_members',
+            'create_instant_invite': 'create_instant_invite', 'change_nickname': 'change_nickname',
+            'manage_nicknames': 'manage_nicknames', 'manage_emojis_and_stickers': 'manage_emojis_and_stickers',
+            'manage_webhooks': 'manage_webhooks', 'view_audit_log': 'view_audit_log',
+            'view_guild_insights': 'view_guild_insights', 'view_channel': 'view_channel',
+            'send_messages': 'send_messages', 'send_messages_in_threads': 'send_messages_in_threads',
+            'create_public_threads': 'create_public_threads', 'create_private_threads': 'create_private_threads',
+            'send_tts_messages': 'send_tts_messages', 'manage_messages': 'manage_messages',
+            'manage_threads': 'manage_threads', 'embed_links': 'embed_links', 'attach_files': 'attach_files',
+            'read_message_history': 'read_message_history', 'mention_everyone': 'mention_everyone',
+            'use_external_emojis': 'use_external_emojis', 'use_external_stickers': 'use_external_stickers',
+            'add_reactions': 'add_reactions', 'use_application_commands': 'use_application_commands',
+            'connect': 'connect', 'speak': 'speak', 'stream': 'stream',
+            'use_voice_activation': 'use_voice_activation', 'priority_speaker': 'priority_speaker',
+            'mute_members': 'mute_members', 'deafen_members': 'deafen_members', 'move_members': 'move_members',
+            'moderate_members': 'moderate_members', 'request_to_speak': 'request_to_speak',
+        }
+
+        for role_data in roles:
+            try:
+                name = role_data["name"]
+                color_str = role_data.get("color", "")
+                hoist = role_data.get("hoist", False)
+                mentionable = role_data.get("mentionable", False)
+                permissions_list = role_data.get("permissions", [])
+
+                # Parse color (hex string like "#FF5733" or "FF5733")
+                color = discord.Color.default()
+                if color_str:
+                    try:
+                        # Remove # if present
+                        color_hex = color_str.lstrip("#")
+                        color = discord.Color(int(color_hex, 16))
+                    except (ValueError, TypeError):
+                        logger.warning(f"Invalid color '{color_str}' for role '{name}', using default")
+
+                # Build permissions object
+                permissions = discord.Permissions()
+                if permissions_list:
+                    for perm_name in permissions_list:
+                        if perm_name in ROLE_PERM_MAP:
+                            setattr(permissions, ROLE_PERM_MAP[perm_name], True)
+
+                # Create role with permissions
+                role = await guild.create_role(
+                    name=name,
+                    color=color,
+                    hoist=hoist,
+                    mentionable=mentionable,
+                    permissions=permissions,
+                    reason="Created from template"
+                )
+
+                created_roles.append(role.name)
+                logger.info(f"Created role '{name}' in {guild.name}")
+
+            except Exception as e:
+                logger.error(f"Failed to create role '{role_data.get('name', 'unknown')}': {e}")
+                errors.append(f"Role '{role_data.get('name', 'unknown')}': {str(e)}")
+
+        message = f"Created {len(created_roles)} role(s)"
+        if errors:
+            message += f" with {len(errors)} error(s)"
+
+        return {
+            "success": len(created_roles) > 0 or len(errors) == 0,
+            "message": message,
+            "created": created_roles,
+            "errors": errors if errors else None
         }
 
 

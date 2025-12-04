@@ -58,6 +58,7 @@ class XPCog(commands.Cog):
         config = session.get(XPConfig, guild_id)
         if config:
             return {
+                "xp_enabled": config.xp_enabled,
                 "message_xp": config.message_xp,
                 "media_multiplier": config.media_multiplier,
                 "reaction_xp": config.reaction_xp,
@@ -79,6 +80,7 @@ class XPCog(commands.Cog):
             }
         # Return defaults
         return {
+            "xp_enabled": False,  # XP disabled by default
             "message_xp": DefaultXPSettings.MESSAGE_XP,
             "media_multiplier": DefaultXPSettings.MEDIA_MULTIPLIER,
             "reaction_xp": DefaultXPSettings.REACTION_XP,
@@ -102,6 +104,11 @@ class XPCog(commands.Cog):
     @staticmethod
     def can_gain_xp(session, guild_id: int, member: discord.Member, channel: discord.abc.GuildChannel = None) -> bool:
         """Check if member can earn XP (not excluded by role or channel)."""
+        # Check if XP system is enabled for this guild
+        xp_config = session.get(XPConfig, guild_id)
+        if not xp_config or not xp_config.xp_enabled:
+            return False
+
         # Check excluded roles
         excluded_roles = (
             session.query(XPExcludedRole.role_id)

@@ -108,6 +108,10 @@ class ActionType(str, Enum):
     # Channel Management
     CHANNEL_TOPIC_SET = "channel_topic_set"
 
+    # Template Management
+    CHANNEL_CREATE = "channel_create"
+    ROLE_CREATE = "role_create"
+
     # Discovery/Self-Promo
     FORCE_FEATURE = "force_feature"
     CLEAR_FEATURED = "clear_featured"
@@ -297,6 +301,9 @@ class XPConfig(Base):
     __tablename__ = "xp_configs"
 
     guild_id = Column(BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"), primary_key=True)
+
+    # System toggle
+    xp_enabled = Column(Boolean, default=False)  # XP system disabled by default
 
     # XP rates
     message_xp = Column(Float, default=1.5)
@@ -713,9 +720,18 @@ class DiscoveryConfig(Base):
     last_featured_user_id = Column(BigInteger, nullable=True)  # Last user who was featured
     last_featured_message_id = Column(BigInteger, nullable=True)  # Message ID of last featured post (for deletion)
 
+    # Message Response Channel
+    message_response_channel_id = Column(BigInteger, nullable=True)  # Channel to send automated messages (instead of replying in self-promo)
+
+    # Featured Reminder Scheduling
+    reminder_schedule = Column(String(50), default='disabled')  # disabled, hourly, every_6_hours, daily, weekly, monthly
+    last_reminder_sent_at = Column(BigInteger, nullable=True)  # Timestamp of last reminder
+
     # Messages
+    how_to_enter_response = Column(Text, default="💬 Thanks for sharing! To enter the featured pool, you need **{token_cost} Hero Tokens**.\nYou currently have **{hero_tokens} Hero Tokens**. Stay active to earn more! 🎮")
     post_response = Column(Text, default="Good luck on being featured! You've been added to the feature pool.")
     feature_message = Column(Text, default="Shoutout to {user}! Check out their content!")
+    cooldown_message = Column(Text, default="⏰ You're on cooldown! Can enter the featured pool again in {time_left}.\n💰 Your {token_cost} hero_tokens were saved.")
     use_embed = Column(Boolean, default=True)
     embed_color = Column(Integer, default=0x5865F2)
 
@@ -1753,6 +1769,8 @@ class LFGMemberStats(Base):
     blacklisted_at = Column(BigInteger, nullable=True)
     blacklisted_by = Column(BigInteger, nullable=True)
     blacklist_reason = Column(String(500), nullable=True)
+    blacklist_pardoned = Column(Boolean, default=False)  # Admin granted permanent pardon from auto-blacklist
+    blacklist_pardoned_at = Column(BigInteger, nullable=True)  # When pardon was granted
 
     # Timestamps
     first_event = Column(BigInteger, nullable=True)

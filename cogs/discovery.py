@@ -178,6 +178,7 @@ class DiscoveryCog(commands.Cog):
         self.creator_of_week_task.start()
         self.creator_of_month_task.start()
         self.cleanup_inactive_creators_task.start()
+        self.featured_reminder_task.start()
 
     def cog_unload(self):
         self.featured_selection_task.cancel()
@@ -186,6 +187,7 @@ class DiscoveryCog(commands.Cog):
         self.creator_of_week_task.cancel()
         self.creator_of_month_task.cancel()
         self.cleanup_inactive_creators_task.cancel()
+        self.featured_reminder_task.cancel()
 
     # ========== EVENT LISTENERS ==========
 
@@ -244,14 +246,9 @@ class DiscoveryCog(commands.Cog):
 
                 # Check if user has enough hero_tokens
                 if member.hero_tokens < token_cost:
-                    # Not enough hero_tokens - just acknowledge post
+                    # Not enough hero_tokens - just react with thumbs up (no spam message)
                     await message.add_reaction("👍")
-                    if token_cost > 0:
-                        reply = await message.reply(
-                            f"💬 Thanks for sharing your content! Remember to be added to the featured pool you Need **{token_cost}.\n"
-                            f"You have **{member.hero_tokens} Hero Tokens**. The more active you are the more Hero Tokens you earn! ",
-                            delete_after=10
-                        )
+                    logger.info(f"User {message.author.id} doesn't have enough tokens ({member.hero_tokens}/{token_cost})")
                     return
 
                 # Check cooldown (default 24 hours)
@@ -270,11 +267,25 @@ class DiscoveryCog(commands.Cog):
                     hours_left = int(time_left // 3600)
                     minutes_left = int((time_left % 3600) // 60)
 
+                    # Use customizable cooldown message
+                    cooldown_msg = config.cooldown_message if config.cooldown_message else (
+                        "⏰ You're on cooldown! Can enter the featured pool again in {time_left}.\n"
+                        "💰 Your {token_cost} hero_tokens were saved."
+                    )
+
+                    # Format the message with time_left and token_cost
+                    formatted_msg = cooldown_msg.format(
+                        time_left=f"**{hours_left}h {minutes_left}m**",
+                        token_cost=token_cost
+                    )
+
                     await message.add_reaction("⏰")  # Clock emoji
-                    await message.reply(
-                        f"⏰ You're on cooldown! Can enter the featured pool again in **{hours_left}h {minutes_left}m**.\n"
-                        f"💰 Your {token_cost} hero_tokens were saved.",
-                        delete_after=20
+                    await self._send_discovery_message(
+                        config=config,
+                        guild=message.guild,
+                        user=message.author,
+                        message_text=formatted_msg,
+                        original_channel=message.channel
                     )
                     return
 
@@ -309,12 +320,18 @@ class DiscoveryCog(commands.Cog):
 
                 # Confirmation message
                 next_cooldown = now + cooldown_seconds
-                reply = await message.reply(
+                success_message = (
                     f"✅ **Added to featured pool!** 🎉\n"
                     f"🎟️ Cost: {token_cost} hero_tokens ({member.hero_tokens} remaining)\n"
                     f"⏰ Next entry: <t:{next_cooldown}:R>\n"
-                    f"🎲 Good luck getting featured!",
-                    delete_after=20
+                    f"🎲 Good luck getting featured!"
+                )
+                await self._send_discovery_message(
+                    config=config,
+                    guild=message.guild,
+                    user=message.author,
+                    message_text=success_message,
+                    original_channel=message.channel
                 )
 
                 # Removed deprecated quick feature - now only adds to pool
@@ -550,6 +567,82 @@ class DiscoveryCog(commands.Cog):
                 if not starter_message:
                     logger.warning(f"[Thread Create] Could not get starter message for thread {thread.id} after {max_retries} attempts")
                     return
+
+                # Token checking for forum posts
+                author = starter_message.author
+
+                # Get or create member record
+                member = session.query(GuildMember).filter_by(
+                    guild_id=thread.guild.id,
+                    user_id=author.id
+                ).first()
+
+                if not member:
+                    logger.info(
+                        f"[Thread Create] Creating new GuildMember record for {author.id} in guild {thread.guild.id}, "
+                        f"display_name={author.display_name}, source=Discord.Thread.author"
+                    )
+                    member = GuildMember(
+                        guild_id=thread.guild.id,
+                        user_id=author.id,
+                        xp=0,
+                        level=1,
+                        hero_tokens=0
+                    )
+                    session.add(member)
+                    session.flush()
+
+                # Check if tokens are required for forum posts
+                require_tokens = getattr(config, 'require_tokens_forum', False)
+                token_cost = config.token_cost_forum if hasattr(config, 'token_cost_forum') else 10
+                now = int(time.time())
+
+                if require_tokens and member.hero_tokens < token_cost:
+                    # Not enough tokens - just log (no spam message)
+                    logger.info(f"[Thread Create] User {author.id} doesn't have enough tokens ({member.hero_tokens}/{token_cost})")
+                    return
+
+                # Check cooldown
+                cooldown_hours = getattr(config, 'entry_cooldown_hours', 24)
+                cooldown_seconds = cooldown_hours * 3600
+
+                last_entry = session.query(FeaturedPool).filter_by(
+                    guild_id=thread.guild.id,
+                    user_id=author.id
+                ).order_by(FeaturedPool.entered_at.desc()).first()
+
+                if last_entry and (now - last_entry.entered_at) < cooldown_seconds:
+                    # Still on cooldown
+                    time_left = cooldown_seconds - (now - last_entry.entered_at)
+                    hours_left = int(time_left // 3600)
+                    minutes_left = int((time_left % 3600) // 60)
+
+                    # Use customizable cooldown message
+                    cooldown_msg = config.cooldown_message if config.cooldown_message else (
+                        "⏰ You're on cooldown! Can enter the featured pool again in {time_left}.\n"
+                        "💰 Your {token_cost} hero_tokens were saved."
+                    )
+
+                    # Format the message with time_left and token_cost
+                    formatted_msg = cooldown_msg.format(
+                        time_left=f"**{hours_left}h {minutes_left}m**",
+                        token_cost=token_cost
+                    )
+
+                    await self._send_discovery_message(
+                        config=config,
+                        guild=thread.guild,
+                        user=author,
+                        message_text=formatted_msg,
+                        original_channel=thread
+                    )
+                    logger.info(f"[Thread Create] User {author.id} is on cooldown ({hours_left}h {minutes_left}m remaining)")
+                    return
+
+                # Deduct tokens if required
+                if require_tokens:
+                    member.hero_tokens -= token_cost
+                    logger.info(f"[Thread Create] Deducted {token_cost} tokens from user {author.id} ({member.hero_tokens} remaining)")
 
                 # Add to featured pool
                 await self._add_forum_post_to_pool(
@@ -1204,8 +1297,6 @@ class DiscoveryCog(commands.Cog):
         - 6-second delay between batches
         - Can handle 1000+ guilds in ~10 minutes
         """
-        import time
-
         with db_session_scope() as session:
             # Get all guilds with intro forum configured
             configs = session.query(DiscoveryConfig).filter(
@@ -1433,8 +1524,55 @@ class DiscoveryCog(commands.Cog):
                             logger.debug(f"[Forum Scanner] Could not get starter message for thread {thread.id} after {max_retries} attempts")
                             continue
 
-                        # Add to featured pool (not directly to Hall of Fame!)
-                        # This way they go through random selection like channel posts
+                        # Check if already in pool
+                        existing = session.query(FeaturedPool).filter_by(
+                            guild_id=guild_id,
+                            forum_thread_id=thread.id
+                        ).first()
+
+                        if existing:
+                            logger.debug(f"[Forum Scanner] Thread {thread.id} already in pool, skipping")
+                            continue
+
+                        # Get member record to check tokens
+                        author = starter_message.author
+                        member = session.query(GuildMember).filter_by(
+                            guild_id=guild_id,
+                            user_id=author.id
+                        ).first()
+
+                        if not member:
+                            logger.debug(f"[Forum Scanner] No member record for user {author.id}, skipping")
+                            continue
+
+                        # Check if tokens are required
+                        require_tokens = getattr(config, 'require_tokens_forum', False)
+                        token_cost = config.token_cost_forum if hasattr(config, 'token_cost_forum') else 10
+
+                        if require_tokens and member.hero_tokens < token_cost:
+                            logger.debug(f"[Forum Scanner] User {author.id} doesn't have enough tokens ({member.hero_tokens}/{token_cost}), skipping")
+                            continue
+
+                        # Check cooldown
+                        now = int(time.time())
+                        cooldown_hours = getattr(config, 'entry_cooldown_hours', 24)
+                        cooldown_seconds = cooldown_hours * 3600
+
+                        last_entry = session.query(FeaturedPool).filter_by(
+                            guild_id=guild_id,
+                            user_id=author.id
+                        ).order_by(FeaturedPool.entered_at.desc()).first()
+
+                        if last_entry and (now - last_entry.entered_at) < cooldown_seconds:
+                            logger.debug(f"[Forum Scanner] User {author.id} is on cooldown, skipping")
+                            continue
+
+                        # Deduct tokens if required
+                        if require_tokens:
+                            member.hero_tokens -= token_cost
+                            logger.info(f"[Forum Scanner] Deducted {token_cost} tokens from user {author.id} ({member.hero_tokens} remaining)")
+
+                        # Add to featured pool
                         await self._add_forum_post_to_pool(
                             guild_id=guild_id,
                             thread=thread,
@@ -1442,6 +1580,7 @@ class DiscoveryCog(commands.Cog):
                             config=config
                         )
                         processed += 1
+                        logger.info(f"[Forum Scanner] Added user {author.id} from thread {thread.id} to pool")
 
                     except Exception as e:
                         logger.error(f"[Forum Scanner] Error processing thread {thread.id}: {e}", exc_info=True)
@@ -1455,9 +1594,59 @@ class DiscoveryCog(commands.Cog):
                 logger.error(f"[Forum Scanner] Error fetching threads for guild {guild_id}: {e}", exc_info=True)
 
             # Update last scan time
-            import time
             config.last_intro_scan_at = int(time.time())
             session.commit()
+
+    async def _send_discovery_message(self, config, guild, user, message_text, original_channel=None, delete_after=300):
+        """
+        Send a discovery message either to the response channel or as a reply.
+
+        Args:
+            config: DiscoveryConfig object
+            guild: discord.Guild
+            user: discord.User or discord.Member
+            message_text: The formatted message to send
+            original_channel: The channel/thread where the action happened (for replies)
+            delete_after: Seconds until message auto-deletes (default 300 = 5 minutes)
+
+        Returns:
+            The sent message object or None
+        """
+        try:
+            # Check if message_response_channel_id is set
+            if config.message_response_channel_id:
+                # Send to response channel with username (not mention)
+                response_channel = guild.get_channel(config.message_response_channel_id)
+                if response_channel:
+                    # Include username in message
+                    full_message = f"**{user.display_name}** {message_text}"
+                    msg = await response_channel.send(full_message)
+                    # Delete after specified seconds
+                    await asyncio.sleep(delete_after)
+                    try:
+                        await msg.delete()
+                    except:
+                        pass  # Message might already be deleted
+                    return msg
+                else:
+                    logger.warning(f"Message response channel {config.message_response_channel_id} not found in guild {guild.id}")
+
+            # Fallback: reply in original channel with mention (if original_channel provided)
+            if original_channel:
+                # Check if it's a TextChannel/Thread (has send method)
+                if hasattr(original_channel, 'send'):
+                    msg = await original_channel.send(f"{user.mention} {message_text}")
+                    await asyncio.sleep(delete_after)
+                    try:
+                        await msg.delete()
+                    except:
+                        pass
+                    return msg
+
+            return None
+        except Exception as e:
+            logger.error(f"Error sending discovery message: {e}", exc_info=True)
+            return None
 
     async def _add_forum_post_to_pool(self, guild_id: int, thread: discord.Thread, message: discord.Message, config=None):
         """
@@ -1506,13 +1695,24 @@ class DiscoveryCog(commands.Cog):
                 session.add(pool_entry)
                 logger.info(f"[Forum Pool] Added {author.display_name} to featured pool from forum (guild {guild_id})")
 
-                # Send post response message to the thread
+                # Send post response message to the thread ONLY if it's recent (within last hour)
+                # This prevents spam on bot restart when scanning old threads
                 if config and config.post_response:
-                    try:
-                        await thread.send(config.post_response)
-                        logger.debug(f"[Forum Pool] Sent post response to thread {thread.id}")
-                    except Exception as e:
-                        logger.error(f"[Forum Pool] Failed to send post response: {e}")
+                    message_age = now - int(message.created_at.timestamp())
+                    if message_age < 3600:  # Only send if message is less than 1 hour old
+                        try:
+                            await self._send_discovery_message(
+                                config=config,
+                                guild=thread.guild,
+                                user=author,
+                                message_text=config.post_response,
+                                original_channel=thread
+                            )
+                            logger.debug(f"[Forum Pool] Sent post response to thread {thread.id}")
+                        except Exception as e:
+                            logger.error(f"[Forum Pool] Failed to send post response: {e}")
+                    else:
+                        logger.debug(f"[Forum Pool] Skipped post response for old thread {thread.id} (age: {message_age}s)")
 
             session.commit()
 
@@ -3362,6 +3562,167 @@ class DiscoveryCog(commands.Cog):
                 result_embed.set_footer(text=f"{len(new_games) - announced_count} more will be announced in the next check")
 
         await ctx.respond(embed=result_embed)
+
+    @tasks.loop(hours=1)
+    async def featured_reminder_task(self):
+        """
+        Send scheduled "How to Get Featured" reminders based on admin configuration.
+        Runs every hour and checks if reminders need to be sent.
+        """
+        logger.debug("Running featured reminder task...")
+
+        with db_session_scope() as session:
+            now = int(time.time())
+
+            # Get all guilds with Discovery enabled and reminders scheduled
+            configs = session.query(DiscoveryConfig).filter(
+                DiscoveryConfig.enabled == True,
+                DiscoveryConfig.reminder_schedule != 'disabled',
+                DiscoveryConfig.reminder_schedule.isnot(None)
+            ).all()
+
+            for config in configs:
+                try:
+                    # Determine if reminder should be sent based on schedule
+                    should_send = False
+                    schedule = config.reminder_schedule
+                    last_sent = config.last_reminder_sent_at or 0
+
+                    # If never sent before, initialize timestamp without sending (prevents spam on bot restart)
+                    if last_sent == 0:
+                        config.last_reminder_sent_at = now
+                        session.commit()
+                        logger.info(f"Initialized reminder timestamp for guild {config.guild_id} without sending")
+                        continue
+
+                    if schedule == 'hourly':
+                        should_send = (now - last_sent) >= 3600  # 1 hour
+                    elif schedule == 'every_6_hours':
+                        should_send = (now - last_sent) >= 21600  # 6 hours
+                    elif schedule == 'daily':
+                        should_send = (now - last_sent) >= 86400  # 24 hours
+                    elif schedule == 'weekly':
+                        should_send = (now - last_sent) >= 604800  # 7 days
+                    elif schedule == 'monthly':
+                        should_send = (now - last_sent) >= 2592000  # 30 days
+
+                    if not should_send:
+                        continue
+
+                    # Get guild
+                    guild = self.bot.get_guild(config.guild_id)
+                    if not guild:
+                        logger.warning(f"Guild {config.guild_id} not found for reminder task")
+                        continue
+
+                    # Determine target channel (selfpromo or feature channel)
+                    target_channel = None
+                    if config.selfpromo_channel_id:
+                        target_channel = guild.get_channel(config.selfpromo_channel_id)
+                    elif config.feature_channel_id:
+                        target_channel = guild.get_channel(config.feature_channel_id)
+
+                    if not target_channel:
+                        logger.warning(f"No target channel found for reminder in guild {config.guild_id}")
+                        continue
+
+                    # Get guild settings for token_name
+                    guild_record = session.query(Guild).filter_by(guild_id=config.guild_id).first()
+                    token_name = guild_record.token_name if guild_record and guild_record.token_name else "Hero Tokens"
+
+                    # Build the embed - fully customizable by admin through "How to get Featured" field
+                    description = config.how_to_enter_response if config.how_to_enter_response else (
+                        "Want to be featured in our Creator Discovery system? Here's how!"
+                    )
+
+                    # Replace placeholders with actual values
+                    description = description.replace("{token_cost}", str(config.token_cost))
+                    description = description.replace("{token_name}", token_name)
+                    description = description.replace("{entry_cooldown}", f"{config.entry_cooldown_hours} hours" if hasattr(config, 'entry_cooldown_hours') else "24 hours")
+                    # Remove user-specific placeholders that don't apply to general reminders
+                    description = description.replace("{hero_tokens}", "???")
+
+                    embed = discord.Embed(
+                        title="🌟 How to Get Featured",
+                        description=description,
+                        color=discord.Color.gold()
+                    )
+                    embed.timestamp = discord.utils.utcnow()
+
+                    # Send the embed
+                    await target_channel.send(embed=embed)
+                    logger.info(f"Sent scheduled featured reminder to guild {config.guild_id} (schedule: {schedule})")
+
+                    # Update last sent timestamp
+                    config.last_reminder_sent_at = now
+                    session.commit()
+
+                except Exception as e:
+                    logger.error(f"Error sending scheduled reminder for guild {config.guild_id}: {e}", exc_info=True)
+
+    @featured_reminder_task.before_loop
+    async def before_featured_reminder_task(self):
+        await self.bot.wait_until_ready()
+
+    @discord.slash_command(name="send-featured-reminder", description="Send a reminder about how to get featured")
+    @commands.has_permissions(administrator=True)
+    async def send_featured_reminder(
+        self,
+        ctx: discord.ApplicationContext,
+        channel: discord.Option(discord.TextChannel, description="Channel to send the reminder to (defaults to self-promo channel)", required=False) = None
+    ):
+        """Send an embed explaining how to get featured in the discovery system."""
+        await ctx.defer(ephemeral=True)
+
+        with db_session_scope() as session:
+            config = session.query(DiscoveryConfig).filter_by(guild_id=ctx.guild.id).first()
+
+            if not config or not config.enabled:
+                await ctx.respond("❌ Creator Discovery is not enabled in this server!", ephemeral=True)
+                return
+
+            # Determine target channel
+            target_channel = channel
+            if not target_channel:
+                # Use selfpromo channel if available
+                if config.selfpromo_channel_id:
+                    target_channel = ctx.guild.get_channel(config.selfpromo_channel_id)
+                elif config.feature_channel_id:
+                    target_channel = ctx.guild.get_channel(config.feature_channel_id)
+
+            if not target_channel:
+                await ctx.respond("❌ Please specify a channel or configure the self-promo channel first!", ephemeral=True)
+                return
+
+            # Get guild settings for token_name
+            guild_record = session.query(Guild).filter_by(guild_id=ctx.guild.id).first()
+            token_name = guild_record.token_name if guild_record and guild_record.token_name else "Hero Tokens"
+
+            # Build the embed - fully customizable by admin through "How to get Featured" field
+            description = config.how_to_enter_response if config.how_to_enter_response else (
+                "Want to be featured in our Creator Discovery system? Here's how!"
+            )
+
+            # Replace placeholders with actual values
+            description = description.replace("{token_cost}", str(config.token_cost))
+            description = description.replace("{token_name}", token_name)
+            description = description.replace("{entry_cooldown}", f"{config.entry_cooldown_hours} hours" if hasattr(config, 'entry_cooldown_hours') else "24 hours")
+            # Remove user-specific placeholders that don't apply to general reminders
+            description = description.replace("{hero_tokens}", "???")
+
+            embed = discord.Embed(
+                title="🌟 How to Get Featured",
+                description=description,
+                color=discord.Color.gold()
+            )
+            embed.timestamp = discord.utils.utcnow()
+
+            try:
+                await target_channel.send(embed=embed)
+                await ctx.respond(f"✅ Sent featured reminder to {target_channel.mention}!", ephemeral=True)
+            except Exception as e:
+                logger.error(f"Failed to send featured reminder: {e}")
+                await ctx.respond(f"❌ Failed to send reminder: {str(e)}", ephemeral=True)
 
 
 def setup(bot: commands.Bot):

@@ -623,6 +623,26 @@ class JoinGroupButton(discord.ui.Button):
             asyncio.create_task(_auto_delete_after(interaction))
             return
 
+        # Check if user is blacklisted
+        try:
+            with get_db_session() as session:
+                from models import LFGMemberStats
+                stats = session.query(LFGMemberStats).filter_by(
+                    guild_id=self.parent_view.group.guild_id,
+                    user_id=interaction.user.id
+                ).first()
+
+                if stats and stats.is_blacklisted:
+                    blacklist_reason = stats.blacklist_reason or "Too many no-shows"
+                    await interaction.response.send_message(
+                        f"❌ You are blacklisted and cannot join groups.\nReason: {blacklist_reason}",
+                        ephemeral=True
+                    )
+                    asyncio.create_task(_auto_delete_after(interaction))
+                    return
+        except Exception as e:
+            logger.error(f"Error checking blacklist status: {e}")
+
         # Add to group
         self.parent_view.member_data[interaction.user.id] = {"options": {}}
 
