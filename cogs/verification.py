@@ -146,6 +146,8 @@ class MultiStepView(View):
     def __init__(self, guild_id: int, require_rules: bool, require_intro: bool):
         super().__init__(timeout=None)
         self.guild_id = guild_id
+        self.require_rules = require_rules
+        self.require_intro = require_intro
 
         # Step 1: Rules button
         rules_button = Button(
@@ -174,8 +176,7 @@ class MultiStepView(View):
         with db_session_scope() as session:
             db_member = session.get(GuildMember, (interaction.guild.id, interaction.user.id))
             if db_member:
-                # Store in a temporary flag (we'll use verification_method field)
-                db_member.verification_method = "rules_read"
+                _save_step(db_member, "rules")
 
         await interaction.response.send_message(
             "Rules acknowledged! Now click **Complete Verification** to finish.",
@@ -190,7 +191,7 @@ class MultiStepView(View):
 
             # Check if rules were read (if required)
             if config and config.require_rules_read:
-                if not db_member or db_member.verification_method != "rules_read":
+                if not db_member or "rules" not in _parse_steps(db_member):
                     await interaction.response.send_message(
                         "Please click **I've read the rules** first!",
                         ephemeral=True
@@ -219,6 +220,24 @@ class MultiStepView(View):
 
 
 # ==================== HELPER FUNCTIONS ====================
+
+def _parse_steps(db_member: GuildMember) -> set:
+    """Parse multi-step progress from verification_method field."""
+    if not db_member or not db_member.verification_method:
+        return set()
+    method = db_member.verification_method
+    if method.startswith("ms:"):
+        parts = method[3:].split(",")
+        return {p.strip() for p in parts if p.strip()}
+    return {method}
+
+
+def _save_step(db_member: GuildMember, step: str):
+    """Persist a completed step onto the member record."""
+    steps = _parse_steps(db_member)
+    steps.add(step)
+    db_member.verification_method = "ms:" + ",".join(sorted(steps))
+
 
 async def process_verification(interaction: discord.Interaction, method: str):
     """Process successful verification for a member."""
@@ -266,7 +285,10 @@ async def process_verification(interaction: discord.Interaction, method: str):
         # Mark as verified
         db_member.is_verified = True
         db_member.verified_at = int(time.time())
-        db_member.verification_method = method
+        if method == "multi_step":
+            _save_step(db_member, "verified")
+        else:
+            db_member.verification_method = method
         db_member.is_quarantined = False
         db_member.quarantined_at = None
 
@@ -436,10 +458,36 @@ class VerificationCog(commands.Cog):
     # ==================== EVENT LISTENERS ====================
 
     @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """Track intro posts for multi-step verification."""
+        try:
+            if message.author.bot or not message.guild:
+                return
+
+            with db_session_scope() as session:
+                config = session.get(VerificationConfig, message.guild.id)
+                if not config or not config.require_intro_message or not config.intro_channel_id:
+                    return
+
+                if message.channel.id != config.intro_channel_id:
+                    return
+
+                db_member = session.get(GuildMember, (message.guild.id, message.author.id))
+                if not db_member:
+                    return
+
+                _save_step(db_member, "intro")
+                logger.info(f"[VERIFY] Marked intro complete for {message.author} in {message.guild.name}")
+        except Exception as e:
+            logger.error(f"Error tracking intro message: {e}")
+
+    @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         """Handle new member join - apply quarantine and start verification."""
         if member.bot:
             return
+        # Ensure bot is ready to resolve channels/roles
+        await self.bot.wait_until_ready()
 
         with db_session_scope() as session:
             db_guild = session.get(Guild, member.guild.id)
@@ -466,6 +514,9 @@ class VerificationCog(commands.Cog):
                     is_verified=False,
                 )
                 session.add(db_member)
+            else:
+                # Reset multi-step progress when rejoining
+                db_member.verification_method = None
 
             # Check account age for auto-verification
             if config.verification_type == VerificationType.ACCOUNT_AGE:
@@ -502,6 +553,8 @@ class VerificationCog(commands.Cog):
                         await member.add_roles(quarantine_role, reason="Pending verification")
                     except discord.Forbidden:
                         logger.warning(f"Cannot add quarantine role in {member.guild.name}")
+                    except Exception as role_err:
+                        logger.error(f"Error adding quarantine role in {member.guild.name}: {role_err}")
 
             verification_channel_id = db_guild.verification_channel_id
             instructions = config.verification_instructions

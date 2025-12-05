@@ -49,9 +49,10 @@ def format_message(template: str, member: discord.Member) -> str:
     guild = member.guild
     member_count = guild.member_count or len(guild.members)
 
+    display_name = member.display_name or member.name
     replacements = {
-        "{user}": member.mention,
-        "{username}": member.display_name,
+        "{user}": member.mention,           # mention (legacy/default)
+        "{username}": display_name,         # plain display name
         "{discriminator}": member.discriminator if member.discriminator != "0" else "",
         "{user_id}": str(member.id),
         "{server}": guild.name,
@@ -122,13 +123,13 @@ class WelcomeCog(commands.Cog):
             auto_role_id = config.auto_role_id
             welcome_channel_id = db_guild.welcome_channel_id
 
-        # Send channel welcome message
+        # Send channel welcome message (text or forum)
         if channel_enabled and welcome_channel_id:
             welcome_channel = guild.get_channel(welcome_channel_id)
-            if welcome_channel and isinstance(welcome_channel, discord.TextChannel):
-                try:
-                    formatted_message = format_message(channel_message, member)
+            try:
+                formatted_message = format_message(channel_message, member)
 
+                async def send_payload(dest_channel):
                     if embed_enabled:
                         embed = discord.Embed(
                             title=format_message(embed_title, member) if embed_title else None,
@@ -140,15 +141,25 @@ class WelcomeCog(commands.Cog):
                             embed.set_thumbnail(url=member.display_avatar.url)
                         if embed_footer:
                             embed.set_footer(text=format_message(embed_footer, member))
-
-                        await welcome_channel.send(embed=embed)
+                        await dest_channel.send(embed=embed)
                     else:
-                        await welcome_channel.send(formatted_message)
+                        await dest_channel.send(formatted_message)
 
-                except discord.Forbidden:
-                    logger.warning(f"Cannot send welcome message in {guild.name} - missing permissions")
-                except Exception as e:
-                    logger.error(f"Error sending welcome message: {e}")
+                if isinstance(welcome_channel, discord.TextChannel):
+                    await send_payload(welcome_channel)
+                elif isinstance(welcome_channel, discord.ForumChannel):
+                    thread = await welcome_channel.create_thread(
+                        name=f"Welcome **{member.display_name or member.name}**",
+                        content=None
+                    )
+                    await send_payload(thread)
+                else:
+                    logger.warning(f"Welcome channel {welcome_channel_id} is not text/forum in guild {guild.id}")
+
+            except discord.Forbidden:
+                logger.warning(f"Cannot send welcome message in {guild.name} - missing permissions")
+            except Exception as e:
+                logger.error(f"Error sending welcome message: {e}")
 
         # Send DM welcome message
         if dm_enabled and dm_message:

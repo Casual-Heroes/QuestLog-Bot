@@ -169,6 +169,36 @@ class ModerationCog(commands.Cog):
                               details: str = None, duration: int = None):
         """Log a moderation action to the database and mod log channel."""
         with db_session_scope() as session:
+            db_guild = session.get(Guild, guild_id)
+
+            # Treat moderation as disabled when no mod/jail/mute channels or roles are configured
+            mod_enabled = bool(
+                db_guild
+                and (
+                    db_guild.mod_log_channel_id
+                    or db_guild.jail_channel_id
+                    or db_guild.jail_role_id
+                    or db_guild.muted_role_id
+                )
+            )
+            if not mod_enabled:
+                return
+
+            # Deduplicate rapid duplicate actions (e.g., double timeout events within 10s)
+            recent_cutoff = int(time.time()) - 10
+            existing = (
+                session.query(ModAction)
+                .filter(
+                    ModAction.guild_id == guild_id,
+                    ModAction.action_type == action_type,
+                    ModAction.target_id == (target.id if target else None),
+                    ModAction.timestamp >= recent_cutoff,
+                )
+                .first()
+            )
+            if existing:
+                return
+
             action = ModAction(
                 guild_id=guild_id,
                 mod_id=mod.id,
@@ -183,7 +213,6 @@ class ModerationCog(commands.Cog):
             )
             session.add(action)
 
-            db_guild = session.get(Guild, guild_id)
             log_channel_id = db_guild.mod_log_channel_id or db_guild.log_channel_id if db_guild else None
 
         # NOTE: Embed sending disabled - audit log cog handles all embeds to avoid duplicates

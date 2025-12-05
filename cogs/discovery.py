@@ -1218,10 +1218,13 @@ class DiscoveryCog(commands.Cog):
                             games = [g for g in games if g.release_date and g.release_date <= announcement_cutoff]
                             logger.info(f"Filtered to {len(games)} games within {announcement_window} day window")
 
-                            # Add to master list (avoid duplicates across searches)
+                            # Add to master list (avoid duplicates across searches), track privacy
                             for game in games:
                                 if game.id not in all_games_to_announce:
-                                    all_games_to_announce[game.id] = game
+                                    all_games_to_announce[game.id] = {
+                                        "game": game,
+                                        "is_public": bool(search_config.show_on_website),
+                                    }
 
                         except Exception as e:
                             logger.error(f"Error running search '{search_config.name}': {e}")
@@ -1229,8 +1232,21 @@ class DiscoveryCog(commands.Cog):
 
                     logger.info(f"Total unique games found across all searches: {len(all_games_to_announce)}")
 
-                    # Announce all unique games
-                    for game_id, game in all_games_to_announce.items():
+                    max_public = getattr(config, "max_public_announcements", None) or 5
+                    max_private = getattr(config, "max_private_announcements", None) or 5
+                    public_sent = 0
+                    private_sent = 0
+
+                    # Announce up to configured limits for public/private games
+                    for game_id, meta in all_games_to_announce.items():
+                        game = meta["game"]
+                        is_public = meta["is_public"]
+
+                        if is_public and public_sent >= max_public:
+                            continue
+                        if (not is_public) and private_sent >= max_private:
+                            continue
+
                         # Check if already announced
                         already_announced = session.query(AnnouncedGame).filter(
                             AnnouncedGame.guild_id == config.guild_id,
@@ -1240,10 +1256,20 @@ class DiscoveryCog(commands.Cog):
                         if already_announced:
                             continue
 
+                        # Pick channel based on search privacy
+                        target_channel = public_channel if is_public else private_channel
+                        if not target_channel:
+                            logger.warning(f"No target channel for game announcement in guild {config.guild_id} (public={public_channel}, private={private_channel})")
+                            continue
+
                         # Create and post announcement
                         try:
                             embed = self.create_game_announcement_embed(game)
-                            message = await channel.send(embed=embed)
+                            message = await target_channel.send(embed=embed)
+                            if is_public:
+                                public_sent += 1
+                            else:
+                                private_sent += 1
 
                             # Record announcement
                             announced = AnnouncedGame(
@@ -1267,6 +1293,18 @@ class DiscoveryCog(commands.Cog):
                         except Exception as e:
                             logger.error(f"Failed to announce game '{game.name}' in guild {config.guild_id}: {e}")
                             continue
+
+                    # If there were more games than we announced, drop a summary link
+                    if len(all_games_to_announce) > announce_sent and (public_channel or private_channel):
+                        summary_channel = public_channel or private_channel
+                        try:
+                            remaining = len(all_games_to_announce) - announce_sent
+                            await summary_channel.send(
+                                f"📋 Found {remaining} more upcoming games. "
+                                f"Check the dashboard for full results."
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to send discovery summary in guild {config.guild_id}: {e}")
 
                     # Update last check time
                     config.last_game_check_at = now

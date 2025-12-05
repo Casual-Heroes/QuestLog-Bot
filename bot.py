@@ -379,6 +379,7 @@ def main():
         "cogs.guild_sync_cog",  # Syncs member counts from Discord every 5 min
         "cogs.guild_sync",  # Auto-syncs roles/channels when they change (60s cooldown)
         "cogs.flair_cog",  # Flair store - let members customize their profile
+        "cogs.raffles",  # Raffles integration
     ]
 
     loaded_count = 0

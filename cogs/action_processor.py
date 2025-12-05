@@ -1273,9 +1273,26 @@ class ActionProcessorCog(commands.Cog):
         """
         user_id = payload.get("target_user_id")
         flair_name = payload.get("flair_name")
+        remove_flag = payload.get("remove_flair")
 
-        if not user_id or not flair_name:
-            raise ValueError("Missing target_user_id or flair_name in payload")
+        if not user_id:
+            raise ValueError("Missing target_user_id in payload")
+
+        # Removal: handle when flair_name is falsy OR explicit remove flag is sent
+        if not flair_name or remove_flag:
+            member = guild.get_member(user_id)
+            if not member:
+                raise ValueError(f"Member {user_id} not found in guild")
+            old_flair_roles = [r for r in member.roles if r.name.startswith("Flair: ")]
+            if old_flair_roles:
+                await member.remove_roles(*old_flair_roles, reason="Removing flair (requested)")
+                logger.info(f"Removed flair roles from {member.display_name}: {[r.name for r in old_flair_roles]}")
+            else:
+                logger.info(f"No flair roles to remove for {member.display_name}")
+            return {
+                "success": True,
+                "message": f"Removed flair from {member.display_name}"
+            }
 
         # Get member
         member = guild.get_member(user_id)

@@ -166,7 +166,8 @@ class Guild(Base):
     xp_enabled = Column(Boolean, default=True)
     anti_raid_enabled = Column(Boolean, default=True)
     verification_enabled = Column(Boolean, default=False)
-    audit_logging_enabled = Column(Boolean, default=True)
+    audit_logging_enabled = Column(Boolean, nullable=False, default=False, server_default='0')
+    mod_enabled = Column(Boolean, nullable=False, default=False, server_default='0')
     discovery_enabled = Column(Boolean, default=False)
 
     # Cached Discord Resources (JSON text - synced by bot to reduce API calls)
@@ -314,6 +315,7 @@ class XPConfig(Base):
     gaming_xp_per_interval = Column(Float, default=1.2)
     invite_xp = Column(Float, default=50.0)
     join_xp = Column(Float, default=25.0)
+    xp_enabled = Column(Boolean, nullable=False, default=True, server_default='1')
 
     # Token conversion
     tokens_per_100_xp_active = Column(Integer, default=15)
@@ -1852,3 +1854,48 @@ class GuildFlair(Base):
         Index("idx_guild_flair_enabled", "guild_id", "enabled"),
         UniqueConstraint("guild_id", "flair_name", name="uq_guild_flair_name"),
     )
+
+
+# Raffles (synced with dashboard)
+class Raffle(Base):
+    __tablename__ = "raffles"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    guild_id = Column(BigInteger, index=True)
+    title = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    cost_tokens = Column(Integer, default=0)
+    max_winners = Column(Integer, default=1)
+    start_at = Column(BigInteger, nullable=True)
+    end_at = Column(BigInteger, nullable=True)
+    auto_pick = Column(Boolean, default=False)
+    active = Column(Boolean, default=True)
+    winners = Column(Text, nullable=True)
+    winners_announced = Column(Boolean, default=False)  # Track if winners have been announced
+    announce_channel_id = Column(BigInteger, nullable=True)
+    announce_role_id = Column(BigInteger, nullable=True)
+    announce_message = Column(Text, nullable=True)
+    winner_message = Column(Text, nullable=True)
+    entry_emoji = Column(String(32), nullable=True)
+    announce_message_id = Column(BigInteger, nullable=True)
+    reminder_channel_id = Column(BigInteger, nullable=True)  # Channel to send admin pick reminders
+    reminder_sent = Column(Boolean, default=False)  # Track if admin reminder has been sent
+    created_by = Column(BigInteger, nullable=True)
+    created_by_name = Column(String(255), nullable=True)
+    created_at = Column(BigInteger, default=lambda: int(time.time()))
+
+    entries = relationship("RaffleEntry", cascade="all, delete-orphan", back_populates="raffle")
+
+
+class RaffleEntry(Base):
+    __tablename__ = "raffle_entries"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    guild_id = Column(BigInteger, index=True)
+    raffle_id = Column(Integer, ForeignKey("raffles.id", ondelete="CASCADE"), index=True)
+    user_id = Column(BigInteger, index=True)
+    username = Column(String(255), nullable=True)
+    tickets = Column(Integer, default=1)
+    created_at = Column(BigInteger, default=lambda: int(time.time()))
+
+    raffle = relationship("Raffle", back_populates="entries")
