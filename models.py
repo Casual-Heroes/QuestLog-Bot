@@ -167,6 +167,7 @@ class Guild(Base):
     anti_raid_enabled = Column(Boolean, default=True)
     verification_enabled = Column(Boolean, default=False)
     audit_logging_enabled = Column(Boolean, nullable=False, default=False, server_default='0')
+    audit_event_config = Column(Text, nullable=True)  # JSON map of event toggles
     mod_enabled = Column(Boolean, nullable=False, default=False, server_default='0')
     discovery_enabled = Column(Boolean, default=False)
 

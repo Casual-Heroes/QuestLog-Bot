@@ -36,6 +36,8 @@ from models import (
 )
 from utils import igdb
 
+DASHBOARD_BASE_URL = "https://dashboard.casual-heroes.com"
+
 
 def get_guild_tier(session, guild_id: int) -> str:
     """Get the effective tier for a guild (FREE, PREMIUM, or PRO)."""
@@ -1113,14 +1115,41 @@ class DiscoveryCog(commands.Cog):
 
         return embed
 
-    @tasks.loop(hours=12)
+    def _build_game_summary_embed(self, guild_id: int, total_found: int, search_count: int, announced_count: int, target_channel: discord.abc.Messageable = None):
+        dash_url = f"{DASHBOARD_BASE_URL}/warden/guild/{guild_id}/found-games/"
+        channel_text = target_channel.mention if target_channel else "this channel"
+        embed = discord.Embed(
+            title="✅ Game Discovery Check Complete",
+            description=f"Found {total_found} games across {search_count} search configurations.",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="📢 Announced", value=f"{announced_count} games to {channel_text}", inline=True)
+        embed.add_field(name="💾 Saved", value=f"{total_found} games total", inline=True)
+        embed.add_field(name="🔗 View Public Games", value=f"[Click here to view all {total_found} games on the dashboard]({dash_url})", inline=False)
+        embed.set_footer(text="Public games → Dashboard • Private games → Discord threads")
+        return embed
+
+    @tasks.loop(minutes=15)
     async def game_discovery_task(self):
         """
         Check for new game releases based on guild search configurations.
-        Runs every 12 hours (guilds can have custom intervals).
+        Runs every 15 minutes (guilds control their own interval via config).
         Uses IGDB for comprehensive game discovery with multiple saved searches.
         """
         logger.info("Running game discovery task...")
+
+        # Skip the first loop after a bot restart to avoid immediate re-announcements;
+        # stamp last_game_check_at to now so intervals resume from this boot time.
+        if not hasattr(self, "_game_discovery_boot_skipped"):
+            with db_session_scope() as session:
+                now_stamp = int(time.time())
+                session.query(DiscoveryConfig).filter(
+                    DiscoveryConfig.game_discovery_enabled == True
+                ).update({'last_game_check_at': now_stamp})
+                session.commit()
+            self._game_discovery_boot_skipped = True
+            logger.info("First discovery loop after boot skipped; intervals reset to now.")
+            return
 
         with db_session_scope() as session:
             now = int(time.time())
@@ -1137,6 +1166,12 @@ class DiscoveryCog(commands.Cog):
 
             for config in configs:
                 try:
+                    # On first boot, avoid immediate re-run if we've checked recently
+                    if not config.last_game_check_at:
+                        config.last_game_check_at = now
+                        session.commit()
+                        continue
+
                     # Check if it's time to check (based on interval)
                     if config.last_game_check_at:
                         time_since_last = now - config.last_game_check_at
@@ -1294,15 +1329,18 @@ class DiscoveryCog(commands.Cog):
                             logger.error(f"Failed to announce game '{game.name}' in guild {config.guild_id}: {e}")
                             continue
 
-                    # If there were more games than we announced, drop a summary link
-                    if len(all_games_to_announce) > announce_sent and (public_channel or private_channel):
-                        summary_channel = public_channel or private_channel
+                    # Always post a summary embed
+                    summary_channel = public_channel or private_channel
+                    if summary_channel:
                         try:
-                            remaining = len(all_games_to_announce) - announce_sent
-                            await summary_channel.send(
-                                f"📋 Found {remaining} more upcoming games. "
-                                f"Check the dashboard for full results."
+                            summary_embed = self._build_game_summary_embed(
+                                guild_id=config.guild_id,
+                                total_found=len(all_games_to_announce),
+                                search_count=len(search_configs),
+                                announced_count=announced_count,
+                                target_channel=summary_channel
                             )
+                            await summary_channel.send(embed=summary_embed)
                         except Exception as e:
                             logger.warning(f"Failed to send discovery summary in guild {config.guild_id}: {e}")
 
@@ -3586,20 +3624,17 @@ class DiscoveryCog(commands.Cog):
             # Update last check time
             config.last_game_check_at = now
 
-            result_embed = discord.Embed(
-                title="✅ Game Discovery Check Complete",
-                description=f"Announced {announced_count} new game(s) in {channel.mention}",
-                color=discord.Color.green()
+            summary_embed = self._build_game_summary_embed(
+                guild_id=ctx.guild.id,
+                total_found=len(games),
+                search_count=1,  # Manual command runs across current config set; using 1 to mirror dashboard button
+                announced_count=announced_count,
+                target_channel=announcement_channel
             )
-            result_embed.add_field(name="Source", value="IGDB", inline=True)
-            result_embed.add_field(name="Total Found", value=str(len(games)), inline=True)
-            result_embed.add_field(name="New Games", value=str(len(new_games)), inline=True)
-            result_embed.add_field(name="Announced", value=str(announced_count), inline=True)
 
-            if announced_count < len(new_games):
-                result_embed.set_footer(text=f"{len(new_games) - announced_count} more will be announced in the next check")
-
-        await ctx.respond(embed=result_embed)
+        # Send summary to channel and respond
+        await announcement_channel.send(embed=summary_embed)
+        await ctx.respond(embed=summary_embed)
 
     @tasks.loop(hours=1)
     async def featured_reminder_task(self):

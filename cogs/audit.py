@@ -21,6 +21,7 @@ import time
 import io
 import csv
 import asyncio
+import json
 import discord
 from discord.ext import commands, tasks
 from discord import SlashCommandGroup
@@ -126,6 +127,8 @@ class AuditCog(commands.Cog):
             db_guild = session.get(Guild, guild_id)
             if not db_guild or not db_guild.audit_logging_enabled:
                 return
+            if not self._event_allowed(db_guild, action):
+                return
 
             # Create audit log entry
             log_entry = AuditLog(
@@ -150,6 +153,18 @@ class AuditCog(commands.Cog):
                 log_channel_id, action, actor_id, actor_name,
                 target_id, target_name, target_type, reason, details
             )
+
+    def _event_allowed(self, db_guild: Guild, action: AuditAction) -> bool:
+        """Check per-event toggles; defaults to True if no config set."""
+        if not db_guild.audit_logging_enabled:
+            return False
+        if not db_guild.audit_event_config:
+            return True
+        try:
+            cfg = json.loads(db_guild.audit_event_config)
+            return cfg.get(action.value, True)
+        except Exception:
+            return True
 
     async def _send_log_embed(
         self,

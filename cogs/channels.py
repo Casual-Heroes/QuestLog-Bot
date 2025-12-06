@@ -519,7 +519,8 @@ class ChannelsCog(commands.Cog):
             db_guild = session.get(Guild, guild_id)
             if not db_guild:
                 return
-            announce_channel_id = db_guild.welcome_channel_id
+            # Prefer audit log channel if audit logging is enabled; fallback to welcome channel
+            announce_channel_id = db_guild.log_channel_id if db_guild.audit_logging_enabled else db_guild.welcome_channel_id
 
         if not announce_channel_id:
             return
