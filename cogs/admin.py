@@ -8,10 +8,11 @@ import os
 import time
 import json
 import asyncio
+import re
 import discord
 from discord.ext import commands
 from discord import SlashCommandGroup
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from config import db_session_scope, logger, get_debug_guilds
@@ -22,11 +23,169 @@ from models import Guild, FeedbackConfig, Suggestion, SuggestionStatus, GuildMem
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", 0))
 
 
+def replace_mentions(text: str, guild: discord.Guild) -> str:
+    """Replace @role/@user/#channel tokens with proper mentions (case-insensitive)."""
+    if not text:
+        return text
+
+    # Build quick lookup for members (username, display, global) lowercase
+    member_map = {}
+    for m in guild.members:
+        for variant in {m.name, m.display_name, getattr(m, "global_name", None)}:
+            if variant:
+                member_map[variant.lower()] = m
+
+    # Channels
+    def ch_replace(match):
+        name = match.group(1)
+        ch = discord.utils.find(lambda c: c.name.lower() == name.lower(), guild.channels)
+        return f"<#{ch.id}>" if ch else match.group(0)
+    text = re.sub(r"#([A-Za-z0-9_\-\|]+)", ch_replace, text)
+
+    # Roles/users
+    def at_replace(match):
+        name = match.group(1).strip()
+        # Role
+        role = discord.utils.find(lambda r: r.name.lower() == name.lower(), guild.roles)
+        if role:
+            return f"<@&{role.id}>"
+        # Member by name/nick/global
+        member = member_map.get(name.lower())
+        if member:
+            return f"<@{member.id}>"
+        return match.group(0)
+
+    text = re.sub(r"@([^\s]+)", at_replace, text)
+    return text
+
+# =============================================================================
+# Embed helper modal
+# =============================================================================
+
+class SendEmbedModal(discord.ui.Modal):
+    """Modal for composing and sending a custom embed."""
+    def __init__(self, channel: Optional[discord.TextChannel], author: discord.Member):
+        super().__init__(title="Send Custom Embed")
+        self.target_channel = channel
+        self.author = author
+
+        self.add_item(discord.ui.InputText(
+            label="Title",
+            placeholder="Embed title",
+            required=True,
+            max_length=256
+        ))
+        self.add_item(discord.ui.InputText(
+            label="Description",
+            placeholder="Embed content (supports @role and #channel)",
+            style=discord.InputTextStyle.long,
+            required=True,
+            max_length=4000
+        ))
+        self.add_item(discord.ui.InputText(
+            label="Color (hex, optional)",
+            placeholder="#5865F2",
+            required=False,
+            max_length=7
+        ))
+        self.add_item(discord.ui.InputText(
+            label="Thumbnail URL (optional)",
+            placeholder="https://example.com/thumb.png",
+            required=False
+        ))
+        self.add_item(discord.ui.InputText(
+            label="Footer (optional)",
+            placeholder="Footer text",
+            required=False,
+            max_length=256
+        ))
+
+    async def callback(self, interaction: discord.Interaction):
+        title = self.children[0].value
+        description = self.children[1].value
+        color_str = self.children[2].value
+        thumb = self.children[3].value
+        footer = self.children[4].value if len(self.children) > 4 else None
+
+        # Replace simple mentions
+        title = replace_mentions(title, interaction.guild)
+        description = replace_mentions(description, interaction.guild)
+        footer = replace_mentions(footer, interaction.guild) if footer else footer
+
+        embed_color = discord.Color.blurple()
+        if color_str:
+            try:
+                embed_color = discord.Color(int(color_str.replace("#", ""), 16))
+            except Exception:
+                await interaction.response.send_message("❌ Invalid hex color. Use #RRGGBB.", ephemeral=True)
+                return
+
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            color=embed_color,
+            timestamp=datetime.now(timezone.utc)
+        )
+        if thumb:
+            embed.set_thumbnail(url=thumb)
+        if footer:
+            embed.set_footer(text=footer)
+        # Author field removed to stay within modal input limits
+
+        channel = self.target_channel or interaction.channel
+        try:
+            msg = await channel.send(embed=embed)
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ I don't have permission to send in that channel.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            f"✅ Embed sent to {channel.mention}! Message ID: `{msg.id}`",
+            ephemeral=True
+        )
+
+class SendMessageModal(discord.ui.Modal):
+    """Modal for composing and sending a plain message."""
+    def __init__(self, channel: Optional[discord.TextChannel], silent: bool = False):
+        super().__init__(title="Send Message")
+        self.target_channel = channel
+        self.silent = silent
+
+        self.add_item(discord.ui.InputText(
+            label="Message",
+            placeholder="Message body (supports @role, @user, #channel)",
+            style=discord.InputTextStyle.long,
+            required=True,
+            max_length=2000
+        ))
+
+    async def callback(self, interaction: discord.Interaction):
+        body = self.children[0].value
+        body = replace_mentions(body, interaction.guild)
+
+        channel = self.target_channel or interaction.channel
+        allowed = discord.AllowedMentions.none() if self.silent else discord.AllowedMentions.all()
+        try:
+            msg = await channel.send(body, allowed_mentions=allowed)
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ I don't have permission to send in that channel.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"✅ Message sent to {channel.mention}! ID: `{msg.id}`",
+            ephemeral=True
+        )
+
+
 class AdminCog(commands.Cog):
     """Admin and settings commands."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+
+    message = SlashCommandGroup(
+        name="message",
+        description="Message System: send/edit messages and embeds",
+    )
 
     settings = SlashCommandGroup(
         name="settings",
@@ -234,68 +393,32 @@ class AdminCog(commands.Cog):
 
     @discord.slash_command(name="send_embed", description="Send a custom embed message")
     @commands.has_permissions(manage_messages=True)
-    @discord.option("channel", discord.TextChannel, description="Channel to send embed to")
-    @discord.option("title", str, description="Embed title")
-    @discord.option("description", str, description="Embed description")
-    @discord.option("color", str, description="Hex color (e.g., #FF5733)", required=False)
-    @discord.option("thumbnail_url", str, description="Thumbnail image URL", required=False)
-    @discord.option("image_url", str, description="Main image URL", required=False)
-    @discord.option("footer", str, description="Footer text", required=False)
-    @discord.option("author_name", str, description="Author name", required=False)
+    @discord.option("channel", discord.TextChannel, description="Channel to send embed to", required=False)
     async def send_embed(
         self,
         ctx: discord.ApplicationContext,
-        channel: discord.TextChannel,
-        title: str,
-        description: str,
-        color: str = None,
-        thumbnail_url: str = None,
-        image_url: str = None,
-        footer: str = None,
-        author_name: str = None
+        channel: Optional[discord.TextChannel] = None
     ):
-        """Send a custom embed message to a channel."""
-        try:
-            # Parse color
-            embed_color = discord.Color.blurple()
-            if color:
-                color = color.strip('#')
-                try:
-                    embed_color = discord.Color(int(color, 16))
-                except ValueError:
-                    await ctx.respond("❌ Invalid hex color. Use format: #FF5733", ephemeral=True)
-                    return
+        """Open a modal to compose and send an embed."""
+        modal = SendEmbedModal(channel=channel, author=ctx.author)
+        await ctx.send_modal(modal)
 
-            embed = discord.Embed(
-                title=title,
-                description=description,
-                color=embed_color
-            )
+    # New Message System commands
+    @message.command(name="send", description="Send a message via modal")
+    @commands.has_permissions(manage_messages=True)
+    @discord.option("channel", discord.TextChannel, description="Channel to send to", required=False)
+    @discord.option("silent", bool, description="Suppress mentions?", required=False, default=False)
+    async def message_send(self, ctx: discord.ApplicationContext, channel: Optional[discord.TextChannel] = None, silent: bool = False):
+        modal = SendMessageModal(channel=channel, silent=silent)
+        await ctx.send_modal(modal)
 
-            if thumbnail_url:
-                embed.set_thumbnail(url=thumbnail_url)
-            if image_url:
-                embed.set_image(url=image_url)
-            if footer:
-                embed.set_footer(text=footer)
-            if author_name:
-                embed.set_author(name=author_name)
+    @message.command(name="send_embed", description="Send an embed via modal")
+    @commands.has_permissions(manage_messages=True)
+    @discord.option("channel", discord.TextChannel, description="Channel to send to", required=False)
+    async def message_send_embed(self, ctx: discord.ApplicationContext, channel: Optional[discord.TextChannel] = None):
+        modal = SendEmbedModal(channel=channel, author=ctx.author)
+        await ctx.send_modal(modal)
 
-            embed.timestamp = datetime.utcnow()
-
-            msg = await channel.send(embed=embed)
-
-            await ctx.respond(
-                f"✅ Embed sent to {channel.mention}!\n"
-                f"Message ID: `{msg.id}` (use this for editing)",
-                ephemeral=True
-            )
-
-        except discord.Forbidden:
-            await ctx.respond("❌ I don't have permission to send messages in that channel.", ephemeral=True)
-        except Exception as e:
-            logger.error(f"Send embed error: {e}")
-            await ctx.respond(f"❌ Error sending embed: {str(e)}", ephemeral=True)
 
     @discord.slash_command(name="edit_embed", description="Edit an existing embed message")
     @commands.has_permissions(manage_messages=True)
@@ -334,10 +457,19 @@ class AdminCog(commands.Cog):
             old_embed = message.embeds[0]
 
             # Build new embed, keeping old values if not provided
+            # Replace mention tokens in provided fields
+            if title:
+                title = replace_mentions(title, ctx.guild)
+            if description:
+                description = replace_mentions(description, ctx.guild)
+            if footer:
+                footer = replace_mentions(footer, ctx.guild)
+
             new_embed = discord.Embed(
                 title=title if title else old_embed.title,
                 description=description if description else old_embed.description,
-                color=old_embed.color
+                color=old_embed.color,
+                timestamp=datetime.now(timezone.utc)
             )
 
             # Update color if provided
@@ -361,8 +493,8 @@ class AdminCog(commands.Cog):
             if old_embed.author:
                 new_embed.set_author(name=old_embed.author.name)
 
-            new_embed.timestamp = datetime.utcnow()
-
+            new_embed.timestamp = datetime.now(timezone.utc) 
+            
             await message.edit(embed=new_embed)
             await ctx.respond(f"✅ Embed updated in {channel.mention}!", ephemeral=True)
 
@@ -1140,6 +1272,11 @@ class AdminCog(commands.Cog):
             guild.vip_granted_at = int(time.time())
             guild.vip_note = note
 
+            # Set lifetime subscription tier for VIP servers
+            guild.subscription_tier = 'complete'
+            guild.billing_cycle = 'lifetime'
+            guild.stripe_subscription_id = f'vip_{target_guild_id}'
+
             guild_name = guild.guild_name or "Unknown"
 
         logger.info(f"VIP granted to {guild_name} ({target_guild_id}) by {message.author}")
@@ -1174,6 +1311,11 @@ class AdminCog(commands.Cog):
             guild.vip_granted_by = None
             guild.vip_granted_at = None
             guild.vip_note = None
+
+            # Reset subscription tier to free
+            guild.subscription_tier = 'free'
+            guild.billing_cycle = None
+            guild.stripe_subscription_id = None
 
             guild_name = guild.guild_name or "Unknown"
 

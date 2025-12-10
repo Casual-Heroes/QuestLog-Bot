@@ -1176,9 +1176,14 @@ class DiscoveryCog(commands.Cog):
                     if config.last_game_check_at:
                         time_since_last = now - config.last_game_check_at
                         interval_seconds = (config.game_check_interval_hours or 24) * 3600
+                        hours_since = time_since_last / 3600
+                        interval_hours = interval_seconds / 3600
+
                         if time_since_last < interval_seconds:
-                            logger.debug(f"Skipping guild {config.guild_id}, checked {time_since_last//3600}h ago")
+                            logger.info(f"Skipping guild {config.guild_id}: checked {hours_since:.2f}h ago (interval: {interval_hours:.0f}h)")
                             continue
+                        else:
+                            logger.info(f"Proceeding with guild {config.guild_id}: {hours_since:.2f}h since last check (interval: {interval_hours:.0f}h)")
 
                     logger.info(f"Checking games for guild {config.guild_id}")
 
@@ -1345,8 +1350,12 @@ class DiscoveryCog(commands.Cog):
                             logger.warning(f"Failed to send discovery summary in guild {config.guild_id}: {e}")
 
                     # Update last check time
+                    old_timestamp = config.last_game_check_at
                     config.last_game_check_at = now
-                    session.commit()
+                    session.flush()  # Flush changes to DB
+                    session.commit()  # Commit transaction
+                    session.refresh(config)  # Refresh to ensure persistence
+                    logger.info(f"Updated last_game_check_at for guild {config.guild_id}: {old_timestamp} → {now}")
 
                     logger.info(f"Game discovery for guild {config.guild_id} complete. Announced {announced_count} new games.")
 
@@ -1441,18 +1450,19 @@ class DiscoveryCog(commands.Cog):
                 return
 
             for config in configs:
+                guild_id = config.guild_id  # Capture guild_id before it might become detached
                 try:
                     # Check subscription tier (Pro or Premium)
-                    guild_record = session.query(Guild).filter_by(guild_id=config.guild_id).first()
+                    guild_record = session.query(Guild).filter_by(guild_id=guild_id).first()
                     if not guild_record or guild_record.subscription_tier not in ['pro', 'premium']:
-                        logger.warning(f"[COTW] Guild {config.guild_id} has COTW enabled but not Pro/Premium tier")
+                        logger.warning(f"[COTW] Guild {guild_id} has COTW enabled but not Pro/Premium tier")
                         continue
 
-                    await self._select_and_announce_cotw(config.guild_id)
+                    await self._select_and_announce_cotw(guild_id)
                     await asyncio.sleep(2)  # Small delay between guilds
 
                 except Exception as e:
-                    logger.error(f"[COTW] Error for guild {config.guild_id}: {e}", exc_info=True)
+                    logger.error(f"[COTW] Error for guild {guild_id}: {e}", exc_info=True)
 
         logger.info("[COTW] Completed weekly COTW selection")
 
@@ -1477,18 +1487,19 @@ class DiscoveryCog(commands.Cog):
                 return
 
             for config in configs:
+                guild_id = config.guild_id  # Capture guild_id before it might become detached
                 try:
                     # Check subscription tier (Premium only)
-                    guild_record = session.query(Guild).filter_by(guild_id=config.guild_id).first()
+                    guild_record = session.query(Guild).filter_by(guild_id=guild_id).first()
                     if not guild_record or guild_record.subscription_tier != 'premium':
-                        logger.warning(f"[COTM] Guild {config.guild_id} has COTM enabled but not Premium tier")
+                        logger.warning(f"[COTM] Guild {guild_id} has COTM enabled but not Premium tier")
                         continue
 
-                    await self._select_and_announce_cotm(config.guild_id)
+                    await self._select_and_announce_cotm(guild_id)
                     await asyncio.sleep(2)  # Small delay between guilds
 
                 except Exception as e:
-                    logger.error(f"[COTM] Error for guild {config.guild_id}: {e}", exc_info=True)
+                    logger.error(f"[COTM] Error for guild {guild_id}: {e}", exc_info=True)
 
         logger.info("[COTM] Completed monthly COTM selection")
 
@@ -1987,11 +1998,21 @@ class DiscoveryCog(commands.Cog):
             if not config or not config.cotw_enabled or not config.cotw_channel_id:
                 return
 
-            # Get all featured creators (forum-based only)
-            creators = session.query(FeaturedCreator).filter_by(
-                guild_id=guild_id,
-                source='forum'
+            # Get all active featured creators
+            all_creators = session.query(FeaturedCreator).filter_by(
+                is_active=True
             ).all()
+
+            # Filter to only creators in this guild (check guilds JSON array)
+            import json as json_lib
+            creators = []
+            for creator in all_creators:
+                try:
+                    guild_ids = json_lib.loads(creator.guilds) if creator.guilds else []
+                    if guild_id in guild_ids:
+                        creators.append(creator)
+                except:
+                    continue
 
             if not creators:
                 logger.warning(f"[COTW] No featured creators found for guild {guild_id}")
@@ -2110,11 +2131,21 @@ class DiscoveryCog(commands.Cog):
             if not config or not config.cotm_enabled or not config.cotm_channel_id:
                 return
 
-            # Get all featured creators (forum-based only)
-            creators = session.query(FeaturedCreator).filter_by(
-                guild_id=guild_id,
-                source='forum'
+            # Get all active featured creators
+            all_creators = session.query(FeaturedCreator).filter_by(
+                is_active=True
             ).all()
+
+            # Filter to only creators in this guild (check guilds JSON array)
+            import json as json_lib
+            creators = []
+            for creator in all_creators:
+                try:
+                    guild_ids = json_lib.loads(creator.guilds) if creator.guilds else []
+                    if guild_id in guild_ids:
+                        creators.append(creator)
+                except:
+                    continue
 
             if not creators:
                 logger.warning(f"[COTM] No featured creators found for guild {guild_id}")
@@ -3712,7 +3743,7 @@ class DiscoveryCog(commands.Cog):
                     description = description.replace("{token_cost}", str(config.token_cost))
                     description = description.replace("{token_name}", token_name)
                     description = description.replace("{entry_cooldown}", f"{config.entry_cooldown_hours} hours" if hasattr(config, 'entry_cooldown_hours') else "24 hours")
-                    # Remove user-specific placeholders that don't apply to general reminders
+                    # Replace {hero_tokens} with ??? since we can't show individual balances in broadcast messages
                     description = description.replace("{hero_tokens}", "???")
 
                     embed = discord.Embed(
@@ -3780,7 +3811,7 @@ class DiscoveryCog(commands.Cog):
             description = description.replace("{token_cost}", str(config.token_cost))
             description = description.replace("{token_name}", token_name)
             description = description.replace("{entry_cooldown}", f"{config.entry_cooldown_hours} hours" if hasattr(config, 'entry_cooldown_hours') else "24 hours")
-            # Remove user-specific placeholders that don't apply to general reminders
+            # Replace {hero_tokens} with ??? since we can't show individual balances in broadcast messages
             description = description.replace("{hero_tokens}", "???")
 
             embed = discord.Embed(

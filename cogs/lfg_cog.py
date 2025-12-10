@@ -517,19 +517,41 @@ class OptionSelect(discord.ui.Select):
             # Add to group
             self.parent_view.member_data[interaction.user.id] = {"options": {}}
 
-            # Add to thread
-            try:
-                thread = interaction.channel
-                if isinstance(thread, discord.Thread):
-                    await thread.add_user(interaction.user)
-            except Exception as e:
-                logger.error(f"Failed to add user to thread: {e}")
-
-            # Auto-confirm attendance if tracking is enabled
+            # Add to database
             try:
                 with get_db_session() as session:
-                    # Check if attendance tracking is enabled
-                    from models import LFGConfig
+                    import json as json_lib
+                    from models import LFGMember, LFGGroup, LFGConfig
+
+                    # Create member record in database
+                    existing_member = session.query(LFGMember).filter_by(
+                        group_id=self.parent_view.group.id,
+                        user_id=interaction.user.id
+                    ).first()
+
+                    if not existing_member:
+                        new_member = LFGMember(
+                            group_id=self.parent_view.group.id,
+                            user_id=interaction.user.id,
+                            display_name=interaction.user.display_name,
+                            rank_value=None,
+                            selections=None,
+                            is_creator=False,
+                            is_co_leader=False
+                        )
+                        session.add(new_member)
+
+                        # Update group member count
+                        group = session.query(LFGGroup).filter_by(id=self.parent_view.group.id).first()
+                        if group:
+                            group.member_count += 1
+                            if group.member_count >= group.max_group_size:
+                                group.is_full = True
+
+                        session.commit()
+                        logger.info(f"Created database member record for user {interaction.user.id}")
+
+                    # Auto-confirm attendance if tracking is enabled
                     config = session.query(LFGConfig).filter_by(
                         guild_id=self.parent_view.group.guild_id
                     ).first()
@@ -537,7 +559,15 @@ class OptionSelect(discord.ui.Select):
                     if config and config.attendance_tracking_enabled:
                         await _auto_confirm_attendance(session, self.parent_view.group.id, interaction.user.id)
             except Exception as e:
-                logger.error(f"Error during auto-confirm attendance on role selection: {e}")
+                logger.error(f"Error during auto-join on role selection: {e}")
+
+            # Add to thread
+            try:
+                thread = interaction.channel
+                if isinstance(thread, discord.Thread):
+                    await thread.add_user(interaction.user)
+            except Exception as e:
+                logger.error(f"Failed to add user to thread: {e}")
 
         selected_value = self.values[0]
         depends_on = self.option_config.get("depends_on")
@@ -571,6 +601,26 @@ class OptionSelect(discord.ui.Select):
 
         # Validation passed - save the selection
         self.parent_view.member_data[interaction.user.id]["options"][self.option_name] = selected_value
+
+        # Save selection to database
+        try:
+            with get_db_session() as session:
+                import json as json_lib
+                from models import LFGMember
+
+                # Get or create member record
+                member = session.query(LFGMember).filter_by(
+                    group_id=self.parent_view.group.id,
+                    user_id=interaction.user.id
+                ).first()
+
+                if member:
+                    # Update selections
+                    member.selections = json_lib.dumps(self.parent_view.member_data[interaction.user.id]["options"])
+                    session.commit()
+                    logger.info(f"Updated role selection for user {interaction.user.id}: {selected_value}")
+        except Exception as e:
+            logger.error(f"Error saving role selection to database: {e}")
 
         # Check if any fields depend on this one
         has_dependents = any(
@@ -643,8 +693,51 @@ class JoinGroupButton(discord.ui.Button):
         except Exception as e:
             logger.error(f"Error checking blacklist status: {e}")
 
-        # Add to group
+        # Add to group (in-memory)
         self.parent_view.member_data[interaction.user.id] = {"options": {}}
+
+        # Add to database
+        try:
+            with get_db_session() as session:
+                from models import LFGMember, LFGGroup, LFGConfig
+                import json as json_lib
+
+                # Add member to database
+                existing_member = session.query(LFGMember).filter_by(
+                    group_id=self.parent_view.group.id,
+                    user_id=interaction.user.id
+                ).first()
+
+                if not existing_member:
+                    new_member = LFGMember(
+                        group_id=self.parent_view.group.id,
+                        user_id=interaction.user.id,
+                        display_name=interaction.user.display_name,
+                        rank_value=None,
+                        selections=None,
+                        is_creator=False,
+                        is_co_leader=False
+                    )
+                    session.add(new_member)
+
+                    # Update group member count
+                    group = session.query(LFGGroup).filter_by(id=self.parent_view.group.id).first()
+                    if group:
+                        group.member_count += 1
+                        if group.member_count >= group.max_group_size:
+                            group.is_full = True
+
+                    session.commit()
+
+                # Auto-confirm attendance if tracking is enabled
+                config = session.query(LFGConfig).filter_by(
+                    guild_id=self.parent_view.group.guild_id
+                ).first()
+
+                if config and config.attendance_tracking_enabled:
+                    await _auto_confirm_attendance(session, self.parent_view.group.id, interaction.user.id)
+        except Exception as e:
+            logger.error(f"Error adding member to database: {e}")
 
         # Add to thread
         try:
@@ -653,20 +746,6 @@ class JoinGroupButton(discord.ui.Button):
                 await thread.add_user(interaction.user)
         except Exception as e:
             logger.error(f"Failed to add user to thread: {e}")
-
-        # Auto-confirm attendance if tracking is enabled
-        try:
-            with get_db_session() as session:
-                # Check if attendance tracking is enabled
-                from models import LFGConfig
-                config = session.query(LFGConfig).filter_by(
-                    guild_id=self.parent_view.group.guild_id
-                ).first()
-
-                if config and config.attendance_tracking_enabled:
-                    await _auto_confirm_attendance(session, self.parent_view.group.id, interaction.user.id)
-        except Exception as e:
-            logger.error(f"Error during auto-confirm attendance: {e}")
 
         await self.parent_view.update_embed()
         await interaction.response.defer()
@@ -690,6 +769,8 @@ class LeaveGroupButton(discord.ui.Button):
             # Remove from database
             try:
                 with get_db_session() as session:
+                    from models import LFGGroup, LFGAttendance
+
                     # Remove from LFGMember table
                     session.query(LFGMember).filter_by(
                         group_id=self.parent_view.group.id,
@@ -702,6 +783,13 @@ class LeaveGroupButton(discord.ui.Button):
                         user_id=interaction.user.id
                     ).delete()
 
+                    # Update group member count
+                    group = session.query(LFGGroup).filter_by(id=self.parent_view.group.id).first()
+                    if group and group.member_count > 0:
+                        group.member_count -= 1
+                        group.is_full = False  # No longer full if someone left
+
+                    session.commit()
                     logger.info(f"User {interaction.user.id} left group {self.parent_view.group.id} - removed from DB")
 
             except Exception as e:
@@ -2908,6 +2996,18 @@ class GameButton(discord.ui.Button):
         """Open LFG creation view for this game."""
         try:
             with get_db_session() as session:
+                # Check guild subscription tier - FREE tier cannot create LFG groups
+                guild_record = session.query(Guild).filter_by(guild_id=interaction.guild.id).first()
+                if guild_record and guild_record.subscription_tier == 'free' and not guild_record.is_vip:
+                    await interaction.response.send_message(
+                        "❌ **LFG Groups require Pro/Premium/VIP**\n\n"
+                        "The LFG Browser feature is available for Pro, Premium, and VIP tiers.\n"
+                        "Upgrade your server to create and manage LFG groups!\n\n"
+                        "Visit the dashboard to upgrade: https://chaoshousegg.com",
+                        ephemeral=True
+                    )
+                    return
+
                 # Reload game config from DB
                 game_config = session.query(LFGGame).filter_by(id=self.game.id).first()
                 if not game_config or not game_config.enabled:

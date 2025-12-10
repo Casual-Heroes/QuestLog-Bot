@@ -89,6 +89,35 @@ class ActionProcessorCog(commands.Cog):
         search_term = urllib.parse.quote(game_name)
         return f"https://store.steampowered.com/search/?term={search_term}"
 
+    async def _trigger_immediate_sync(self, guild_id: int):
+        """
+        Trigger an immediate guild sync to update database cache.
+
+        This bypasses the normal 5-second cooldown to ensure cache is updated
+        immediately after bulk operations like creating default flair roles.
+
+        Args:
+            guild_id: Discord guild ID to sync
+        """
+        try:
+            import os
+
+            bot_api_port = int(os.getenv('BOT_API_PORT', 8001))
+            url = f"http://localhost:{bot_api_port}/api/sync/{guild_id}"
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get('success'):
+                            logger.info(f"✅ Immediate sync triggered for guild {guild_id} after action completion")
+                        else:
+                            logger.error(f"Failed to sync guild {guild_id}: {data.get('error', 'Unknown error')}")
+                    else:
+                        logger.error(f"Failed to sync guild {guild_id}: HTTP {response.status}")
+        except Exception as e:
+            logger.error(f"Error triggering immediate sync for guild {guild_id}: {e}", exc_info=True)
+
     @tasks.loop(seconds=2.0)
     async def process_actions_loop(self):
         """Poll for and process pending actions every 2 seconds."""
@@ -147,6 +176,11 @@ class ActionProcessorCog(commands.Cog):
 
             logger.info(f"ActionProcessor: Completed {action.action_type.value} for guild {action.guild_id}")
 
+            # Trigger immediate sync for actions that modify Discord resources
+            # This ensures the database cache is updated immediately
+            if action.action_type in [ActionType.FLAIR_SEED_ROLES]:
+                await self._trigger_immediate_sync(action.guild_id)
+
         except Exception as e:
             # Handle failure
             action.retry_count += 1
@@ -190,6 +224,8 @@ class ActionProcessorCog(commands.Cog):
             return await self._action_tokens_modify(guild, payload, "add")
         elif action_type == ActionType.TOKENS_REMOVE:
             return await self._action_tokens_modify(guild, payload, "remove")
+        elif action_type == ActionType.TOKENS_SET:
+            return await self._action_tokens_modify(guild, payload, "set")
 
         # Member Management
         elif action_type == ActionType.MEMBER_KICK:
@@ -215,6 +251,10 @@ class ActionProcessorCog(commands.Cog):
         elif action_type == ActionType.DM_SEND:
             return await self._action_dm_send(guild, payload)
 
+        # XP Boost Events
+        elif action_type == ActionType.BOOST_EVENT_START:
+            return await self._action_boost_event_start(guild, payload)
+
         # Channel Management
         elif action_type == ActionType.CHANNEL_TOPIC_SET:
             return await self._action_channel_topic(guild, payload)
@@ -234,6 +274,16 @@ class ActionProcessorCog(commands.Cog):
         # Flair Management
         elif action_type == ActionType.FLAIR_ASSIGN:
             return await self._action_flair_assign(guild, payload)
+        elif action_type == ActionType.FLAIR_SEED_ROLES:
+            return await self._action_flair_seed_roles(guild, payload)
+
+        # LFG System
+        elif action_type == ActionType.LFG_THREAD_CREATE:
+            return await self._action_lfg_thread_create(guild, payload)
+        elif action_type == ActionType.LFG_THREAD_UPDATE:
+            return await self._action_lfg_thread_update(guild, payload)
+        elif action_type == ActionType.LFG_THREAD_DELETE:
+            return await self._action_lfg_thread_delete(guild, payload)
 
         # Template Management
         elif action_type == ActionType.CHANNEL_CREATE:
@@ -421,7 +471,7 @@ class ActionProcessorCog(commands.Cog):
         return {"success_count": len(success), "failed_count": len(failed), "failed": failed}
 
     async def _action_tokens_modify(self, guild: discord.Guild, payload: dict, operation: str) -> dict:
-        """Add or remove Hero Tokens."""
+        """Add, remove, or set Hero Tokens."""
         user_id = int(payload["user_id"])
         amount = int(payload["amount"])
 
@@ -446,6 +496,8 @@ class ActionProcessorCog(commands.Cog):
                 member.hero_tokens += amount
             elif operation == "remove":
                 member.hero_tokens = max(0, member.hero_tokens - amount)
+            elif operation == "set":
+                member.hero_tokens = max(0, amount)
 
             session.commit()
 
@@ -597,34 +649,106 @@ class ActionProcessorCog(commands.Cog):
     # ═══════════════════════════════════════════════════════════════
 
     async def _action_message_send(self, guild: discord.Guild, payload: dict) -> dict:
-        """Send a message to a channel (includes test welcome/goodbye messages)."""
+        """Send/edit messages and embeds; broadcast; includes test welcome/goodbye."""
         message_type = payload.get("type")
+        mode = payload.get("mode", "send")
 
         # Handle test welcome/goodbye messages
         if message_type in ("test_welcome", "test_goodbye"):
             return await self._send_test_message(guild, message_type, payload)
 
-        # Regular message sending
-        channel_id = int(payload["channel_id"])
-        content = payload.get("content")
-        embed_data = payload.get("embed")
+        allowed_mentions = discord.AllowedMentions.none() if payload.get("silent") else discord.AllowedMentions.all()
+        silent = payload.get("silent", False)
 
-        channel = guild.get_channel(channel_id)
-        if not channel:
-            raise ValueError(f"Channel {channel_id} not found")
+        # Send message
+        if mode == "send":
+            channel_id = int(payload["channel_id"])
+            channel = guild.get_channel(channel_id)
+            if not channel:
+                raise ValueError(f"Channel {channel_id} not found")
+            msg = await channel.send(content=payload.get("content"), allowed_mentions=allowed_mentions, silent=silent)
+            return {"success": True, "message_id": msg.id}
 
-        embed = None
-        if embed_data:
+        # Send embed
+        if mode == "send_embed":
+            channel_id = int(payload["channel_id"])
+            channel = guild.get_channel(channel_id)
+            if not channel:
+                raise ValueError(f"Channel {channel_id} not found")
+            embed_data = payload.get("embed") or {}
             embed = discord.Embed(
                 title=embed_data.get("title"),
                 description=embed_data.get("description"),
                 color=embed_data.get("color", 0x5865F2)
             )
             if embed_data.get("footer"):
-                embed.set_footer(text=embed_data["footer"])
+                embed.set_footer(text=embed_data.get("footer"))
+            msg = await channel.send(embed=embed, allowed_mentions=allowed_mentions, silent=silent)
+            return {"success": True, "message_id": msg.id}
 
-        msg = await channel.send(content=content, embed=embed)
-        return {"success": True, "message_id": msg.id}
+        # Edit message
+        if mode == "edit":
+            channel_id = int(payload["channel_id"])
+            message_id = int(payload["message_id"])
+            channel = guild.get_channel(channel_id)
+            if not channel:
+                raise ValueError(f"Channel {channel_id} not found")
+            message = await channel.fetch_message(message_id)
+            if message.author.id != self.bot.user.id:
+                raise ValueError("Cannot edit messages not sent by the bot")
+            await message.edit(content=payload.get("content"), allowed_mentions=allowed_mentions)
+            return {"success": True, "message_id": message.id}
+
+        # Edit embed
+        if mode == "edit_embed":
+            message_id = int(payload["message_id"])
+            channel = guild.get_channel(int(payload["channel_id"])) if payload.get("channel_id") else None
+            message = None
+            if channel:
+                message = await channel.fetch_message(message_id)
+            else:
+                # try to find message across text channels
+                for ch in guild.text_channels:
+                    try:
+                        message = await ch.fetch_message(message_id)
+                        channel = ch
+                        break
+                    except Exception:
+                        continue
+            if not message:
+                raise ValueError("Message not found")
+            if message.author.id != self.bot.user.id:
+                raise ValueError("Cannot edit messages not sent by the bot")
+            embed_data = payload.get("embed") or {}
+            old = message.embeds[0] if message.embeds else None
+            embed = discord.Embed(
+                title=embed_data.get("title") or (old.title if old else None),
+                description=embed_data.get("description") or (old.description if old else None),
+                color=embed_data.get("color", old.color.value if old else 0x5865F2)
+            )
+            footer = embed_data.get("footer") or (old.footer.text if old and old.footer else None)
+            if footer:
+                embed.set_footer(text=footer)
+            await message.edit(embed=embed, allowed_mentions=allowed_mentions)
+            return {"success": True, "message_id": message.id}
+
+        # Broadcast to category
+        if mode == "broadcast":
+            category_id = int(payload["category_id"])
+            category = discord.utils.get(guild.categories, id=category_id)
+            if not category:
+                raise ValueError(f"Category {category_id} not found")
+            sent = 0
+            for ch in category.channels:
+                if isinstance(ch, discord.TextChannel):
+                    try:
+                        await ch.send(content=payload.get("content"), allowed_mentions=allowed_mentions, silent=silent)
+                        sent += 1
+                    except Exception:
+                        continue
+            return {"success": True, "sent": sent}
+
+        raise ValueError("Invalid message mode")
 
     async def _send_test_message(self, guild: discord.Guild, message_type: str, payload: dict) -> dict:
         """Send a test welcome or goodbye message."""
@@ -721,6 +845,64 @@ class ActionProcessorCog(commands.Cog):
             return {"success": True, "user_id": user_id}
         except discord.Forbidden:
             return {"success": False, "error": "Cannot DM user (DMs disabled)"}
+
+    async def _action_boost_event_start(self, guild: discord.Guild, payload: dict) -> dict:
+        """Send announcement when XP boost event is activated."""
+        event_name = payload.get("event_name", "XP Boost Event")
+        multiplier = payload.get("multiplier", 2.0)
+        description = payload.get("description", "")
+        channel_id = int(payload["channel_id"])
+        role_id = payload.get("role_id")
+        end_time = payload.get("end_time")
+
+        # Get announcement channel
+        channel = guild.get_channel(channel_id)
+        if not channel:
+            raise ValueError(f"Announcement channel {channel_id} not found")
+
+        # Format role ping
+        role_mention = ""
+        if role_id:
+            role = guild.get_role(int(role_id))
+            if role:
+                role_mention = role.mention + " "
+
+        # Create embed
+        embed = discord.Embed(
+            title=f"🚀 {event_name} is Now Active!",
+            description=description or "Get boosted XP for your server activity!",
+            color=discord.Color.orange(),
+            timestamp=discord.utils.utcnow()
+        )
+        embed.add_field(
+            name="⚡ XP Multiplier",
+            value=f"**{multiplier}x** XP for all activity!",
+            inline=False
+        )
+
+        # Show end time with Discord's automatic timezone conversion
+        if end_time:
+            embed.add_field(
+                name="⏰ Event Duration",
+                value=f"**Ends:** <t:{end_time}:F>\n*(<t:{end_time}:R>)*",
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="⏰ Event Duration",
+                value="**No end time** - Active until manually disabled",
+                inline=False
+            )
+
+        embed.set_footer(text="Take advantage of this boost while it lasts!")
+
+        # Send announcement
+        await channel.send(
+            content=role_mention if role_mention else None,
+            embed=embed
+        )
+
+        return {"success": True, "channel_id": channel_id, "event_name": event_name}
 
     async def _action_channel_topic(self, guild: discord.Guild, payload: dict) -> dict:
         """Set a channel topic."""
@@ -832,7 +1014,7 @@ class ActionProcessorCog(commands.Cog):
         return {"success": True, "message": "Test embed sent to channel"}
 
     async def _action_test_forum_embed(self, guild: discord.Guild, payload: dict) -> dict:
-        """Send a test embed to the selected test forum channel."""
+        """Send a test embed to the selected channel."""
         import discord
 
         # Get channel_id from payload (sent from website)
@@ -840,29 +1022,25 @@ class ActionProcessorCog(commands.Cog):
         if not channel_id:
             raise ValueError("No channel_id provided in payload")
 
-        forum = self.bot.get_channel(int(channel_id))
-        if not forum:
+        channel = self.bot.get_channel(int(channel_id))
+        if not channel:
             raise ValueError(f"Channel {channel_id} not found")
 
         # Create test embed
         embed = discord.Embed(
-            title="🧪 Test Forum Embed",
-            description="This is a test of the intro forum embed. If you can see this, the forum embed is working correctly!",
+            title="🧪 Test Embed",
+            description="This is a test embed. If you can see this, the embed is working correctly!",
             color=0xFFFF00,  # Yellow
             timestamp=discord.utils.utcnow()
         )
         embed.add_field(name="Status", value="✅ Working", inline=True)
-        embed.add_field(name="Forum", value=forum.mention, inline=True)
+        embed.add_field(name="Channel", value=channel.mention, inline=True)
         embed.set_footer(text="Test triggered from website")
 
-        # For forums, we need to create a thread with the embed
-        thread = await forum.create_thread(
-            name="Test Forum Embed",
-            content="Test embed from website",
-            embed=embed
-        )
+        # Send embed directly to the channel
+        await channel.send(embed=embed)
 
-        return {"success": True, "message": "Test embed sent to forum"}
+        return {"success": True, "message": "Test embed sent to channel"}
 
     async def _action_check_games(self, guild: discord.Guild, payload: dict) -> dict:
         """Manually trigger game discovery check using all enabled search configs."""
@@ -1329,6 +1507,157 @@ class ActionProcessorCog(commands.Cog):
             "message": f"Assigned flair '{flair_name}' to {member.display_name}"
         }
 
+    async def _action_flair_seed_roles(self, guild: discord.Guild, payload: dict) -> dict:
+        """
+        Create default flair roles in the guild and hoist them to the top.
+        Also ensure GuildFlair records exist for all default flairs.
+        """
+        from cogs.flair_cog import NORMAL_FLAIRS, SEASONAL_FLAIRS
+        from models import GuildFlair
+
+        created_roles = []
+        moved_roles = []
+        now = int(time.time())
+        renames = payload.get("renames") or []
+
+        # Use current DB flairs if present (so renamed defaults are respected), otherwise fall back to built-in lists
+        # Only use normal/seasonal flairs, not custom flairs (custom flairs have their own creation flow)
+        try:
+            with db_session_scope() as session:
+                db_flairs = session.query(GuildFlair).filter_by(guild_id=guild.id).filter(
+                    GuildFlair.flair_type.in_(['normal', 'seasonal'])
+                ).all()
+                if db_flairs:
+                    default_flairs = [(f.flair_name, f.cost, f.flair_type) for f in db_flairs]
+                else:
+                    default_flairs = [(name, cost, "normal") for name, cost in NORMAL_FLAIRS.items()] + \
+                                     [(name, cost, "seasonal") for name, cost in SEASONAL_FLAIRS.items()]
+        except Exception as e:
+            logger.warning(f"Failed to load guild flairs for seed in {guild.name}: {e}")
+            default_flairs = [(name, cost, "normal") for name, cost in NORMAL_FLAIRS.items()] + \
+                             [(name, cost, "seasonal") for name, cost in SEASONAL_FLAIRS.items()]
+
+        # First handle renames (e.g., admin renamed a flair in the dashboard)
+        for rename in renames:
+            old = rename.get("old_name")
+            new = rename.get("new_name")
+            if not old or not new or old == new:
+                continue
+            try:
+                role = discord.utils.get(guild.roles, name=f"Flair: {old}")
+                if role:
+                    await role.edit(name=f"Flair: {new}", reason="Rename flair role")
+                    moved_roles.append(f"Renamed {old} -> {new}")
+                else:
+                    # If missing, create with new name
+                    role = await guild.create_role(
+                        name=f"Flair: {new}",
+                        hoist=True,
+                        mentionable=False,
+                        reason="Create renamed flair role"
+                    )
+                    created_roles.append(f"Flair: {new}")
+            except Exception as e:
+                logger.warning(f"Failed to rename/create flair role {old}->{new} in {guild.name}: {e}")
+
+        # Find the bot's highest role position (flair roles should go just below this)
+        bot_member = guild.get_member(self.bot.user.id)
+        if bot_member and bot_member.top_role:
+            # Position just below bot's highest role
+            # Leave some room (subtract 2) in case there are admin roles we shouldn't touch
+            target_position = max(bot_member.top_role.position - 2, 1)
+        else:
+            # Fallback: try to position near top of role list
+            target_position = max(len(guild.roles) - 5, 1)
+
+        logger.info(f"Creating/moving {len(default_flairs)} flair roles to position {target_position} in {guild.name}")
+
+        # Create missing roles first, then batch position them
+        new_roles = []
+        for flair_name, cost, flair_type in default_flairs:
+            role_name = f"Flair: {flair_name}"
+            role = discord.utils.get(guild.roles, name=role_name)
+
+            if not role:
+                try:
+                    role = await guild.create_role(
+                        name=role_name,
+                        hoist=True,
+                        mentionable=False,
+                        color=discord.Color.default(),  # No color by default (users see their flair color)
+                        reason="Create default flair role (vanity role for display)"
+                    )
+                    created_roles.append(role_name)
+                    new_roles.append(role)
+                    logger.info(f"Created flair role: {role_name} in {guild.name}")
+                except Exception as e:
+                    logger.warning(f"Failed to create flair role {role_name} in {guild.name}: {e}")
+                    continue
+
+            # Sync GuildFlair record for this flair
+            try:
+                with db_session_scope() as session:
+                    gf = (
+                        session.query(GuildFlair)
+                        .filter_by(guild_id=guild.id, flair_name=flair_name)
+                        .first()
+                    )
+                    if not gf:
+                        gf = GuildFlair(
+                            guild_id=guild.id,
+                            flair_name=flair_name,
+                            flair_type=flair_type or ("normal" if flair_name in NORMAL_FLAIRS else "seasonal"),
+                            cost=int(cost),
+                            enabled=True,
+                            display_order=0,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                        session.add(gf)
+                    else:
+                        gf.cost = int(cost)
+                        gf.enabled = True
+                        gf.updated_at = now
+            except Exception as e:
+                logger.warning(f"Failed to sync GuildFlair for {flair_name} in {guild.name}: {e}")
+
+        # Batch move all flair roles to the top
+        # Get all existing flair roles
+        all_flair_roles = [r for r in guild.roles if r.name.startswith("Flair: ")]
+
+        if all_flair_roles:
+            try:
+                # Build position dict for Discord API
+                # Discord.py expects: {role_object: position_int, ...}
+                positions = {}
+                current_pos = target_position
+
+                # Position flair roles from high to low
+                for role in sorted(all_flair_roles, key=lambda r: r.name):
+                    positions[role] = current_pos
+                    current_pos -= 1
+
+                # Send batch position update to Discord
+                await guild.edit_role_positions(positions=positions, reason="Position flair roles at top for visibility")
+                moved_roles.extend([r.name for r in all_flair_roles])
+                logger.info(f"✅ Positioned {len(all_flair_roles)} flair roles at top of {guild.name}")
+            except Exception as e:
+                logger.warning(f"Failed to batch position flair roles in {guild.name}: {e}")
+                # Fallback: try individual positioning
+                for role in all_flair_roles:
+                    try:
+                        await role.edit(position=target_position, reason="Hoist flair role to top")
+                        moved_roles.append(role.name)
+                    except Exception as e2:
+                        logger.debug(f"Could not move role {role.name} in {guild.name}: {e2}")
+
+        return {
+            "success": True,
+            "created_roles": created_roles,
+            "moved_roles": moved_roles,
+            "message": f"Created {len(created_roles)} roles; hoisted {len(moved_roles)} flair roles."
+        }
+
     # ═══════════════════════════════════════════════════════════════
     # TEMPLATE ACTIONS
     # ═══════════════════════════════════════════════════════════════
@@ -1583,6 +1912,284 @@ class ActionProcessorCog(commands.Cog):
             "message": message,
             "created": created_roles,
             "errors": errors if errors else None
+        }
+
+    # ═══════════════════════════════════════════════════════════════
+    # LFG ACTIONS
+    # ═══════════════════════════════════════════════════════════════
+
+    async def _action_lfg_thread_create(self, guild: discord.Guild, payload: dict) -> dict:
+        """Create an LFG thread with interactive management view."""
+        import json as json_lib
+        from models import LFGGroup, LFGGame, LFGConfig, LFGMember
+        from db import get_db_session
+
+        group_id = payload.get('group_id')
+        if not group_id:
+            raise ValueError("group_id is required")
+
+        # Get group and game data from database
+        with get_db_session() as session:
+            group = session.query(LFGGroup).filter_by(id=group_id).first()
+            if not group:
+                raise ValueError(f"LFG group {group_id} not found")
+
+            game = session.query(LFGGame).filter_by(id=group.game_id).first()
+            if not game:
+                raise ValueError(f"Game {group.game_id} not found")
+
+            config = session.query(LFGConfig).filter_by(guild_id=guild.id).first()
+
+            # Parse custom options
+            custom_options = json_lib.loads(game.custom_options) if game.custom_options else []
+
+            # Get channel
+            channel_id = payload.get('channel_id') or (config.browser_notify_channel_id if config else None)
+            if not channel_id:
+                raise ValueError("No channel configured for LFG notifications")
+
+            channel = guild.get_channel(int(channel_id))
+            if not channel:
+                raise ValueError(f"Channel {channel_id} not found")
+
+            # Get creator's data from database to build thread name
+            creator_member = session.query(LFGMember).filter_by(
+                group_id=group.id,
+                is_creator=True
+            ).first()
+
+            # Build thread name: "Title - Game - Creator"
+            creator_name = creator_member.display_name if creator_member else "Unknown"
+            title = group.thread_name or "LFG Group"
+            thread_name = f"{title} - {game.game_name} - {creator_name}"
+
+            # Create thread
+            thread = await channel.create_thread(
+                name=thread_name[:100],  # Discord 100 char limit
+                type=discord.ChannelType.public_thread,
+                auto_archive_duration=1440  # 24 hours
+            )
+
+            # Update group with thread ID
+            group.thread_id = thread.id
+            session.commit()
+
+            # Ping role and auto-invite members if ping_role_id is set
+            if group.ping_role_id:
+                try:
+                    role = guild.get_role(int(group.ping_role_id))
+                    if role:
+                        # Send ping message
+                        await thread.send(f"{role.mention} - New LFG group created!")
+
+                        # Add all members with this role to the thread
+                        for member in guild.members:
+                            if role in member.roles:
+                                try:
+                                    await thread.add_user(member)
+                                except Exception as e:
+                                    logger.debug(f"Could not add {member.id} to thread: {e}")
+                except Exception as e:
+                    logger.warning(f"Failed to ping role {group.ping_role_id}: {e}")
+
+            # Import GroupManagementView from lfg_cog
+            from cogs.lfg_cog import GroupManagementView
+
+            # Create the interactive view
+            view = GroupManagementView(game, group, custom_options, config)
+
+            if creator_member:
+                # Load creator's selections
+                creator_selections = json_lib.loads(creator_member.selections) if creator_member.selections else {}
+                view.member_data[group.creator_id] = {
+                    "rank": creator_member.rank_value,
+                    "options": creator_selections
+                }
+
+            # Load other active members (left_at is None)
+            members = session.query(LFGMember).filter_by(group_id=group.id).filter(LFGMember.left_at == None).all()
+            for member in members:
+                if not member.is_creator:  # Already added creator
+                    member_selections = json_lib.loads(member.selections) if member.selections else {}
+                    view.member_data[member.user_id] = {
+                        "rank": member.rank_value,
+                        "options": member_selections
+                    }
+
+            # Add co-leaders to the thread
+            co_leaders = [m for m in members if m.is_co_leader and not m.is_creator]
+            for co_leader in co_leaders:
+                try:
+                    user = guild.get_member(int(co_leader.user_id))
+                    if user:
+                        await thread.add_user(user)
+                        logger.info(f"Added co-leader {co_leader.user_id} to thread {thread.id}")
+                except Exception as e:
+                    logger.warning(f"Failed to add co-leader {co_leader.user_id} to thread: {e}")
+
+            # Send the embed with interactive view
+            embed = view.build_embed()
+            message = await thread.send(embed=embed, view=view)
+            view.message = message
+
+        return {
+            "success": True,
+            "thread_id": thread.id,
+            "message": f"Created LFG thread: {thread.name}"
+        }
+
+    async def _action_lfg_thread_update(self, guild: discord.Guild, payload: dict) -> dict:
+        """Update an existing LFG thread's embed."""
+        import json as json_lib
+        from models import LFGGroup, LFGGame, LFGConfig, LFGMember
+        from db import get_db_session
+
+        group_id = payload.get('group_id')
+        if not group_id:
+            raise ValueError("group_id is required")
+
+        with get_db_session() as session:
+            group = session.query(LFGGroup).filter_by(id=group_id).first()
+            if not group:
+                raise ValueError(f"LFG group {group_id} not found")
+
+            if not group.thread_id:
+                raise ValueError(f"Group {group_id} has no thread to update")
+
+            game = session.query(LFGGame).filter_by(id=group.game_id).first()
+            if not game:
+                raise ValueError(f"Game {group.game_id} not found")
+
+            config = session.query(LFGConfig).filter_by(guild_id=guild.id).first()
+
+            # Get the thread
+            thread = guild.get_thread(group.thread_id)
+            if not thread:
+                # Try fetching it
+                try:
+                    thread = await guild.fetch_channel(group.thread_id)
+                except:
+                    raise ValueError(f"Thread {group.thread_id} not found")
+
+            # Add user to thread if requested (when joining from website)
+            add_user_id = payload.get('add_user_to_thread')
+            if add_user_id:
+                try:
+                    user = guild.get_member(int(add_user_id))
+                    if user:
+                        await thread.add_user(user)
+                        logger.info(f"Added user {add_user_id} to thread {thread.id}")
+                except Exception as e:
+                    logger.warning(f"Failed to add user {add_user_id} to thread: {e}")
+
+            # Remove users from thread if requested (when co-leaders are removed)
+            remove_user_ids = payload.get('remove_users_from_thread', [])
+            for user_id in remove_user_ids:
+                try:
+                    user = guild.get_member(int(user_id))
+                    if user:
+                        await thread.remove_user(user)
+                        logger.info(f"Removed user {user_id} from thread {thread.id}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove user {user_id} from thread: {e}")
+
+            # Sync co-leaders with thread - add any co-leaders who aren't in the thread yet
+            co_leaders = session.query(LFGMember).filter_by(
+                group_id=group.id,
+                is_co_leader=True
+            ).filter(LFGMember.left_at == None).all()
+
+            for co_leader in co_leaders:
+                if co_leader.is_creator:  # Skip creator, they're already in the thread
+                    continue
+                try:
+                    user = guild.get_member(int(co_leader.user_id))
+                    if user:
+                        await thread.add_user(user)
+                        logger.info(f"Synced co-leader {co_leader.user_id} to thread {thread.id}")
+                except Exception as e:
+                    logger.debug(f"Could not add co-leader {co_leader.user_id} to thread: {e}")
+
+            # Parse custom options
+            custom_options = json_lib.loads(game.custom_options) if game.custom_options else []
+
+            # Recreate the view
+            from cogs.lfg_cog import GroupManagementView
+            view = GroupManagementView(game, group, custom_options, config)
+
+            # Load all active members (left_at is None)
+            members = session.query(LFGMember).filter_by(group_id=group.id).filter(LFGMember.left_at == None).all()
+            for member in members:
+                member_selections = json_lib.loads(member.selections) if member.selections else {}
+                view.member_data[member.user_id] = {
+                    "rank": member.rank_value,
+                    "options": member_selections
+                }
+
+            # Find the original message (first message in thread)
+            async for message in thread.history(limit=10, oldest_first=True):
+                if message.author.id == self.bot.user.id and message.embeds:
+                    # Update the embed
+                    embed = view.build_embed()
+                    await message.edit(embed=embed, view=view)
+                    view.message = message
+                    break
+
+        return {
+            "success": True,
+            "message": f"Updated LFG thread: {thread.name}"
+        }
+
+    async def _action_lfg_thread_delete(self, guild: discord.Guild, payload: dict) -> dict:
+        """Delete an LFG thread and send cancellation message."""
+        import json as json_lib
+        from models import LFGGroup, LFGGame, LFGConfig
+        from db import get_db_session
+
+        group_id = payload.get('group_id')
+        thread_id = payload.get('thread_id')  # Get from payload since group may be deleted
+        thread_name = payload.get('thread_name', 'Unknown')
+        game_name = payload.get('game_name', 'Unknown')
+        game_emoji = payload.get('game_emoji', '🎮')
+        deleted_by_id = payload.get('deleted_by_id')
+        channel_id = payload.get('channel_id')
+
+        if not group_id:
+            raise ValueError("group_id is required")
+
+        # Delete the thread if it exists
+        if thread_id:
+            try:
+                thread = guild.get_thread(thread_id)
+                if not thread:
+                    thread = await guild.fetch_channel(thread_id)
+
+                if thread:
+                    await thread.delete()
+            except Exception as e:
+                logger.warning(f"Failed to delete thread {thread_id}: {e}")
+
+        # Send cancellation message to the notification channel
+        if channel_id:
+            try:
+                channel = guild.get_channel(int(channel_id))
+                if channel:
+                    embed = discord.Embed(
+                        title=f"🚫 LFG Group Cancelled",
+                        description=f"**{game_emoji} {game_name}**\n{thread_name}",
+                        color=0xFF0000,  # Red
+                        timestamp=discord.utils.utcnow()
+                    )
+                    if deleted_by_id:
+                        embed.add_field(name="Cancelled by", value=f"<@{deleted_by_id}>", inline=True)
+
+                    await channel.send(embed=embed)
+            except Exception as e:
+                logger.warning(f"Failed to send cancellation message: {e}")
+
+        return {
+            "success": True,
+            "message": f"Deleted LFG thread and sent cancellation notice"
         }
 
 

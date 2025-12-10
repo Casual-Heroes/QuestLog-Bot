@@ -21,7 +21,7 @@ import time
 import asyncio
 import re
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import SlashCommandGroup
 
 from config import (
@@ -31,8 +31,8 @@ from config import (
     get_debug_guilds,
 )
 from models import (
-    Guild, GuildMember, XPConfig, LevelRole,
-    XPExcludedChannel, XPExcludedRole, LevelRequirement
+    Guild, GuildMember, XPConfig, LevelRole, LevelUpConfig,
+    XPExcludedChannel, XPExcludedRole, LevelRequirement, XPBoostEvent
 )
 
 
@@ -43,6 +43,8 @@ class XPCog(commands.Cog):
         self.bot = bot
         # Per-guild invite cache: {guild_id: {invite_code: {uses, inviter, last_award}}}
         self.invite_cache = {}
+        # Start background task to expire boost events
+        self.check_expired_boost_events.start()
 
     xp = SlashCommandGroup(
         name="xp",
@@ -165,16 +167,90 @@ class XPCog(commands.Cog):
             return level
 
     @staticmethod
+    def calculate_xp_with_boosts(session, guild_id: int, user_id: int, base_xp: float,
+                                  guild: discord.Guild = None, channel_id: int = None) -> tuple:
+        """
+        Calculate XP with active boost event multipliers applied.
+
+        Args:
+            session: Database session
+            guild_id: Guild ID
+            user_id: User ID
+            base_xp: Base XP amount to award
+            guild: Discord guild object (optional, for role checking)
+            channel_id: Channel ID (optional, for channel-specific boosts)
+
+        Returns:
+            tuple: (final_xp, bonus_tokens, active_event_names)
+        """
+        from models import XPBoostEvent
+
+        # Get all active boost events for this guild
+        current_time = int(time.time())
+        events = session.query(XPBoostEvent).filter(
+            XPBoostEvent.guild_id == guild_id,
+            XPBoostEvent.is_active == True
+        ).all()
+
+        total_multiplier = 1.0
+        total_token_bonus = 0
+        active_events = []
+
+        for event in events:
+            # Skip expired events (will be auto-disabled by background task)
+            if event.end_time and event.end_time < current_time:
+                continue
+
+            # Check scope
+            applies = False
+            if event.scope == 'server':
+                applies = True
+            elif event.scope == 'channel' and channel_id:
+                applies = (event.scope_id == channel_id)
+            elif event.scope == 'role' and guild and user_id:
+                # Check if user has the role
+                member = guild.get_member(user_id)
+                if member:
+                    applies = any(role.id == event.scope_id for role in member.roles)
+
+            if applies:
+                # Stack multipliers (e.g., 2x + 1.5x = 3.5x total)
+                total_multiplier += (event.multiplier - 1.0)
+                total_token_bonus += (event.token_bonus or 0)
+                active_events.append(event.name)
+
+        # Always round 0.5 up (not banker's rounding) for intuitive game mechanics
+        # This ensures 4.5 XP becomes 5, not 4
+        final_xp = int(base_xp * total_multiplier + 0.5)
+        bonus_tokens = int(final_xp * total_token_bonus / 100 + 0.5) if total_token_bonus > 0 else 0
+
+        if active_events:
+            logger.debug(
+                f"XP Boost Applied: guild={guild_id}, user={user_id}, "
+                f"base={base_xp}, final={final_xp}, multiplier={total_multiplier:.2f}x, "
+                f"events={', '.join(active_events)}"
+            )
+
+        return final_xp, bonus_tokens, active_events
+
+    @staticmethod
     def add_xp(session, guild_id: int, user_id: int, amount: float,
-               display_name: str = None, engagement_type: str = "active") -> tuple:
+               display_name: str = None, engagement_type: str = "active",
+               guild: discord.Guild = None, channel_id: int = None) -> tuple:
         """
         Add XP to a member and calculate level/token rewards.
+        Now includes XP boost event support.
 
         Returns:
             tuple: (old_level, new_level, current_hero_tokens, token_diff)
         """
         if amount <= 0:
             return (0, 0, 0, 0)
+
+        # Apply XP boost events
+        final_xp, boost_bonus_tokens, active_events = XPCog.calculate_xp_with_boosts(
+            session, guild_id, user_id, amount, guild, channel_id
+        )
 
         # Get XP config for guild
         xp_config = XPCog.get_xp_config(session, guild_id)
@@ -203,8 +279,8 @@ class XPCog(commands.Cog):
         old_level = db_member.level
         old_xp = db_member.xp
 
-        # Add XP
-        db_member.xp += amount
+        # Add XP (with boost multiplier applied)
+        db_member.xp += final_xp
         db_member.last_active = int(time.time())
 
         # Calculate hero tokens (awarded every 100 XP)
@@ -220,6 +296,11 @@ class XPCog(commands.Cog):
                 token_diff = diff * xp_config["tokens_passive"]
             db_member.hero_tokens += token_diff
 
+        # Add bonus tokens from boost events
+        if boost_bonus_tokens > 0:
+            db_member.hero_tokens += boost_bonus_tokens
+            token_diff += boost_bonus_tokens
+
         # Calculate new level
         new_level = XPCog.calculate_level(session, db_member.xp, xp_config["max_level"])
         db_member.level = new_level
@@ -233,17 +314,23 @@ class XPCog(commands.Cog):
 
     async def send_level_up_notification(self, guild: discord.Guild, member: discord.Member,
                                          old_level: int, new_level: int,
-                                         hero_tokens: int, token_diff: int):
-        """Send level up notification to the guild's level-up channel."""
+                                         hero_tokens: int, token_diff: int,
+                                         current_channel: discord.TextChannel = None):
+        """Send level up notification respecting the guild's levelup config."""
         if new_level <= old_level:
             return
 
         with db_session_scope() as session:
-            db_guild = session.get(Guild, guild.id)
-            if not db_guild:
+            # Get levelup config
+            levelup_config = session.get(LevelUpConfig, guild.id)
+            if not levelup_config or not levelup_config.enabled:
                 return
 
-            channel_id = db_guild.level_up_channel_id
+            destination = levelup_config.destination or "current"
+
+            # Get guild for specific channel lookup
+            db_guild = session.get(Guild, guild.id)
+            channel_id = db_guild.level_up_channel_id if db_guild else None
 
             # Get level roles for this guild
             level_roles = (
@@ -251,18 +338,34 @@ class XPCog(commands.Cog):
                 .filter(LevelRole.guild_id == guild.id)
                 .all()
             )
-            # Copy data before session closes
             role_data = {lr.level: lr.role_id for lr in level_roles}
 
-        # Find level-up channel
-        level_channel = guild.get_channel(channel_id) if channel_id else None
-        if not level_channel:
+        # Determine destination channel based on config
+        level_channel = None
+
+        if destination == "current":
+            # Send in the channel where they leveled up
+            level_channel = current_channel
+        elif destination == "channel":
+            # Send in specific configured channel
+            level_channel = guild.get_channel(channel_id) if channel_id else None
+        elif destination == "dm":
+            # Send as DM
             try:
                 if member.dm_channel is None:
                     await member.create_dm()
                 level_channel = member.dm_channel
             except Exception:
+                logger.warning(f"Cannot DM user {member.id} for level-up")
                 return
+        elif destination == "none":
+            # Silent - don't send any message
+            return
+
+        # If no valid channel found, abort
+        if not level_channel:
+            logger.warning(f"No valid level-up channel for guild {guild.id}, destination={destination}")
+            return
 
         # Send level up message
         try:
@@ -288,9 +391,9 @@ class XPCog(commands.Cog):
                         logger.warning(f"Cannot assign role {role.name} to {member.id}")
 
         except discord.Forbidden:
-            logger.warning(f"Cannot send level up message for {member.id}")
+            logger.warning(f"Cannot send level up message for {member.id} in {level_channel}")
         except Exception as e:
-            logger.error(f"Error sending level up notification: {e}")
+            logger.error(f"Error sending level up notification: {e}", exc_info=True)
 
     async def check_and_award_level_roles(self, guild: discord.Guild, member: discord.Member, level: int):
         """Check and assign milestone roles based on level."""
@@ -455,7 +558,8 @@ class XPCog(commands.Cog):
                                 session.commit()
                                 await self.send_level_up_notification(
                                     member.guild, inviter,
-                                    old_level, new_level, tokens, token_diff
+                                    old_level, new_level, tokens, token_diff,
+                                    None  # No specific channel for invite XP
                                 )
 
                 cached["uses"] = invite.uses
@@ -530,7 +634,8 @@ class XPCog(commands.Cog):
                         xp_amount = xp_config["message_xp"] * xp_config["media_multiplier"]
                         result = XPCog.add_xp(
                             session, guild_id, message.author.id,
-                            xp_amount, message.author.display_name, "active"
+                            xp_amount, message.author.display_name, "active",
+                            message.guild, message.channel.id
                         )
                         db_member.last_media_ts = now
                         old_level, new_level, tokens, token_diff = result
@@ -542,7 +647,8 @@ class XPCog(commands.Cog):
                     if (now - db_member.last_message_ts) >= xp_config["message_cooldown"]:
                         result = XPCog.add_xp(
                             session, guild_id, message.author.id,
-                            xp_config["message_xp"], message.author.display_name, "active"
+                            xp_config["message_xp"], message.author.display_name, "active",
+                            message.guild, message.channel.id
                         )
                         db_member.last_message_ts = now
                         old_level, new_level, tokens, token_diff = result
@@ -555,7 +661,8 @@ class XPCog(commands.Cog):
             if should_notify and level_data:
                 await self.send_level_up_notification(
                     message.guild, message.author,
-                    level_data[0], level_data[1], level_data[2], level_data[3]
+                    level_data[0], level_data[1], level_data[2], level_data[3],
+                    message.channel
                 )
                 await self.check_and_award_level_roles(
                     message.guild, message.author, level_data[1]
@@ -623,7 +730,8 @@ class XPCog(commands.Cog):
             if should_notify and level_data:
                 await self.send_level_up_notification(
                     guild, payload.member,
-                    level_data[0], level_data[1], level_data[2], level_data[3]
+                    level_data[0], level_data[1], level_data[2], level_data[3],
+                    channel  # Reaction channel
                 )
                 await self.check_and_award_level_roles(guild, payload.member, level_data[1])
 
@@ -715,7 +823,8 @@ class XPCog(commands.Cog):
             if should_notify and level_data:
                 await self.send_level_up_notification(
                     member.guild, member,
-                    level_data[0], level_data[1], level_data[2], level_data[3]
+                    level_data[0], level_data[1], level_data[2], level_data[3],
+                    None  # No text channel context for voice XP
                 )
                 await self.check_and_award_level_roles(member.guild, member, level_data[1])
 
@@ -782,7 +891,8 @@ class XPCog(commands.Cog):
                 if member:
                     await self.send_level_up_notification(
                         interaction.guild, member,
-                        level_data[0], level_data[1], level_data[2], level_data[3]
+                        level_data[0], level_data[1], level_data[2], level_data[3],
+                        interaction.channel  # Command channel
                     )
                     await self.check_and_award_level_roles(
                         interaction.guild, member, level_data[1]
@@ -877,7 +987,8 @@ class XPCog(commands.Cog):
             if should_notify and level_data:
                 await self.send_level_up_notification(
                     after.guild, after,
-                    level_data[0], level_data[1], level_data[2], level_data[3]
+                    level_data[0], level_data[1], level_data[2], level_data[3],
+                    None  # No channel context for gaming/presence XP
                 )
                 await self.check_and_award_level_roles(after.guild, after, level_data[1])
 
@@ -1159,6 +1270,48 @@ class XPCog(commands.Cog):
         except Exception as e:
             logger.error(f"Error exporting members: {e}")
             await ctx.respond(f"❌ Error: {str(e)}", ephemeral=True)
+
+    # ═══════════════════════════════════════════════════════════════
+    # XP BOOST EVENTS - Background Tasks
+    # ═══════════════════════════════════════════════════════════════
+
+    @tasks.loop(minutes=5)
+    async def check_expired_boost_events(self):
+        """Automatically disable boost events that have expired."""
+        from models import XPBoostEvent
+
+        try:
+            current_time = int(time.time())
+
+            with db_session_scope() as session:
+                # Find active events that have passed their end time
+                expired_events = session.query(XPBoostEvent).filter(
+                    XPBoostEvent.is_active == True,
+                    XPBoostEvent.end_time.isnot(None),
+                    XPBoostEvent.end_time < current_time
+                ).all()
+
+                for event in expired_events:
+                    event.is_active = False
+                    logger.info(
+                        f"Auto-disabled expired boost event: {event.name} "
+                        f"(Guild: {event.guild_id}, ended at {event.end_time})"
+                    )
+
+                if expired_events:
+                    logger.info(f"Auto-disabled {len(expired_events)} expired boost events")
+
+        except Exception as e:
+            logger.error(f"Error checking expired boost events: {e}", exc_info=True)
+
+    @check_expired_boost_events.before_loop
+    async def before_check_expired_boost_events(self):
+        """Wait for bot to be ready before starting the task."""
+        await self.bot.wait_until_ready()
+
+    def cog_unload(self):
+        """Clean up when cog is unloaded."""
+        self.check_expired_boost_events.cancel()
 
 
 def setup(bot: commands.Bot):

@@ -114,6 +114,20 @@ async def health_check(request):
     return web.json_response({'status': 'ok', 'bot_ready': bot_instance is not None})
 
 
+async def get_guild_ids(request):
+    """Return list of guild IDs where the bot is currently installed."""
+    if not bot_instance:
+        return web.json_response({'error': 'Bot not ready'}, status=503)
+
+    try:
+        # Get all guild IDs the bot is currently in
+        guild_ids = [str(guild.id) for guild in bot_instance.guilds]
+        return web.json_response({'guild_ids': guild_ids})
+    except Exception as e:
+        logger.error(f"Error getting guild IDs: {e}", exc_info=True)
+        return web.json_response({'error': str(e)}, status=500)
+
+
 async def mod_untimeout(request):
     """Remove timeout from a user."""
     try:
@@ -373,6 +387,7 @@ def create_app():
 
     # Routes
     app.router.add_get('/health', health_check)
+    app.router.add_get('/api/guilds', get_guild_ids)
     app.router.add_post('/api/sync', force_guild_sync)
     app.router.add_post('/api/sync/{guild_id}', force_guild_sync)
 

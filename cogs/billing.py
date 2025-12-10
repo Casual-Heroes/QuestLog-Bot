@@ -92,7 +92,7 @@ class BillingCog(commands.Cog):
         with db_session_scope() as session:
             sub = Subscription(
                 guild_id=guild_id,
-                tier=SubscriptionTier.PREMIUM.value,  # Will be updated
+                tier=SubscriptionTier.COMPLETE.value,
                 started_at=int(time.time()),
             )
             # Just log for now - full tracking in Subscription table
@@ -168,11 +168,8 @@ class BillingCog(commands.Cog):
             sub = stripe.Subscription.retrieve(subscription_id)
             price_id = sub["items"]["data"][0]["price"]["id"]
 
-            # Determine tier from price
-            if price_id in [STRIPE_PRICES.get("pro_monthly"), STRIPE_PRICES.get("pro_yearly")]:
-                tier = SubscriptionTier.PRO.value
-            else:
-                tier = SubscriptionTier.PREMIUM.value
+            # All subscriptions are now Complete tier
+            tier = SubscriptionTier.COMPLETE.value
 
             expires_at = sub["current_period_end"]
 
@@ -186,7 +183,7 @@ class BillingCog(commands.Cog):
         elif mode == "payment":
             # One-time payment (lifetime)
             await self._update_guild_subscription(
-                guild_id, SubscriptionTier.PRO.value,
+                guild_id, SubscriptionTier.COMPLETE.value,
                 expires_at=None,  # Never expires
                 stripe_customer_id=customer_id
             )
@@ -195,11 +192,11 @@ class BillingCog(commands.Cog):
             with db_session_scope() as session:
                 db_guild = session.get(Guild, guild_id)
                 if db_guild:
-                    db_guild.is_vip = True
-                    db_guild.vip_note = "Lifetime Pro purchase"
+                    db_guild.billing_cycle = 'lifetime'
+                    db_guild.vip_note = "Lifetime Complete purchase"
                     db_guild.vip_granted_at = int(time.time())
 
-            await self._notify_subscription_start(guild_id, SubscriptionTier.PRO.value, lifetime=True)
+            await self._notify_subscription_start(guild_id, SubscriptionTier.COMPLETE.value, lifetime=True)
 
     async def _handle_subscription_updated(self, subscription: dict):
         """Handle subscription updates (upgrades, downgrades, renewals)."""
@@ -217,13 +214,8 @@ class BillingCog(commands.Cog):
                 return
             guild_id = db_guild.guild_id
 
-        # Get new tier from price
-        price_id = subscription["items"]["data"][0]["price"]["id"]
-
-        if price_id in [STRIPE_PRICES.get("pro_monthly"), STRIPE_PRICES.get("pro_yearly")]:
-            tier = SubscriptionTier.PRO.value
-        else:
-            tier = SubscriptionTier.PREMIUM.value
+        # All subscriptions are now Complete tier
+        tier = SubscriptionTier.COMPLETE.value
 
         expires_at = subscription["current_period_end"]
 
@@ -312,26 +304,18 @@ class BillingCog(commands.Cog):
             color=discord.Color.gold()
         )
 
-        features = []
-        if tier == SubscriptionTier.PRO.value:
-            features = [
-                "Unlimited bulk operations",
-                "90-day audit log retention",
-                "Cross-server discovery network",
-                "Unlimited self-promo posts",
-                "Custom branding",
-                "API access",
-                "Priority support",
-            ]
-        elif tier == SubscriptionTier.PREMIUM.value:
-            features = [
-                "100 users per bulk operation",
-                "30-day audit log retention",
-                "Featured pool access",
-                "10 self-promo posts/day",
-                "Game server sync",
-                "Analytics dashboard",
-            ]
+        # All Complete tier features
+        features = [
+            "All 5 premium modules included",
+            "Unlimited XP tracking",
+            "Unlimited reaction roles",
+            "XP Boost Events",
+            "Full moderation suite",
+            "Discovery & promotions",
+            "LFG & event tracking",
+            "Role management",
+            "Advanced customization",
+        ]
 
         if features:
             embed.add_field(
