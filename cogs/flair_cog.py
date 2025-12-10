@@ -27,6 +27,7 @@ NORMAL_FLAIRS = {
     "[🎮 Casual Legend]": 15,
     "[🍕 AFK Snacker]": 30,
     "[☕ Coffee & Cooldowns]": 50,
+    "[👑 Boss Fight Survivor]": 65,
     "[🛋️ Couch Commander]": 80,
     "[📅 Weekend Warrior]": 100,
     "[👑 Boss Fight Survivor]": 140,
