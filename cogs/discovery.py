@@ -1349,18 +1349,22 @@ class DiscoveryCog(commands.Cog):
                         except Exception as e:
                             logger.warning(f"Failed to send discovery summary in guild {config.guild_id}: {e}")
 
-                    # Update last check time
-                    old_timestamp = config.last_game_check_at
-                    config.last_game_check_at = now
-                    session.flush()  # Flush changes to DB
-                    session.commit()  # Commit transaction
-                    session.refresh(config)  # Refresh to ensure persistence
-                    logger.info(f"Updated last_game_check_at for guild {config.guild_id}: {old_timestamp} → {now}")
-
                     logger.info(f"Game discovery for guild {config.guild_id} complete. Announced {announced_count} new games.")
 
                 except Exception as e:
                     logger.error(f"Error processing game discovery for guild {config.guild_id}: {e}", exc_info=True)
+                finally:
+                    # ALWAYS update last check time, even if there was an error
+                    # This prevents the bot from retrying too frequently if there's a persistent issue
+                    try:
+                        old_timestamp = config.last_game_check_at
+                        config.last_game_check_at = now
+                        session.flush()  # Flush changes to DB
+                        session.commit()  # Commit transaction
+                        session.refresh(config)  # Refresh to ensure persistence
+                        logger.info(f"Updated last_game_check_at for guild {config.guild_id}: {old_timestamp} → {now}")
+                    except Exception as update_error:
+                        logger.error(f"Failed to update last_game_check_at for guild {config.guild_id}: {update_error}")
 
         logger.info("Game discovery task completed")
 
