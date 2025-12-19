@@ -17,6 +17,11 @@ from config import (
 )
 from models import Guild, GuildMember, SubscriptionTier
 
+# URLs (centralized for easy updating)
+WEBSITE_URL = "https://casual-heroes.com/questlog/overview/"
+SUPPORT_INVITE = "https://discord.gg/exRgR9YGyy"  # Casual Heroes Hosting Services (Support)
+DASHBOARD_URL = "https://dashboard.casual-heroes.com/questlog/"
+
 
 class CoreCog(commands.Cog):
     """Core bot functionality - events and basic commands."""
@@ -54,8 +59,8 @@ class CoreCog(commands.Cog):
                 "`/questlog setup` - Quick setup wizard\n"
                 "`/xp profile` - View your XP & level\n"
                 "`/xp leaderboard` - Server leaderboard\n"
-                "`/verify` - Verify yourself\n"
-                "`/roles` - Self-assign roles"
+                "`/verify me` - Verify yourself\n"
+                "`/roles menu` - Self-assign roles"
             ),
             inline=True
         )
@@ -67,7 +72,7 @@ class CoreCog(commands.Cog):
                 "`/raid status` - Check raid status\n"
                 "`/raid lockdown` - Lock server\n"
                 "`/audit search` - Search audit logs\n"
-                "`/verify config` - Verification settings"
+                "`/raid config` - Security settings"
             ),
             inline=True
         )
@@ -78,8 +83,8 @@ class CoreCog(commands.Cog):
             value=(
                 "`/promo post` - Self-promotion\n"
                 "`/promo featured` - Enter featured pool\n"
-                "`/discovery` - Cross-server network\n"
-                "`/analytics` - Engagement stats"
+                "`/discovery browse` - Browse creators\n"
+                "`/lfg create` - Create LFG events"
             ),
             inline=True
         )
@@ -88,14 +93,13 @@ class CoreCog(commands.Cog):
         embed.add_field(
             name="⚙️ Admin",
             value=(
-                "`/questlog settings` - Bot settings\n"
-                "`/questlog premium` - Subscription info\n"
-                "`/questlog dashboard` - Web dashboard"
+                "`/premium` - View pricing\n"
+                f"[Web Dashboard]({DASHBOARD_URL}) - Manage settings"
             ),
             inline=False
         )
 
-        embed.set_footer(text="💡 Need more help? Join discord.gg/questlog")
+        embed.set_footer(text=f"💡 Need more help? Join {SUPPORT_INVITE}")
 
         await ctx.respond(embed=embed, ephemeral=True)
 
@@ -125,9 +129,9 @@ class CoreCog(commands.Cog):
         embed.add_field(
             name="🔗 Links",
             value=(
-                "[Website](https://bot)\n"
-                "[Support Server](https://discord.gg/questlog)\n"
-                "[Documentation](https://docs.bot)"
+                f"[Website]({WEBSITE_URL})\n"
+                f"[Support Server]({SUPPORT_INVITE})\n"
+                f"[Dashboard]({DASHBOARD_URL})"
             ),
             inline=True
         )
@@ -194,11 +198,10 @@ class CoreCog(commands.Cog):
 
             if not is_premium:
                 embed.add_field(
-                    name="⭐ Upgrade to Premium",
+                    name="⭐ Upgrade QuestLog",
                     value=(
-                        "Unlock self-promo, discovery network, "
-                        "game server sync, and more!\n"
-                        "`/questlog premium` for details"
+                        "Unlock powerful modules: Discovery, Events, Advanced Security, and more!\n"
+                        "Use `/premium` to see pricing options"
                     ),
                     inline=False
                 )
@@ -213,8 +216,8 @@ class CoreCog(commands.Cog):
             is_premium = guild.is_premium() if guild else False
 
         embed = discord.Embed(
-            title="⭐ QuestLog Premium",
-            description="Unlock the full power of QuestLog for your community.",
+            title="⭐ QuestLog Pricing",
+            description="Choose the features that fit your community's needs.",
             color=discord.Color.gold()
         )
 
@@ -230,44 +233,54 @@ class CoreCog(commands.Cog):
                 "• 7-Day Audit Logs\n"
                 "• Up to 2,500 members"
             ),
-            inline=True
+            inline=False
         )
 
-        # Premium tier
+        # Module-based tier
         embed.add_field(
-            name="⭐ Premium - $14.99/mo",
+            name="🧩 Module-Based (Pick & Choose)",
             value=(
-                "• Everything in Free\n"
-                "• **Self-Promo (15 tokens)**\n"
-                "• **Featured Pool (50 tokens)**\n"
-                "• **Discovery Network**\n"
-                "• **Game Server Sync**\n"
-                "• Advanced Anti-Raid\n"
-                "• Multi-Step Verification\n"
-                "• Unlimited React Roles\n"
-                "• 90-Day Audit Logs\n"
-                "• Unlimited members"
+                "Subscribe to individual modules:\n"
+                "• **Engagement Suite** - $5/mo\n"
+                "• **Role Management** - $4/mo\n"
+                "• **Moderation & Security** - $5/mo\n"
+                "• **Discovery & Promotion** - $5/mo\n"
+                "• **Events & Attendance (LFG)** - $4/mo\n\n"
+                "_Only pay for what you need!_"
             ),
-            inline=True
+            inline=False
+        )
+
+        # Complete tier
+        embed.add_field(
+            name="🚀 Complete (Everything Unlocked)",
+            value=(
+                "• All modules included\n"
+                "• Unlimited members\n"
+                "• Priority support\n"
+                "• Early access to new features\n\n"
+                "_Best value for full-featured communities_"
+            ),
+            inline=False
         )
 
         if is_premium:
             embed.add_field(
                 name="✅ Your Status",
-                value="This server has **Premium**! Thank you for supporting ",
+                value="This server has an active subscription! Thank you for supporting QuestLog! 🎉",
                 inline=False
             )
         else:
             embed.add_field(
-                name="🚀 Get Premium",
+                name="💎 Get Started",
                 value=(
-                    "Visit [bot/premium](https://bot/premium) to subscribe.\n"
-                    "Or use `/questlog subscribe` to start your free trial!"
+                    f"Visit the [Dashboard]({DASHBOARD_URL}guild/{ctx.guild.id}/billing) to manage your subscription.\n"
+                    "Choose individual modules or go Complete!"
                 ),
                 inline=False
             )
 
-        embed.set_footer(text="Questions? Join discord.gg/questlog")
+        embed.set_footer(text=f"Questions? Join {SUPPORT_INVITE}")
 
         await ctx.respond(embed=embed, ephemeral=True)
 
@@ -287,39 +300,40 @@ class CoreCog(commands.Cog):
         )
 
         embed.add_field(
-            name="Step 1: Channels",
+            name="📊 Step 1: Configure from Dashboard",
             value=(
-                "Set up these channels:\n"
-                "• `/questlog set-channel logs #mod-logs`\n"
-                "• `/questlog set-channel levelup #level-ups`\n"
-                "• `/questlog set-channel verification #verify`"
+                f"Visit the [Dashboard]({DASHBOARD_URL}guild/{ctx.guild.id}) to:\n"
+                "• Set up notification channels\n"
+                "• Configure verification settings\n"
+                "• Enable/disable modules\n"
+                "• Manage subscription"
             ),
             inline=False
         )
 
         embed.add_field(
-            name="Step 2: Roles",
+            name="🎮 Step 2: Test Features",
             value=(
-                "Configure roles:\n"
-                "• `/questlog set-role verified @Verified`\n"
-                "• `/questlog set-role quarantine @Quarantine`\n"
-                "• `/level-roles add 5 @Level5`"
+                "Try these commands:\n"
+                "• `/xp profile` - Check XP system\n"
+                "• `/verify me` - Test verification\n"
+                "• `/roles menu` - Set up self-roles"
             ),
             inline=False
         )
 
         embed.add_field(
-            name="Step 3: Enable Features",
+            name="🔒 Step 3: Security (Moderators)",
             value=(
-                "Turn on features:\n"
-                "• `/questlog enable xp`\n"
-                "• `/questlog enable verification`\n"
-                "• `/questlog enable anti-raid`"
+                "Configure security:\n"
+                "• `/raid config` - Anti-raid settings\n"
+                "• `/raid status` - Check protection\n"
+                "• `/audit search` - Review logs"
             ),
             inline=False
         )
 
-        embed.set_footer(text="Need help? Use /questlog help or join discord.gg/questlog")
+        embed.set_footer(text=f"Need help? Use /help or join {SUPPORT_INVITE}")
 
         await ctx.followup.send(embed=embed, ephemeral=True)
 

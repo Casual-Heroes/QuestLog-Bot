@@ -26,6 +26,8 @@ staticfiles/admin/js/vendor/jquery/LICENSE.txt
 staticfiles/admin/js/vendor/select2/LICENSE.md
 staticfiles/admin/js/vendor/xregexp/LICENSE.txt
 staticfiles/admin/css/vendor/select2/LICENSE-SELECT2.md
+test_enum.py
+discovery.py.backup
 
 # Custom Files and Folders to Ignore
 find_corrupted_members.py
@@ -79,4 +81,8 @@ chwebsiteprj/
 /hosting
 /wardenprj
 /warden
+CORE_COMMANDS_AUDIT.md
+SECURITY_AUDIT_COMPLETE.md
+SECURITY_FIXES.md
+
 

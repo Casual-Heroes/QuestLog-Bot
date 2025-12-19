@@ -2674,615 +2674,628 @@ class DiscoveryCog(commands.Cog):
 
         await ctx.respond(embed=embed, ephemeral=True)
 
-    @discovery.command(name="set-primary-guild", description="Set which guild's intro to display globally")
-    async def set_primary_guild(self, ctx: discord.ApplicationContext):
-        """
-        Set which guild's intro should be displayed on your global Hall of Fame profile.
-        By default, your most recent intro is used (auto-select).
-        """
-        with db_session_scope() as session:
-            # Get creator
-            creator = session.get(FeaturedCreator, ctx.author.id)
-
-            if not creator:
-                await ctx.respond(
-                    "You don't have a Hall of Fame entry yet.\n\n"
-                    "Post an intro in a forum or use `/promo featured` to get featured!",
-                    ephemeral=True
-                )
-                return
-
-            # Get list of guilds they're in
-            guilds_list = json.loads(creator.guilds) if creator.guilds else []
-
-            if not guilds_list:
-                await ctx.respond(
-                    "You're not in any tracked guilds.",
-                    ephemeral=True
-                )
-                return
-
-            # Build guild selection embed
-            embed = discord.Embed(
-                title="🏆 Set Your Primary Guild",
-                description=(
-                    f"**Current Primary:** {creator.primary_guild_id}\n"
-                    f"**Auto-Select:** {'Enabled ✅' if creator.auto_select_primary else 'Disabled ❌'}\n\n"
-                    "Choose which guild's intro should be displayed on your Hall of Fame profile.\n\n"
-                    "**Your Guilds:**"
-                ),
-                color=discord.Color.gold()
-            )
-
-            for guild_id in guilds_list:
-                guild = self.bot.get_guild(guild_id)
-                guild_name = guild.name if guild else f"Guild {guild_id}"
-                is_primary = "⭐ **PRIMARY**" if guild_id == creator.primary_guild_id else ""
-                embed.add_field(
-                    name=f"{guild_name} {is_primary}",
-                    value=f"Guild ID: `{guild_id}`",
-                    inline=False
-                )
-
-            embed.add_field(
-                name="💡 How to Change",
-                value=(
-                    "To change your primary guild, use:\n"
-                    "`/discovery set-primary <guild_id>`\n\n"
-                    "To enable auto-select (always use most recent):\n"
-                    "`/discovery auto-select true`"
-                ),
-                inline=False
-            )
-
-            await ctx.respond(embed=embed, ephemeral=True)
-
-    @discovery.command(name="set-primary", description="Set your primary guild by ID")
-    @discord.option(
-        name="guild_id",
-        description="The guild ID to set as primary",
-        required=True
-    )
-    async def set_primary(
-        self,
-        ctx: discord.ApplicationContext,
-        guild_id: str
-    ):
-        """Set which guild's intro should be displayed globally."""
-        try:
-            guild_id_int = int(guild_id)
-        except ValueError:
-            await ctx.respond("Invalid guild ID. Please provide a valid number.", ephemeral=True)
-            return
-
-        with db_session_scope() as session:
-            # Get creator
-            creator = session.get(FeaturedCreator, ctx.author.id)
-
-            if not creator:
-                await ctx.respond(
-                    "You don't have a Hall of Fame entry yet.",
-                    ephemeral=True
-                )
-                return
-
-            # Check if they're in this guild
-            guilds_list = json.loads(creator.guilds) if creator.guilds else []
-
-            if guild_id_int not in guilds_list:
-                await ctx.respond(
-                    f"You're not in guild {guild_id_int}.\n\n"
-                    "Use `/discovery set-primary-guild` to see your guilds.",
-                    ephemeral=True
-                )
-                return
-
-            # Update primary guild
-            creator.primary_guild_id = guild_id_int
-            creator.auto_select_primary = False  # Disable auto-select when manually set
-            creator.updated_at = int(time.time())
-            session.commit()
-
-            guild = self.bot.get_guild(guild_id_int)
-            guild_name = guild.name if guild else f"Guild {guild_id_int}"
-
-            await ctx.respond(
-                f"✅ **Primary guild set!**\n\n"
-                f"Your Hall of Fame profile will now display your intro from **{guild_name}**.\n"
-                f"Auto-select has been disabled.\n\n"
-                f"To re-enable auto-select, use `/discovery auto-select true`",
-                ephemeral=True
-            )
-
-    @discovery.command(name="auto-select", description="Enable/disable auto-select for primary guild")
-    @discord.option(
-        name="enabled",
-        description="Enable or disable auto-select",
-        required=True
-    )
-    async def auto_select(
-        self,
-        ctx: discord.ApplicationContext,
-        enabled: bool
-    ):
-        """Enable or disable automatic primary guild selection."""
-        with db_session_scope() as session:
-            # Get creator
-            creator = session.get(FeaturedCreator, ctx.author.id)
-
-            if not creator:
-                await ctx.respond(
-                    "You don't have a Hall of Fame entry yet.",
-                    ephemeral=True
-                )
-                return
-
-            # Update auto-select
-            creator.auto_select_primary = enabled
-            creator.updated_at = int(time.time())
-            session.commit()
-
-            if enabled:
-                await ctx.respond(
-                    "✅ **Auto-select enabled!**\n\n"
-                    "Your Hall of Fame profile will now automatically display your most recent intro.",
-                    ephemeral=True
-                )
-            else:
-                await ctx.respond(
-                    "✅ **Auto-select disabled!**\n\n"
-                    f"Your Hall of Fame profile will continue displaying your intro from guild {creator.primary_guild_id}.\n"
-                    "Use `/discovery set-primary <guild_id>` to change it manually.",
-                    ephemeral=True
-                )
-
-    @discovery.command(name="servers", description="Browse servers in discovery network (PRO)")
-    @discord.option(
-        name="category",
-        description="Filter by category",
-        required=False,
-        choices=["gaming", "streaming", "content", "esports", "casual", "competitive"]
-    )
-    async def discovery_servers(
-        self,
-        ctx: discord.ApplicationContext,
-        category: str = None
-    ):
-        """Browse servers in the discovery network."""
-        with db_session_scope() as session:
-            tier = get_guild_tier(session, ctx.guild.id)
-            has_discovery = FeatureLimits.get_limit(tier, "discovery_network")
-
-            if not has_discovery:
-                await ctx.respond(
-                    "**Discovery Network requires QuestLog PRO!**\n\n"
-                    "Upgrade with `/questlog upgrade` to:\n"
-                    "- Browse and join partner servers\n"
-                    "- List your server in the directory\n"
-                    "- Cross-promote with other communities",
-                    ephemeral=True
-                )
-                return
-
-            # Build query
-            query = (
-                session.query(ServerListing)
-                .filter(
-                    ServerListing.is_published == True,
-                    ServerListing.guild_id != ctx.guild.id  # Don't show own server
-                )
-            )
-
-            if category:
-                query = query.filter(ServerListing.categories.contains(category))
-
-            listings = query.order_by(ServerListing.member_count.desc()).limit(15).all()
-
-            if not listings:
-                await ctx.respond(
-                    "No servers found in the discovery network yet.\n\n"
-                    "Be the first! Use `/listing create` to add your server.",
-                    ephemeral=True
-                )
-                return
-
-            embed = discord.Embed(
-                title="Discovery Network",
-                description=f"Servers matching: **{category or 'All Categories'}**",
-                color=discord.Color.purple()
-            )
-
-            for listing in listings:
-                # Increment view count
-                listing.views += 1
-
-                tags = f"\n*{listing.tags}*" if listing.tags else ""
-                invite_text = f"\n[Join Server](https://discord.gg/{listing.invite_code})" if listing.invite_code else ""
-
-                embed.add_field(
-                    name=f"{listing.title} ({listing.member_count:,} members)",
-                    value=f"{listing.description[:150] if listing.description else 'No description'}{tags}{invite_text}",
-                    inline=False
-                )
-
-            embed.set_footer(text=f"Showing {len(listings)} servers | /listing create to add yours")
-
-        await ctx.respond(embed=embed, ephemeral=True)
-
-    @discovery.command(name="join", description="Join the discovery network (Admin, PRO)")
-    @commands.has_permissions(administrator=True)
-    async def discovery_join(self, ctx: discord.ApplicationContext):
-        """Join the discovery network."""
-        with db_session_scope() as session:
-            tier = get_guild_tier(session, ctx.guild.id)
-            has_discovery = FeatureLimits.get_limit(tier, "discovery_network")
-
-            if not has_discovery:
-                await ctx.respond(
-                    "**Discovery Network requires QuestLog PRO!**\n\n"
-                    "Upgrade with `/questlog upgrade` to access cross-server promotion.",
-                    ephemeral=True
-                )
-                return
-
-            # Check if already joined
-            existing = session.get(DiscoveryNetwork, ctx.guild.id)
-            if existing and existing.is_active:
-                await ctx.respond(
-                    "Your server is already in the discovery network!\n\n"
-                    "Use `/discovery settings` to configure your preferences.",
-                    ephemeral=True
-                )
-                return
-
-            # Join network
-            if existing:
-                existing.is_active = True
-            else:
-                network = DiscoveryNetwork(
-                    guild_id=ctx.guild.id,
-                    is_active=True,
-                    allow_incoming=True,
-                    allow_outgoing=True,
-                    categories="gaming",
-                )
-                session.add(network)
-
-            # Enable discovery on guild
-            guild = session.get(Guild, ctx.guild.id)
-            if guild:
-                guild.discovery_enabled = True
-
-        await ctx.respond(
-            "**Welcome to the Discovery Network!**\n\n"
-            "Your server is now part of the cross-server promotion network.\n\n"
-            "**Next steps:**\n"
-            "1. `/listing create` - Create your server listing\n"
-            "2. `/discovery settings` - Configure your preferences\n"
-            "3. `/discovery servers` - Browse other servers",
-            ephemeral=True
-        )
-
-    @discovery.command(name="settings", description="Configure discovery settings (Admin, PRO)")
-    @commands.has_permissions(administrator=True)
-    @discord.option(
-        name="incoming",
-        description="Allow incoming promo posts from other servers",
-        required=False
-    )
-    @discord.option(
-        name="outgoing",
-        description="Share your promos with other servers",
-        required=False
-    )
-    @discord.option(
-        name="channel",
-        description="Channel for cross-server promos",
-        required=False
-    )
-    @discord.option(
-        name="categories",
-        description="Categories (comma-separated: gaming,streaming,esports)",
-        required=False
-    )
-    async def discovery_settings(
-        self,
-        ctx: discord.ApplicationContext,
-        incoming: bool = None,
-        outgoing: bool = None,
-        channel: discord.TextChannel = None,
-        categories: str = None
-    ):
-        """Configure discovery network settings."""
-        with db_session_scope() as session:
-            tier = get_guild_tier(session, ctx.guild.id)
-            has_discovery = FeatureLimits.get_limit(tier, "discovery_network")
-
-            if not has_discovery:
-                await ctx.respond("Discovery Network requires QuestLog PRO!", ephemeral=True)
-                return
-
-            network = session.get(DiscoveryNetwork, ctx.guild.id)
-            if not network:
-                await ctx.respond("Join the network first with `/discovery join`.", ephemeral=True)
-                return
-
-            # Update settings
-            changes = []
-            if incoming is not None:
-                network.allow_incoming = incoming
-                changes.append(f"Incoming promos: **{'Enabled' if incoming else 'Disabled'}**")
-            if outgoing is not None:
-                network.allow_outgoing = outgoing
-                changes.append(f"Outgoing promos: **{'Enabled' if outgoing else 'Disabled'}**")
-            if channel is not None:
-                network.network_channel_id = channel.id
-                changes.append(f"Network channel: {channel.mention}")
-            if categories is not None:
-                network.categories = categories.lower().replace(" ", "")
-                changes.append(f"Categories: **{network.categories}**")
-
-            if not changes:
-                # Show current settings
-                embed = discord.Embed(
-                    title="Discovery Network Settings",
-                    color=discord.Color.purple()
-                )
-                embed.add_field(
-                    name="Incoming Promos",
-                    value="Enabled" if network.allow_incoming else "Disabled",
-                    inline=True
-                )
-                embed.add_field(
-                    name="Outgoing Promos",
-                    value="Enabled" if network.allow_outgoing else "Disabled",
-                    inline=True
-                )
-                ch = ctx.guild.get_channel(network.network_channel_id) if network.network_channel_id else None
-                embed.add_field(
-                    name="Network Channel",
-                    value=ch.mention if ch else "Not set",
-                    inline=True
-                )
-                embed.add_field(
-                    name="Categories",
-                    value=network.categories or "gaming",
-                    inline=True
-                )
-                await ctx.respond(embed=embed, ephemeral=True)
-            else:
-                await ctx.respond(
-                    "**Settings updated:**\n" + "\n".join(changes),
-                    ephemeral=True
-                )
-
-    @discovery.command(name="leave", description="Leave the discovery network (Admin)")
-    @commands.has_permissions(administrator=True)
-    async def discovery_leave(self, ctx: discord.ApplicationContext):
-        """Leave the discovery network."""
-        with db_session_scope() as session:
-            network = session.get(DiscoveryNetwork, ctx.guild.id)
-            if not network or not network.is_active:
-                await ctx.respond("Your server is not in the discovery network.", ephemeral=True)
-                return
-
-            network.is_active = False
-
-            # Unpublish listing
-            listing = session.get(ServerListing, ctx.guild.id)
-            if listing:
-                listing.is_published = False
-
-            guild = session.get(Guild, ctx.guild.id)
-            if guild:
-                guild.discovery_enabled = False
-
-        await ctx.respond(
-            "You've left the discovery network.\n"
-            "Your server listing has been unpublished.\n\n"
-            "Rejoin anytime with `/discovery join`.",
-            ephemeral=True
-        )
-
-    # ========== SERVER LISTING COMMANDS ==========
-
-    @listing.command(name="create", description="Create your server listing (PRO)")
-    @commands.has_permissions(administrator=True)
-    @discord.option(name="title", description="Server title (max 100 chars)", required=True)
-    @discord.option(name="description", description="Server description", required=True)
-    @discord.option(name="invite_code", description="Invite code (without discord.gg/)", required=False)
-    @discord.option(
-        name="category",
-        description="Primary category",
-        required=True,
-        choices=["gaming", "streaming", "content", "esports", "casual", "competitive"]
-    )
-    @discord.option(name="tags", description="Tags (comma-separated)", required=False)
-    async def listing_create(
-        self,
-        ctx: discord.ApplicationContext,
-        title: str,
-        description: str,
-        category: str,
-        invite_code: str = None,
-        tags: str = None
-    ):
-        """Create or update your server listing."""
-        with db_session_scope() as session:
-            tier = get_guild_tier(session, ctx.guild.id)
-            has_discovery = FeatureLimits.get_limit(tier, "discovery_network")
-
-            if not has_discovery:
-                await ctx.respond("Server listings require QuestLog PRO!", ephemeral=True)
-                return
-
-            if len(title) > 100:
-                await ctx.respond("Title must be 100 characters or less.", ephemeral=True)
-                return
-
-            # Check if in network
-            network = session.get(DiscoveryNetwork, ctx.guild.id)
-            if not network or not network.is_active:
-                await ctx.respond(
-                    "Join the discovery network first with `/discovery join`.",
-                    ephemeral=True
-                )
-                return
-
-            # Create or update listing
-            listing = session.get(ServerListing, ctx.guild.id)
-            if listing:
-                listing.title = title
-                listing.description = description
-                listing.invite_code = invite_code
-                listing.categories = category
-                listing.tags = tags
-                listing.member_count = ctx.guild.member_count
-                listing.updated_at = int(time.time())
-                action = "updated"
-            else:
-                listing = ServerListing(
-                    guild_id=ctx.guild.id,
-                    title=title,
-                    description=description,
-                    invite_code=invite_code,
-                    categories=category,
-                    tags=tags,
-                    member_count=ctx.guild.member_count,
-                    is_published=True,
-                )
-                session.add(listing)
-                action = "created"
-
-        invite_url = f"https://discord.gg/{invite_code}" if invite_code else "Not set"
-        await ctx.respond(
-            f"**Server listing {action}!**\n\n"
-            f"**Title:** {title}\n"
-            f"**Category:** {category}\n"
-            f"**Invite:** {invite_url}\n\n"
-            f"Your server is now visible in `/discovery servers`!",
-            ephemeral=True
-        )
-
-    @listing.command(name="edit", description="Edit your server listing (PRO)")
-    @commands.has_permissions(administrator=True)
-    @discord.option(name="title", description="New title", required=False)
-    @discord.option(name="description", description="New description", required=False)
-    @discord.option(name="invite_code", description="New invite code", required=False)
-    @discord.option(
-        name="category",
-        description="New category",
-        required=False,
-        choices=["gaming", "streaming", "content", "esports", "casual", "competitive"]
-    )
-    @discord.option(name="tags", description="New tags", required=False)
-    async def listing_edit(
-        self,
-        ctx: discord.ApplicationContext,
-        title: str = None,
-        description: str = None,
-        invite_code: str = None,
-        category: str = None,
-        tags: str = None
-    ):
-        """Edit your server listing."""
-        with db_session_scope() as session:
-            listing = session.get(ServerListing, ctx.guild.id)
-            if not listing:
-                await ctx.respond(
-                    "No listing found. Create one with `/listing create`.",
-                    ephemeral=True
-                )
-                return
-
-            changes = []
-            if title:
-                listing.title = title
-                changes.append(f"Title: **{title}**")
-            if description:
-                listing.description = description
-                changes.append("Description: Updated")
-            if invite_code:
-                listing.invite_code = invite_code
-                changes.append(f"Invite: **{invite_code}**")
-            if category:
-                listing.categories = category
-                changes.append(f"Category: **{category}**")
-            if tags:
-                listing.tags = tags
-                changes.append(f"Tags: **{tags}**")
-
-            listing.updated_at = int(time.time())
-            listing.member_count = ctx.guild.member_count
-
-        if changes:
-            await ctx.respond("**Listing updated:**\n" + "\n".join(changes), ephemeral=True)
-        else:
-            await ctx.respond("No changes provided. Use options to update fields.", ephemeral=True)
-
-    @listing.command(name="publish", description="Publish/unpublish your listing (PRO)")
-    @commands.has_permissions(administrator=True)
-    @discord.option(name="published", description="Publish listing?", required=True)
-    async def listing_publish(
-        self,
-        ctx: discord.ApplicationContext,
-        published: bool
-    ):
-        """Publish or unpublish your server listing."""
-        with db_session_scope() as session:
-            listing = session.get(ServerListing, ctx.guild.id)
-            if not listing:
-                await ctx.respond("No listing found. Create one with `/listing create`.", ephemeral=True)
-                return
-
-            listing.is_published = published
-            listing.updated_at = int(time.time())
-
-        status = "published" if published else "unpublished"
-        await ctx.respond(f"Your server listing is now **{status}**.", ephemeral=True)
-
-    @listing.command(name="stats", description="View your listing stats (PRO)")
-    async def listing_stats(self, ctx: discord.ApplicationContext):
-        """View your server listing stats."""
-        with db_session_scope() as session:
-            listing = session.get(ServerListing, ctx.guild.id)
-            if not listing:
-                await ctx.respond("No listing found. Create one with `/listing create`.", ephemeral=True)
-                return
-
-            embed = discord.Embed(
-                title=f"Listing Stats: {listing.title}",
-                color=discord.Color.purple()
-            )
-            embed.add_field(name="Views", value=f"**{listing.views:,}**", inline=True)
-            embed.add_field(name="Clicks", value=f"**{listing.clicks:,}**", inline=True)
-            embed.add_field(name="Joins", value=f"**{listing.joins_from_discovery:,}**", inline=True)
-            embed.add_field(name="Status", value="Published" if listing.is_published else "Unpublished", inline=True)
-            embed.add_field(name="Category", value=listing.categories, inline=True)
-            embed.add_field(name="Member Count", value=f"{listing.member_count:,}", inline=True)
-
-            if listing.views > 0:
-                ctr = (listing.clicks / listing.views) * 100
-                embed.add_field(name="Click Rate", value=f"**{ctr:.1f}%**", inline=True)
-            if listing.clicks > 0:
-                join_rate = (listing.joins_from_discovery / listing.clicks) * 100
-                embed.add_field(name="Join Rate", value=f"**{join_rate:.1f}%**", inline=True)
-
-        await ctx.respond(embed=embed, ephemeral=True)
-
-    @listing.command(name="delete", description="Delete your server listing (Admin)")
-    @commands.has_permissions(administrator=True)
-    async def listing_delete(self, ctx: discord.ApplicationContext):
-        """Delete your server listing."""
-        with db_session_scope() as session:
-            listing = session.get(ServerListing, ctx.guild.id)
-            if not listing:
-                await ctx.respond("No listing found.", ephemeral=True)
-                return
-
-            session.delete(listing)
-
-        await ctx.respond("Your server listing has been deleted.", ephemeral=True)
+    # ========================================================================
+    # PHASE 2/3 FEATURES - DISABLED (Require web integration & documentation)
+    # ========================================================================
+    # The following commands are COMMENTED OUT until web dashboard and
+    # documentation are ready:
+    # - Cross-server Discovery Network (/discovery servers, join, settings, leave)
+    # - Server Listings (/listing create, edit, publish, stats, delete)
+    # - Primary Guild Selection (/discovery set-primary-guild, set-primary, auto-select)
+    #
+    # These features require additional web development and user documentation
+    # before they can be launched. Uncomment when ready for Phase 2/3.
+    # ========================================================================
+
+# PHASE2:     @discovery.command(name="set-primary-guild", description="Set which guild's intro to display globally")
+# PHASE2:     async def set_primary_guild(self, ctx: discord.ApplicationContext):
+# PHASE2:         """
+# PHASE2:         Set which guild's intro should be displayed on your global Hall of Fame profile.
+# PHASE2:         By default, your most recent intro is used (auto-select).
+# PHASE2:         """
+# PHASE2:         with db_session_scope() as session:
+# PHASE2:             # Get creator
+# PHASE2:             creator = session.get(FeaturedCreator, ctx.author.id)
+# PHASE2: 
+# PHASE2:             if not creator:
+# PHASE2:                 await ctx.respond(
+# PHASE2:                     "You don't have a Hall of Fame entry yet.\n\n"
+# PHASE2:                     "Post an intro in a forum or use `/promo featured` to get featured!",
+# PHASE2:                     ephemeral=True
+# PHASE2:                 )
+# PHASE2:                 return
+# PHASE2: 
+# PHASE2:             # Get list of guilds they're in
+# PHASE2:             guilds_list = json.loads(creator.guilds) if creator.guilds else []
+# PHASE2: 
+# PHASE2:             if not guilds_list:
+# PHASE2:                 await ctx.respond(
+# PHASE2:                     "You're not in any tracked guilds.",
+# PHASE2:                     ephemeral=True
+# PHASE2:                 )
+# PHASE2:                 return
+# PHASE2: 
+# PHASE2:             # Build guild selection embed
+# PHASE2:             embed = discord.Embed(
+# PHASE2:                 title="🏆 Set Your Primary Guild",
+# PHASE2:                 description=(
+# PHASE2:                     f"**Current Primary:** {creator.primary_guild_id}\n"
+# PHASE2:                     f"**Auto-Select:** {'Enabled ✅' if creator.auto_select_primary else 'Disabled ❌'}\n\n"
+# PHASE2:                     "Choose which guild's intro should be displayed on your Hall of Fame profile.\n\n"
+# PHASE2:                     "**Your Guilds:**"
+# PHASE2:                 ),
+# PHASE2:                 color=discord.Color.gold()
+# PHASE2:             )
+# PHASE2: 
+# PHASE2:             for guild_id in guilds_list:
+# PHASE2:                 guild = self.bot.get_guild(guild_id)
+# PHASE2:                 guild_name = guild.name if guild else f"Guild {guild_id}"
+# PHASE2:                 is_primary = "⭐ **PRIMARY**" if guild_id == creator.primary_guild_id else ""
+# PHASE2:                 embed.add_field(
+# PHASE2:                     name=f"{guild_name} {is_primary}",
+# PHASE2:                     value=f"Guild ID: `{guild_id}`",
+# PHASE2:                     inline=False
+# PHASE2:                 )
+# PHASE2: 
+# PHASE2:             embed.add_field(
+# PHASE2:                 name="💡 How to Change",
+# PHASE2:                 value=(
+# PHASE2:                     "To change your primary guild, use:\n"
+# PHASE2:                     "`/discovery set-primary <guild_id>`\n\n"
+# PHASE2:                     "To enable auto-select (always use most recent):\n"
+# PHASE2:                     "`/discovery auto-select true`"
+# PHASE2:                 ),
+# PHASE2:                 inline=False
+# PHASE2:             )
+# PHASE2: 
+# PHASE2:             await ctx.respond(embed=embed, ephemeral=True)
+# PHASE2: 
+# PHASE2:     @discovery.command(name="set-primary", description="Set your primary guild by ID")
+# PHASE2:     @discord.option(
+# PHASE2:         name="guild_id",
+# PHASE2:         description="The guild ID to set as primary",
+# PHASE2:         required=True
+# PHASE2:     )
+# PHASE2:     async def set_primary(
+# PHASE2:         self,
+# PHASE2:         ctx: discord.ApplicationContext,
+# PHASE2:         guild_id: str
+# PHASE2:     ):
+# PHASE2:         """Set which guild's intro should be displayed globally."""
+# PHASE2:         try:
+# PHASE2:             guild_id_int = int(guild_id)
+# PHASE2:         except ValueError:
+# PHASE2:             await ctx.respond("Invalid guild ID. Please provide a valid number.", ephemeral=True)
+# PHASE2:             return
+# PHASE2: 
+# PHASE2:         with db_session_scope() as session:
+# PHASE2:             # Get creator
+# PHASE2:             creator = session.get(FeaturedCreator, ctx.author.id)
+# PHASE2: 
+# PHASE2:             if not creator:
+# PHASE2:                 await ctx.respond(
+# PHASE2:                     "You don't have a Hall of Fame entry yet.",
+# PHASE2:                     ephemeral=True
+# PHASE2:                 )
+# PHASE2:                 return
+# PHASE2: 
+# PHASE2:             # Check if they're in this guild
+# PHASE2:             guilds_list = json.loads(creator.guilds) if creator.guilds else []
+# PHASE2: 
+# PHASE2:             if guild_id_int not in guilds_list:
+# PHASE2:                 await ctx.respond(
+# PHASE2:                     f"You're not in guild {guild_id_int}.\n\n"
+# PHASE2:                     "Use `/discovery set-primary-guild` to see your guilds.",
+# PHASE2:                     ephemeral=True
+# PHASE2:                 )
+# PHASE2:                 return
+# PHASE2: 
+# PHASE2:             # Update primary guild
+# PHASE2:             creator.primary_guild_id = guild_id_int
+# PHASE2:             creator.auto_select_primary = False  # Disable auto-select when manually set
+# PHASE2:             creator.updated_at = int(time.time())
+# PHASE2:             session.commit()
+# PHASE2: 
+# PHASE2:             guild = self.bot.get_guild(guild_id_int)
+# PHASE2:             guild_name = guild.name if guild else f"Guild {guild_id_int}"
+# PHASE2: 
+# PHASE2:             await ctx.respond(
+# PHASE2:                 f"✅ **Primary guild set!**\n\n"
+# PHASE2:                 f"Your Hall of Fame profile will now display your intro from **{guild_name}**.\n"
+# PHASE2:                 f"Auto-select has been disabled.\n\n"
+# PHASE2:                 f"To re-enable auto-select, use `/discovery auto-select true`",
+# PHASE2:                 ephemeral=True
+# PHASE2:             )
+# PHASE2: 
+# PHASE2:     @discovery.command(name="auto-select", description="Enable/disable auto-select for primary guild")
+# PHASE2:     @discord.option(
+# PHASE2:         name="enabled",
+# PHASE2:         description="Enable or disable auto-select",
+# PHASE2:         required=True
+# PHASE2:     )
+# PHASE2:     async def auto_select(
+# PHASE2:         self,
+# PHASE2:         ctx: discord.ApplicationContext,
+# PHASE2:         enabled: bool
+# PHASE2:     ):
+# PHASE2:         """Enable or disable automatic primary guild selection."""
+# PHASE2:         with db_session_scope() as session:
+# PHASE2:             # Get creator
+# PHASE2:             creator = session.get(FeaturedCreator, ctx.author.id)
+# PHASE2: 
+# PHASE2:             if not creator:
+# PHASE2:                 await ctx.respond(
+# PHASE2:                     "You don't have a Hall of Fame entry yet.",
+# PHASE2:                     ephemeral=True
+# PHASE2:                 )
+# PHASE2:                 return
+# PHASE2: 
+# PHASE2:             # Update auto-select
+# PHASE2:             creator.auto_select_primary = enabled
+# PHASE2:             creator.updated_at = int(time.time())
+# PHASE2:             session.commit()
+# PHASE2: 
+# PHASE2:             if enabled:
+# PHASE2:                 await ctx.respond(
+# PHASE2:                     "✅ **Auto-select enabled!**\n\n"
+# PHASE2:                     "Your Hall of Fame profile will now automatically display your most recent intro.",
+# PHASE2:                     ephemeral=True
+# PHASE2:                 )
+# PHASE2:             else:
+# PHASE2:                 await ctx.respond(
+# PHASE2:                     "✅ **Auto-select disabled!**\n\n"
+# PHASE2:                     f"Your Hall of Fame profile will continue displaying your intro from guild {creator.primary_guild_id}.\n"
+# PHASE2:                     "Use `/discovery set-primary <guild_id>` to change it manually.",
+# PHASE2:                     ephemeral=True
+# PHASE2:                 )
+
+# PHASE2:     @discovery.command(name="servers", description="Browse servers in discovery network (PRO)")
+# PHASE2:     @discord.option(
+# PHASE2:         name="category",
+# PHASE2:         description="Filter by category",
+# PHASE2:         required=False,
+# PHASE2:         choices=["gaming", "streaming", "content", "esports", "casual", "competitive"]
+# PHASE2:     )
+# PHASE2:     async def discovery_servers(
+# PHASE2:         self,
+# PHASE2:         ctx: discord.ApplicationContext,
+# PHASE2:         category: str = None
+# PHASE2:     ):
+# PHASE2:         """Browse servers in the discovery network."""
+# PHASE2:         with db_session_scope() as session:
+# PHASE2:             tier = get_guild_tier(session, ctx.guild.id)
+# PHASE2:             has_discovery = FeatureLimits.get_limit(tier, "discovery_network")
+# PHASE2: 
+# PHASE2:             if not has_discovery:
+# PHASE2:                 await ctx.respond(
+# PHASE2:                     "**Discovery Network requires QuestLog PRO!**\n\n"
+# PHASE2:                     "Upgrade with `/questlog upgrade` to:\n"
+# PHASE2:                     "- Browse and join partner servers\n"
+# PHASE2:                     "- List your server in the directory\n"
+# PHASE2:                     "- Cross-promote with other communities",
+# PHASE2:                     ephemeral=True
+# PHASE2:                 )
+# PHASE2:                 return
+# PHASE2: 
+# PHASE2:             # Build query
+# PHASE2:             query = (
+# PHASE2:                 session.query(ServerListing)
+# PHASE2:                 .filter(
+# PHASE2:                     ServerListing.is_published == True,
+# PHASE2:                     ServerListing.guild_id != ctx.guild.id  # Don't show own server
+# PHASE2:                 )
+# PHASE2:             )
+# PHASE2: 
+# PHASE2:             if category:
+# PHASE2:                 query = query.filter(ServerListing.categories.contains(category))
+# PHASE2: 
+# PHASE2:             listings = query.order_by(ServerListing.member_count.desc()).limit(15).all()
+# PHASE2: 
+# PHASE2:             if not listings:
+# PHASE2:                 await ctx.respond(
+# PHASE2:                     "No servers found in the discovery network yet.\n\n"
+# PHASE2:                     "Be the first! Use `/listing create` to add your server.",
+# PHASE2:                     ephemeral=True
+# PHASE2:                 )
+# PHASE2:                 return
+# PHASE2: 
+# PHASE2:             embed = discord.Embed(
+# PHASE2:                 title="Discovery Network",
+# PHASE2:                 description=f"Servers matching: **{category or 'All Categories'}**",
+# PHASE2:                 color=discord.Color.purple()
+# PHASE2:             )
+# PHASE2: 
+# PHASE2:             for listing in listings:
+# PHASE2:                 # Increment view count
+# PHASE2:                 listing.views += 1
+# PHASE2: 
+# PHASE2:                 tags = f"\n*{listing.tags}*" if listing.tags else ""
+# PHASE2:                 invite_text = f"\n[Join Server](https://discord.gg/{listing.invite_code})" if listing.invite_code else ""
+# PHASE2: 
+# PHASE2:                 embed.add_field(
+# PHASE2:                     name=f"{listing.title} ({listing.member_count:,} members)",
+# PHASE2:                     value=f"{listing.description[:150] if listing.description else 'No description'}{tags}{invite_text}",
+# PHASE2:                     inline=False
+# PHASE2:                 )
+# PHASE2: 
+# PHASE2:             embed.set_footer(text=f"Showing {len(listings)} servers | /listing create to add yours")
+# PHASE2: 
+# PHASE2:         await ctx.respond(embed=embed, ephemeral=True)
+# PHASE2: 
+# PHASE2:     @discovery.command(name="join", description="Join the discovery network (Admin, PRO)")
+# PHASE2:     @commands.has_permissions(administrator=True)
+# PHASE2:     async def discovery_join(self, ctx: discord.ApplicationContext):
+# PHASE2:         """Join the discovery network."""
+# PHASE2:         with db_session_scope() as session:
+# PHASE2:             tier = get_guild_tier(session, ctx.guild.id)
+# PHASE2:             has_discovery = FeatureLimits.get_limit(tier, "discovery_network")
+# PHASE2: 
+# PHASE2:             if not has_discovery:
+# PHASE2:                 await ctx.respond(
+# PHASE2:                     "**Discovery Network requires QuestLog PRO!**\n\n"
+# PHASE2:                     "Upgrade with `/questlog upgrade` to access cross-server promotion.",
+# PHASE2:                     ephemeral=True
+# PHASE2:                 )
+# PHASE2:                 return
+# PHASE2: 
+# PHASE2:             # Check if already joined
+# PHASE2:             existing = session.get(DiscoveryNetwork, ctx.guild.id)
+# PHASE2:             if existing and existing.is_active:
+# PHASE2:                 await ctx.respond(
+# PHASE2:                     "Your server is already in the discovery network!\n\n"
+# PHASE2:                     "Use `/discovery settings` to configure your preferences.",
+# PHASE2:                     ephemeral=True
+# PHASE2:                 )
+# PHASE2:                 return
+# PHASE2: 
+# PHASE2:             # Join network
+# PHASE2:             if existing:
+# PHASE2:                 existing.is_active = True
+# PHASE2:             else:
+# PHASE2:                 network = DiscoveryNetwork(
+# PHASE2:                     guild_id=ctx.guild.id,
+# PHASE2:                     is_active=True,
+# PHASE2:                     allow_incoming=True,
+# PHASE2:                     allow_outgoing=True,
+# PHASE2:                     categories="gaming",
+# PHASE2:                 )
+# PHASE2:                 session.add(network)
+# PHASE2: 
+# PHASE2:             # Enable discovery on guild
+# PHASE2:             guild = session.get(Guild, ctx.guild.id)
+# PHASE2:             if guild:
+# PHASE2:                 guild.discovery_enabled = True
+# PHASE2: 
+# PHASE2:         await ctx.respond(
+# PHASE2:             "**Welcome to the Discovery Network!**\n\n"
+# PHASE2:             "Your server is now part of the cross-server promotion network.\n\n"
+# PHASE2:             "**Next steps:**\n"
+# PHASE2:             "1. `/listing create` - Create your server listing\n"
+# PHASE2:             "2. `/discovery settings` - Configure your preferences\n"
+# PHASE2:             "3. `/discovery servers` - Browse other servers",
+# PHASE2:             ephemeral=True
+# PHASE2:         )
+# PHASE2: 
+# PHASE2:     @discovery.command(name="settings", description="Configure discovery settings (Admin, PRO)")
+# PHASE2:     @commands.has_permissions(administrator=True)
+# PHASE2:     @discord.option(
+# PHASE2:         name="incoming",
+# PHASE2:         description="Allow incoming promo posts from other servers",
+# PHASE2:         required=False
+# PHASE2:     )
+# PHASE2:     @discord.option(
+# PHASE2:         name="outgoing",
+# PHASE2:         description="Share your promos with other servers",
+# PHASE2:         required=False
+# PHASE2:     )
+# PHASE2:     @discord.option(
+# PHASE2:         name="channel",
+# PHASE2:         description="Channel for cross-server promos",
+# PHASE2:         required=False
+# PHASE2:     )
+# PHASE2:     @discord.option(
+# PHASE2:         name="categories",
+# PHASE2:         description="Categories (comma-separated: gaming,streaming,esports)",
+# PHASE2:         required=False
+# PHASE2:     )
+# PHASE2:     async def discovery_settings(
+# PHASE2:         self,
+# PHASE2:         ctx: discord.ApplicationContext,
+# PHASE2:         incoming: bool = None,
+# PHASE2:         outgoing: bool = None,
+# PHASE2:         channel: discord.TextChannel = None,
+# PHASE2:         categories: str = None
+# PHASE2:     ):
+# PHASE2:         """Configure discovery network settings."""
+# PHASE2:         with db_session_scope() as session:
+# PHASE2:             tier = get_guild_tier(session, ctx.guild.id)
+# PHASE2:             has_discovery = FeatureLimits.get_limit(tier, "discovery_network")
+# PHASE2: 
+# PHASE2:             if not has_discovery:
+# PHASE2:                 await ctx.respond("Discovery Network requires QuestLog PRO!", ephemeral=True)
+# PHASE2:                 return
+# PHASE2: 
+# PHASE2:             network = session.get(DiscoveryNetwork, ctx.guild.id)
+# PHASE2:             if not network:
+# PHASE2:                 await ctx.respond("Join the network first with `/discovery join`.", ephemeral=True)
+# PHASE2:                 return
+# PHASE2: 
+# PHASE2:             # Update settings
+# PHASE2:             changes = []
+# PHASE2:             if incoming is not None:
+# PHASE2:                 network.allow_incoming = incoming
+# PHASE2:                 changes.append(f"Incoming promos: **{'Enabled' if incoming else 'Disabled'}**")
+# PHASE2:             if outgoing is not None:
+# PHASE2:                 network.allow_outgoing = outgoing
+# PHASE2:                 changes.append(f"Outgoing promos: **{'Enabled' if outgoing else 'Disabled'}**")
+# PHASE2:             if channel is not None:
+# PHASE2:                 network.network_channel_id = channel.id
+# PHASE2:                 changes.append(f"Network channel: {channel.mention}")
+# PHASE2:             if categories is not None:
+# PHASE2:                 network.categories = categories.lower().replace(" ", "")
+# PHASE2:                 changes.append(f"Categories: **{network.categories}**")
+# PHASE2: 
+# PHASE2:             if not changes:
+# PHASE2:                 # Show current settings
+# PHASE2:                 embed = discord.Embed(
+# PHASE2:                     title="Discovery Network Settings",
+# PHASE2:                     color=discord.Color.purple()
+# PHASE2:                 )
+# PHASE2:                 embed.add_field(
+# PHASE2:                     name="Incoming Promos",
+# PHASE2:                     value="Enabled" if network.allow_incoming else "Disabled",
+# PHASE2:                     inline=True
+# PHASE2:                 )
+# PHASE2:                 embed.add_field(
+# PHASE2:                     name="Outgoing Promos",
+# PHASE2:                     value="Enabled" if network.allow_outgoing else "Disabled",
+# PHASE2:                     inline=True
+# PHASE2:                 )
+# PHASE2:                 ch = ctx.guild.get_channel(network.network_channel_id) if network.network_channel_id else None
+# PHASE2:                 embed.add_field(
+# PHASE2:                     name="Network Channel",
+# PHASE2:                     value=ch.mention if ch else "Not set",
+# PHASE2:                     inline=True
+# PHASE2:                 )
+# PHASE2:                 embed.add_field(
+# PHASE2:                     name="Categories",
+# PHASE2:                     value=network.categories or "gaming",
+# PHASE2:                     inline=True
+# PHASE2:                 )
+# PHASE2:                 await ctx.respond(embed=embed, ephemeral=True)
+# PHASE2:             else:
+# PHASE2:                 await ctx.respond(
+# PHASE2:                     "**Settings updated:**\n" + "\n".join(changes),
+# PHASE2:                     ephemeral=True
+# PHASE2:                 )
+# PHASE2: 
+# PHASE2:     @discovery.command(name="leave", description="Leave the discovery network (Admin)")
+# PHASE2:     @commands.has_permissions(administrator=True)
+# PHASE2:     async def discovery_leave(self, ctx: discord.ApplicationContext):
+# PHASE2:         """Leave the discovery network."""
+# PHASE2:         with db_session_scope() as session:
+# PHASE2:             network = session.get(DiscoveryNetwork, ctx.guild.id)
+# PHASE2:             if not network or not network.is_active:
+# PHASE2:                 await ctx.respond("Your server is not in the discovery network.", ephemeral=True)
+# PHASE2:                 return
+# PHASE2: 
+# PHASE2:             network.is_active = False
+# PHASE2: 
+# PHASE2:             # Unpublish listing
+# PHASE2:             listing = session.get(ServerListing, ctx.guild.id)
+# PHASE2:             if listing:
+# PHASE2:                 listing.is_published = False
+# PHASE2: 
+# PHASE2:             guild = session.get(Guild, ctx.guild.id)
+# PHASE2:             if guild:
+# PHASE2:                 guild.discovery_enabled = False
+# PHASE2: 
+# PHASE2:         await ctx.respond(
+# PHASE2:             "You've left the discovery network.\n"
+# PHASE2:             "Your server listing has been unpublished.\n\n"
+# PHASE2:             "Rejoin anytime with `/discovery join`.",
+# PHASE2:             ephemeral=True
+# PHASE2:         )
+# PHASE2: 
+# PHASE2:     # ========== SERVER LISTING COMMANDS ==========
+# PHASE2: 
+# PHASE2:     @listing.command(name="create", description="Create your server listing (PRO)")
+# PHASE2:     @commands.has_permissions(administrator=True)
+# PHASE2:     @discord.option(name="title", description="Server title (max 100 chars)", required=True)
+# PHASE2:     @discord.option(name="description", description="Server description", required=True)
+# PHASE2:     @discord.option(name="invite_code", description="Invite code (without discord.gg/)", required=False)
+# PHASE2:     @discord.option(
+# PHASE2:         name="category",
+# PHASE2:         description="Primary category",
+# PHASE2:         required=True,
+# PHASE2:         choices=["gaming", "streaming", "content", "esports", "casual", "competitive"]
+# PHASE2:     )
+# PHASE2:     @discord.option(name="tags", description="Tags (comma-separated)", required=False)
+# PHASE2:     async def listing_create(
+# PHASE2:         self,
+# PHASE2:         ctx: discord.ApplicationContext,
+# PHASE2:         title: str,
+# PHASE2:         description: str,
+# PHASE2:         category: str,
+# PHASE2:         invite_code: str = None,
+# PHASE2:         tags: str = None
+# PHASE2:     ):
+# PHASE2:         """Create or update your server listing."""
+# PHASE2:         with db_session_scope() as session:
+# PHASE2:             tier = get_guild_tier(session, ctx.guild.id)
+# PHASE2:             has_discovery = FeatureLimits.get_limit(tier, "discovery_network")
+# PHASE2: 
+# PHASE2:             if not has_discovery:
+# PHASE2:                 await ctx.respond("Server listings require QuestLog PRO!", ephemeral=True)
+# PHASE2:                 return
+# PHASE2: 
+# PHASE2:             if len(title) > 100:
+# PHASE2:                 await ctx.respond("Title must be 100 characters or less.", ephemeral=True)
+# PHASE2:                 return
+# PHASE2: 
+# PHASE2:             # Check if in network
+# PHASE2:             network = session.get(DiscoveryNetwork, ctx.guild.id)
+# PHASE2:             if not network or not network.is_active:
+# PHASE2:                 await ctx.respond(
+# PHASE2:                     "Join the discovery network first with `/discovery join`.",
+# PHASE2:                     ephemeral=True
+# PHASE2:                 )
+# PHASE2:                 return
+# PHASE2: 
+# PHASE2:             # Create or update listing
+# PHASE2:             listing = session.get(ServerListing, ctx.guild.id)
+# PHASE2:             if listing:
+# PHASE2:                 listing.title = title
+# PHASE2:                 listing.description = description
+# PHASE2:                 listing.invite_code = invite_code
+# PHASE2:                 listing.categories = category
+# PHASE2:                 listing.tags = tags
+# PHASE2:                 listing.member_count = ctx.guild.member_count
+# PHASE2:                 listing.updated_at = int(time.time())
+# PHASE2:                 action = "updated"
+# PHASE2:             else:
+# PHASE2:                 listing = ServerListing(
+# PHASE2:                     guild_id=ctx.guild.id,
+# PHASE2:                     title=title,
+# PHASE2:                     description=description,
+# PHASE2:                     invite_code=invite_code,
+# PHASE2:                     categories=category,
+# PHASE2:                     tags=tags,
+# PHASE2:                     member_count=ctx.guild.member_count,
+# PHASE2:                     is_published=True,
+# PHASE2:                 )
+# PHASE2:                 session.add(listing)
+# PHASE2:                 action = "created"
+# PHASE2: 
+# PHASE2:         invite_url = f"https://discord.gg/{invite_code}" if invite_code else "Not set"
+# PHASE2:         await ctx.respond(
+# PHASE2:             f"**Server listing {action}!**\n\n"
+# PHASE2:             f"**Title:** {title}\n"
+# PHASE2:             f"**Category:** {category}\n"
+# PHASE2:             f"**Invite:** {invite_url}\n\n"
+# PHASE2:             f"Your server is now visible in `/discovery servers`!",
+# PHASE2:             ephemeral=True
+# PHASE2:         )
+# PHASE2: 
+# PHASE2:     @listing.command(name="edit", description="Edit your server listing (PRO)")
+# PHASE2:     @commands.has_permissions(administrator=True)
+# PHASE2:     @discord.option(name="title", description="New title", required=False)
+# PHASE2:     @discord.option(name="description", description="New description", required=False)
+# PHASE2:     @discord.option(name="invite_code", description="New invite code", required=False)
+# PHASE2:     @discord.option(
+# PHASE2:         name="category",
+# PHASE2:         description="New category",
+# PHASE2:         required=False,
+# PHASE2:         choices=["gaming", "streaming", "content", "esports", "casual", "competitive"]
+# PHASE2:     )
+# PHASE2:     @discord.option(name="tags", description="New tags", required=False)
+# PHASE2:     async def listing_edit(
+# PHASE2:         self,
+# PHASE2:         ctx: discord.ApplicationContext,
+# PHASE2:         title: str = None,
+# PHASE2:         description: str = None,
+# PHASE2:         invite_code: str = None,
+# PHASE2:         category: str = None,
+# PHASE2:         tags: str = None
+# PHASE2:     ):
+# PHASE2:         """Edit your server listing."""
+# PHASE2:         with db_session_scope() as session:
+# PHASE2:             listing = session.get(ServerListing, ctx.guild.id)
+# PHASE2:             if not listing:
+# PHASE2:                 await ctx.respond(
+# PHASE2:                     "No listing found. Create one with `/listing create`.",
+# PHASE2:                     ephemeral=True
+# PHASE2:                 )
+# PHASE2:                 return
+# PHASE2: 
+# PHASE2:             changes = []
+# PHASE2:             if title:
+# PHASE2:                 listing.title = title
+# PHASE2:                 changes.append(f"Title: **{title}**")
+# PHASE2:             if description:
+# PHASE2:                 listing.description = description
+# PHASE2:                 changes.append("Description: Updated")
+# PHASE2:             if invite_code:
+# PHASE2:                 listing.invite_code = invite_code
+# PHASE2:                 changes.append(f"Invite: **{invite_code}**")
+# PHASE2:             if category:
+# PHASE2:                 listing.categories = category
+# PHASE2:                 changes.append(f"Category: **{category}**")
+# PHASE2:             if tags:
+# PHASE2:                 listing.tags = tags
+# PHASE2:                 changes.append(f"Tags: **{tags}**")
+# PHASE2: 
+# PHASE2:             listing.updated_at = int(time.time())
+# PHASE2:             listing.member_count = ctx.guild.member_count
+# PHASE2: 
+# PHASE2:         if changes:
+# PHASE2:             await ctx.respond("**Listing updated:**\n" + "\n".join(changes), ephemeral=True)
+# PHASE2:         else:
+# PHASE2:             await ctx.respond("No changes provided. Use options to update fields.", ephemeral=True)
+# PHASE2: 
+# PHASE2:     @listing.command(name="publish", description="Publish/unpublish your listing (PRO)")
+# PHASE2:     @commands.has_permissions(administrator=True)
+# PHASE2:     @discord.option(name="published", description="Publish listing?", required=True)
+# PHASE2:     async def listing_publish(
+# PHASE2:         self,
+# PHASE2:         ctx: discord.ApplicationContext,
+# PHASE2:         published: bool
+# PHASE2:     ):
+# PHASE2:         """Publish or unpublish your server listing."""
+# PHASE2:         with db_session_scope() as session:
+# PHASE2:             listing = session.get(ServerListing, ctx.guild.id)
+# PHASE2:             if not listing:
+# PHASE2:                 await ctx.respond("No listing found. Create one with `/listing create`.", ephemeral=True)
+# PHASE2:                 return
+# PHASE2: 
+# PHASE2:             listing.is_published = published
+# PHASE2:             listing.updated_at = int(time.time())
+# PHASE2: 
+# PHASE2:         status = "published" if published else "unpublished"
+# PHASE2:         await ctx.respond(f"Your server listing is now **{status}**.", ephemeral=True)
+# PHASE2: 
+# PHASE2:     @listing.command(name="stats", description="View your listing stats (PRO)")
+# PHASE2:     async def listing_stats(self, ctx: discord.ApplicationContext):
+# PHASE2:         """View your server listing stats."""
+# PHASE2:         with db_session_scope() as session:
+# PHASE2:             listing = session.get(ServerListing, ctx.guild.id)
+# PHASE2:             if not listing:
+# PHASE2:                 await ctx.respond("No listing found. Create one with `/listing create`.", ephemeral=True)
+# PHASE2:                 return
+# PHASE2: 
+# PHASE2:             embed = discord.Embed(
+# PHASE2:                 title=f"Listing Stats: {listing.title}",
+# PHASE2:                 color=discord.Color.purple()
+# PHASE2:             )
+# PHASE2:             embed.add_field(name="Views", value=f"**{listing.views:,}**", inline=True)
+# PHASE2:             embed.add_field(name="Clicks", value=f"**{listing.clicks:,}**", inline=True)
+# PHASE2:             embed.add_field(name="Joins", value=f"**{listing.joins_from_discovery:,}**", inline=True)
+# PHASE2:             embed.add_field(name="Status", value="Published" if listing.is_published else "Unpublished", inline=True)
+# PHASE2:             embed.add_field(name="Category", value=listing.categories, inline=True)
+# PHASE2:             embed.add_field(name="Member Count", value=f"{listing.member_count:,}", inline=True)
+# PHASE2: 
+# PHASE2:             if listing.views > 0:
+# PHASE2:                 ctr = (listing.clicks / listing.views) * 100
+# PHASE2:                 embed.add_field(name="Click Rate", value=f"**{ctr:.1f}%**", inline=True)
+# PHASE2:             if listing.clicks > 0:
+# PHASE2:                 join_rate = (listing.joins_from_discovery / listing.clicks) * 100
+# PHASE2:                 embed.add_field(name="Join Rate", value=f"**{join_rate:.1f}%**", inline=True)
+# PHASE2: 
+# PHASE2:         await ctx.respond(embed=embed, ephemeral=True)
+# PHASE2: 
+# PHASE2:     @listing.command(name="delete", description="Delete your server listing (Admin)")
+# PHASE2:     @commands.has_permissions(administrator=True)
+# PHASE2:     async def listing_delete(self, ctx: discord.ApplicationContext):
+# PHASE2:         """Delete your server listing."""
+# PHASE2:         with db_session_scope() as session:
+# PHASE2:             listing = session.get(ServerListing, ctx.guild.id)
+# PHASE2:             if not listing:
+# PHASE2:                 await ctx.respond("No listing found.", ephemeral=True)
+# PHASE2:                 return
+# PHASE2: 
+# PHASE2:             session.delete(listing)
+# PHASE2: 
+# PHASE2:         await ctx.respond("Your server listing has been deleted.", ephemeral=True)
 
     @promo.command(name="clearfeatured", description="Clear current featured person (Admin)")
     @commands.has_permissions(administrator=True)
