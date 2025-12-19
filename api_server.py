@@ -86,7 +86,7 @@ async def force_guild_sync(request):
                 try:
                     import aiohttp
                     django_url = os.getenv('DJANGO_URL', 'https://casual-heroes.com')
-                    cache_url = f"{django_url}/warden/api/guild/{guild_id}/invalidate-cache/"
+                    cache_url = f"{django_url}/questlog/api/guild/{guild_id}/invalidate-cache/"
                     async with aiohttp.ClientSession() as cache_session:
                         await cache_session.post(cache_url, timeout=aiohttp.ClientTimeout(total=2))
                 except Exception as cache_error:

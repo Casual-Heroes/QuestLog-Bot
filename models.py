@@ -1,5 +1,5 @@
 # warden/models.py
-# Database models for Warden Bot - Multi-tenant design for 1000+ guilds
+# Database models for QuestLog - Multi-tenant design for 1000+ guilds
 
 from sqlalchemy import (
     Column, Integer, String, BigInteger, Boolean, Text, Float,
@@ -139,7 +139,7 @@ class ActionType(str, Enum):
 # Guild
 
 class Guild(Base):
-    """Master table for all guilds using Warden."""
+    """Master table for all guilds using QuestLog."""
     __tablename__ = "guilds"
 
     guild_id = Column(BigInteger, primary_key=True)
@@ -167,7 +167,7 @@ class Guild(Base):
     vip_note = Column(String(255), nullable=True)
 
     # Settings
-    bot_prefix = Column(String(10), default="/warden")
+    bot_prefix = Column(String(10), default="/questlog")
     language = Column(String(10), default="en")
     timezone = Column(String(50), default="UTC")
 

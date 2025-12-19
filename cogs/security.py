@@ -1,6 +1,6 @@
 # cogs/security.py - Anti-Raid Protection & Security
 """
-Security cog for Warden bot.
+Security cog for QuestLog.
 Handles anti-raid protection, lockdown, and threat detection.
 
 FREE FEATURES:
@@ -388,7 +388,7 @@ class SecurityCog(commands.Cog):
 
             if not raid_config:
                 await ctx.respond(
-                    "⚠️ Raid protection not configured. Use `/warden setup` first.",
+                    "⚠️ Raid protection not configured. Use `/questlog setup` first.",
                     ephemeral=True
                 )
                 return

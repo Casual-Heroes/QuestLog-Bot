@@ -2,7 +2,7 @@
 """Test script to verify ActionType enum has BOOST_EVENT_START"""
 
 import sys
-sys.path.insert(0, '/mnt/gamestoreage2/DiscordBots/wardenbot')
+sys.path.insert(0, '/mnt/gamestoreage2/DiscordBots/questlogbot')
 
 from models import ActionType
 

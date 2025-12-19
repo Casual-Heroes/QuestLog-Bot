@@ -295,7 +295,7 @@ class RafflesCog(commands.Cog):
         embed.add_field(name="Max Winners", value=str(raffle.max_winners), inline=True)
         embed.add_field(
             name="Action Needed",
-            value="Please go to the Warden dashboard and manually pick a winner for this raffle.",
+            value="Please go to the QuestLog dashboard and manually pick a winner for this raffle.",
             inline=False
         )
 

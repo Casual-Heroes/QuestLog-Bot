@@ -1,6 +1,6 @@
 # bot.py - Main Bot Entry Point
 """
-Warden Bot - Discord Security & Engagement Platform
+QuestLog - Discord Security & Engagement Platform
 
 Run with: python -m bot
 """
@@ -34,12 +34,12 @@ from models import Guild, SubscriptionTier
 # Presence messages to rotate through
 PRESENCE_MESSAGES = [
     ("watching", "{server_count} servers"),
-    ("playing", "/warden help"),
+    ("playing", "/questlog help"),
     ("playing", "/xp profile"),
     ("playing", "/flair store"),
     ("playing", "/leaderboard"),
     ("watching", "your server grow"),
-    ("playing", "/warden dashboard"),
+    ("playing", "/questlog dashboard"),
     ("listening", "your commands"),
 ]
 
@@ -92,7 +92,7 @@ async def on_ready():
         bot.start_time = time.time()
 
     logger.info(f"{'=' * 50}")
-    logger.info(f"Warden Bot is ready!")
+    logger.info(f"QuestLog is ready!")
     logger.info(f"Logged in as: {bot.user.name} ({bot.user.id})")
     logger.info(f"Connected to {len(bot.guilds)} guilds")
     logger.info(f"Pycord version: {discord.__version__}")
@@ -257,26 +257,26 @@ async def on_guild_join(guild: discord.Guild):
 
     activity = discord.Activity(
         type=discord.ActivityType.watching,
-        name=f"{len(bot.guilds)} servers | /warden help"
+        name=f"{len(bot.guilds)} servers | /questlog help"
     )
     await bot.change_presence(activity=activity)
 
     if guild.system_channel:
         try:
             embed = discord.Embed(
-                title="👋 Thanks for adding Warden!",
+                title="👋 Thanks for adding QuestLog!",
                 description=(
-                    "Warden is your all-in-one security and engagement bot.\n\n"
+                    "QuestLog is your all-in-one security and engagement bot.\n\n"
                     "**Get started:**\n"
-                    "• `/warden setup` - Quick setup wizard\n"
-                    "• `/warden help` - See all commands\n"
-                    "• `/warden dashboard` - Web dashboard\n\n"
+                    "• `/questlog setup` - Quick setup wizard\n"
+                    "• `/questlog help` - See all commands\n"
+                    "• `/questlog dashboard` - Web dashboard\n\n"
                     "**Free features:** XP, leveling, anti-raid, verification\n"
                     "**Premium:** Discovery network, game server sync, analytics"
                 ),
                 color=discord.Color.brand_green()
             )
-            embed.set_footer(text="Need help? Join our support server: discord.gg/warden")
+            embed.set_footer(text="Need help? Join our support server: discord.gg/questlog")
             await guild.system_channel.send(embed=embed)
         except discord.Forbidden:
             logger.warning(f"Couldn't send welcome message to {guild.name}")
@@ -297,7 +297,7 @@ async def on_guild_remove(guild: discord.Guild):
 
     activity = discord.Activity(
         type=discord.ActivityType.watching,
-        name=f"{len(bot.guilds)} servers | /warden help"
+        name=f"{len(bot.guilds)} servers | /questlog help"
     )
     await bot.change_presence(activity=activity)
 
@@ -334,9 +334,9 @@ async def on_application_command_error(
 
 def main():
     """Entry point for running the bot."""
-    logger.info("Starting Warden bot...")
+    logger.info("Starting QuestLog...")
 
-    # Initialize database (was in WardenBot.setup_hook)
+    # Initialize database (was in QuestLogBot.setup_hook)
     try:
         init_database()
         logger.info("✅ Database initialized")
@@ -351,7 +351,7 @@ def main():
         sys.exit(1)
 
     # Use imported bot from config (simple pattern like Q7)
-    # Add bot attributes that WardenBot had
+    # Add bot attributes that QuestLogBot had
     bot.db_engine = get_engine()
     bot.start_time = None
     bot.commands_processed = 0

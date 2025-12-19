@@ -1,6 +1,6 @@
 # cogs/discovery.py - Discovery & Self-Promo System
 """
-Full discovery system for Warden bot.
+Full discovery system for QuestLog.
 
 FREE FEATURES:
 - Self-promo: Post in #self-promo channel (0 hero_tokens, daily limit based on tier)
@@ -1116,7 +1116,7 @@ class DiscoveryCog(commands.Cog):
         return embed
 
     def _build_game_summary_embed(self, guild_id: int, total_found: int, search_count: int, announced_count: int, target_channel: discord.abc.Messageable = None):
-        dash_url = f"{DASHBOARD_BASE_URL}/warden/guild/{guild_id}/found-games/"
+        dash_url = f"{DASHBOARD_BASE_URL}/questlog/guild/{guild_id}/found-games/"
         channel_text = target_channel.mention if target_channel else "this channel"
         embed = discord.Embed(
             title="✅ Game Discovery Check Complete",
@@ -1977,7 +1977,7 @@ class DiscoveryCog(commands.Cog):
             )
 
             # Add website link
-            website_url = f"https://casual-heroes.com/warden/guild/{guild.id}/featured-creators"
+            website_url = f"https://casual-heroes.com/questlog/guild/{guild.id}/featured-creators"
             embed.add_field(
                 name="🌐 Featured Creators Hall of Fame",
                 value=f"[View all featured creators on our website]({website_url})",
@@ -2311,7 +2311,7 @@ class DiscoveryCog(commands.Cog):
             guild = session.get(Guild, ctx.guild.id)
 
             if not guild:
-                await ctx.respond("Guild not configured. Ask an admin to run `/warden setup`.", ephemeral=True)
+                await ctx.respond("Guild not configured. Ask an admin to run `/questlog setup`.", ephemeral=True)
                 return
 
             # Check if self-promo channel is set
@@ -2441,8 +2441,8 @@ class DiscoveryCog(commands.Cog):
             has_featured_pool = FeatureLimits.get_limit(tier, "featured_pool")
             if not has_featured_pool:
                 await ctx.respond(
-                    "**Featured Pool requires Warden Premium!**\n\n"
-                    "Ask a server admin to upgrade with `/warden premium`.\n\n"
+                    "**Featured Pool requires QuestLog Premium!**\n\n"
+                    "Ask a server admin to upgrade with `/questlog premium`.\n\n"
                     "Free alternative: Use `/promo post` to share your content!",
                     ephemeral=True
                 )
@@ -2855,8 +2855,8 @@ class DiscoveryCog(commands.Cog):
 
             if not has_discovery:
                 await ctx.respond(
-                    "**Discovery Network requires Warden PRO!**\n\n"
-                    "Upgrade with `/warden upgrade` to:\n"
+                    "**Discovery Network requires QuestLog PRO!**\n\n"
+                    "Upgrade with `/questlog upgrade` to:\n"
                     "- Browse and join partner servers\n"
                     "- List your server in the directory\n"
                     "- Cross-promote with other communities",
@@ -2919,8 +2919,8 @@ class DiscoveryCog(commands.Cog):
 
             if not has_discovery:
                 await ctx.respond(
-                    "**Discovery Network requires Warden PRO!**\n\n"
-                    "Upgrade with `/warden upgrade` to access cross-server promotion.",
+                    "**Discovery Network requires QuestLog PRO!**\n\n"
+                    "Upgrade with `/questlog upgrade` to access cross-server promotion.",
                     ephemeral=True
                 )
                 return
@@ -2999,7 +2999,7 @@ class DiscoveryCog(commands.Cog):
             has_discovery = FeatureLimits.get_limit(tier, "discovery_network")
 
             if not has_discovery:
-                await ctx.respond("Discovery Network requires Warden PRO!", ephemeral=True)
+                await ctx.respond("Discovery Network requires QuestLog PRO!", ephemeral=True)
                 return
 
             network = session.get(DiscoveryNetwork, ctx.guild.id)
@@ -3113,7 +3113,7 @@ class DiscoveryCog(commands.Cog):
             has_discovery = FeatureLimits.get_limit(tier, "discovery_network")
 
             if not has_discovery:
-                await ctx.respond("Server listings require Warden PRO!", ephemeral=True)
+                await ctx.respond("Server listings require QuestLog PRO!", ephemeral=True)
                 return
 
             if len(title) > 100:
@@ -3375,7 +3375,7 @@ class DiscoveryCog(commands.Cog):
         with db_session_scope() as session:
             config = session.get(DiscoveryConfig, ctx.guild.id)
             if not config:
-                await ctx.respond("❌ Discovery is not configured. Ask an admin to run `/warden setup`.", ephemeral=True)
+                await ctx.respond("❌ Discovery is not configured. Ask an admin to run `/questlog setup`.", ephemeral=True)
                 return
 
             changes = []
@@ -3466,7 +3466,7 @@ class DiscoveryCog(commands.Cog):
         with db_session_scope() as session:
             config = session.get(DiscoveryConfig, ctx.guild.id)
             if not config:
-                await ctx.respond("❌ Discovery is not configured. Ask an admin to run `/warden setup`.", ephemeral=True)
+                await ctx.respond("❌ Discovery is not configured. Ask an admin to run `/questlog setup`.", ephemeral=True)
                 return
 
             changes = []
@@ -3547,7 +3547,7 @@ class DiscoveryCog(commands.Cog):
         with db_session_scope() as session:
             config = session.get(DiscoveryConfig, ctx.guild.id)
             if not config:
-                await ctx.respond("❌ Discovery is not configured. Ask an admin to run `/warden setup`.", ephemeral=True)
+                await ctx.respond("❌ Discovery is not configured. Ask an admin to run `/questlog setup`.", ephemeral=True)
                 return
 
             if not config.game_discovery_enabled:

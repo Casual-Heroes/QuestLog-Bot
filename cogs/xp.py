@@ -1,6 +1,6 @@
 # cogs/xp.py - XP & Leveling System (FREE)
 """
-XP cog for Warden bot.
+XP cog for QuestLog.
 Handles XP tracking, leveling, and Hero Tokens.
 
 XP SOURCES:

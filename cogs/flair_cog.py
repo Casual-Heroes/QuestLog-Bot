@@ -1,6 +1,6 @@
 # cogs/flair_cog.py - Flair Store System
 """
-Flair Store Cog for Warden Bot.
+Flair Store Cog for QuestLog.
 Allows members to purchase and equip flairs using Hero Tokens.
 Flairs are displayed as Discord roles with the "Flair: " prefix.
 

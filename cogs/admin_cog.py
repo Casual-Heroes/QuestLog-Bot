@@ -1,4 +1,4 @@
-# admin_cog.py - Consolidated Admin Utilities for Warden
+# admin_cog.py - Consolidated Admin Utilities for QuestLog
 # Combines: broadcast, sendembed, editembed, sendmessage, feedback
 
 import discord

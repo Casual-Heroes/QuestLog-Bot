@@ -1,4 +1,4 @@
-# config.py - Configuration for Warden Bot (Multi-Tenant)
+# config.py - Configuration for QuestLog (Multi-Tenant)
 # Designed for 1000+ Discord guilds with MySQL + SQLAlchemy + Pycord
 
 import os
@@ -376,8 +376,8 @@ class FeatureLimits:
 # Pricing configuration (Aggressive Volume Play)
 class Pricing:
     """
-    Warden subscription pricing.
-    Strategy: Aggressive pricing to capture market share, Warden as hook for game server sales.
+    QuestLog subscription pricing.
+    Strategy: Aggressive pricing to capture market share, QuestLog as hook for game server sales.
     """
 
     # Base monthly prices

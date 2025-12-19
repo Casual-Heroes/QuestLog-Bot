@@ -1,6 +1,6 @@
 # cogs/moderation.py - Moderation System
 """
-Comprehensive moderation for Warden bot.
+Comprehensive moderation for QuestLog.
 
 Features:
 - Manual mod commands: kick, ban, timeout, warn, jail, mute

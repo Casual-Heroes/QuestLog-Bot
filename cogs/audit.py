@@ -1,6 +1,6 @@
 # cogs/audit.py - Full Audit Logging System
 """
-Complete audit system for Warden bot.
+Complete audit system for QuestLog.
 Tracks and logs all server events for accountability and security.
 
 RETENTION BY TIER:
@@ -1139,7 +1139,7 @@ class AuditCog(commands.Cog):
         with db_session_scope() as session:
             db_guild = session.get(Guild, ctx.guild.id)
             if not db_guild:
-                await ctx.respond("Run `/warden setup` first.", ephemeral=True)
+                await ctx.respond("Run `/questlog setup` first.", ephemeral=True)
                 return
 
             tier = get_guild_tier(session, ctx.guild.id)

@@ -1,6 +1,6 @@
 # cogs/roles.py - Role & IAM Management
 """
-Comprehensive role management for Warden bot.
+Comprehensive role management for QuestLog.
 
 Features:
 - Mass assign/remove roles

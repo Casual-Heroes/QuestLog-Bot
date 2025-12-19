@@ -1,6 +1,6 @@
 # cogs/verification.py - Member Verification System
 """
-Full verification system for Warden bot.
+Full verification system for QuestLog.
 
 VERIFICATION TYPES:
 - NONE: No verification required
@@ -438,7 +438,7 @@ class VerificationCog(commands.Cog):
                                     guild_id=guild.id,
                                     action=AuditAction.MEMBER_KICK,
                                     actor_id=self.bot.user.id,
-                                    actor_name="Warden Bot",
+                                    actor_name="QuestLog",
                                     target_id=member.id,
                                     target_name=str(member),
                                     reason="Verification timeout"
@@ -639,7 +639,7 @@ class VerificationCog(commands.Cog):
             tier = get_guild_tier(session, ctx.guild.id)
             if tier == "FREE":
                 await ctx.respond(
-                    "Multi-step verification requires **Warden Premium**.\n"
+                    "Multi-step verification requires **QuestLog Premium**.\n"
                     "Please contact an admin to upgrade or use basic verification.",
                     ephemeral=True
                 )
@@ -840,7 +840,7 @@ class VerificationCog(commands.Cog):
             config = session.get(VerificationConfig, ctx.guild.id)
 
             if not db_guild:
-                await ctx.respond("Run `/warden setup` first.", ephemeral=True)
+                await ctx.respond("Run `/questlog setup` first.", ephemeral=True)
                 return
 
             verification_type = config.verification_type if config else VerificationType.BUTTON
@@ -857,7 +857,7 @@ class VerificationCog(commands.Cog):
             ),
             color=discord.Color.blue()
         )
-        embed.set_footer(text="Powered by Warden")
+        embed.set_footer(text="Powered by QuestLog")
 
         # Create appropriate view based on verification type
         if verification_type == VerificationType.BUTTON:
@@ -869,7 +869,7 @@ class VerificationCog(commands.Cog):
             tier = get_guild_tier(session, ctx.guild.id)
             if tier == "FREE":
                 await ctx.respond(
-                    "Multi-step verification requires Warden Premium.",
+                    "Multi-step verification requires QuestLog Premium.",
                     ephemeral=True
                 )
                 return
@@ -938,7 +938,7 @@ class VerificationCog(commands.Cog):
         with db_session_scope() as session:
             db_guild = session.get(Guild, ctx.guild.id)
             if not db_guild:
-                await ctx.respond("Run `/warden setup` first.", ephemeral=True)
+                await ctx.respond("Run `/questlog setup` first.", ephemeral=True)
                 return
 
             config = session.get(VerificationConfig, ctx.guild.id)
@@ -954,7 +954,7 @@ class VerificationCog(commands.Cog):
                     tier = get_guild_tier(session, ctx.guild.id)
                     if tier == "FREE":
                         await ctx.respond(
-                            "Multi-step verification requires Warden Premium!",
+                            "Multi-step verification requires QuestLog Premium!",
                             ephemeral=True
                         )
                         return
@@ -1033,7 +1033,7 @@ class VerificationCog(commands.Cog):
             tier = get_guild_tier(session, ctx.guild.id)
             if tier == "FREE":
                 await ctx.respond(
-                    "Multi-step verification requires Warden Premium!",
+                    "Multi-step verification requires QuestLog Premium!",
                     ephemeral=True
                 )
                 return

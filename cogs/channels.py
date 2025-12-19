@@ -1,6 +1,6 @@
 # cogs/channels.py - Channel Management
 """
-Channel management for Warden bot.
+Channel management for QuestLog.
 
 Features:
 - Channel/Category templates

@@ -1,6 +1,6 @@
 # cogs/billing.py - Stripe Billing & Subscriptions
 """
-Stripe integration for Warden bot subscriptions.
+Stripe integration for QuestLog subscriptions.
 
 Features:
 - Checkout session creation for Premium/Pro upgrades
@@ -460,7 +460,7 @@ class BillingCog(commands.Cog):
     async def billing_plans(self, ctx: discord.ApplicationContext):
         """View available plans and pricing."""
         embed = discord.Embed(
-            title="Warden Subscription Plans",
+            title="QuestLog Subscription Plans",
             description="All features available on all tiers - only quantities differ!",
             color=discord.Color.gold()
         )

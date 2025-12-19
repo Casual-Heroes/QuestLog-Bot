@@ -657,7 +657,8 @@ class ActionProcessorCog(commands.Cog):
         if message_type in ("test_welcome", "test_goodbye"):
             return await self._send_test_message(guild, message_type, payload)
 
-        allowed_mentions = discord.AllowedMentions.none() if payload.get("silent") else discord.AllowedMentions.all()
+        # Safe default: allow user/role mentions but NOT @everyone/@here (prevent abuse)
+        allowed_mentions = discord.AllowedMentions.none() if payload.get("silent") else discord.AllowedMentions(everyone=False, roles=True, users=True)
         silent = payload.get("silent", False)
 
         # Send message
@@ -1384,7 +1385,7 @@ class ActionProcessorCog(commands.Cog):
             if public_games_count > 0:
                 summary_embed.add_field(name="📢 Announced", value=f"{announced} games to this channel", inline=True)
                 summary_embed.add_field(name="💾 Saved", value=f"{public_games_count} games total", inline=True)
-                dashboard_url = f"https://dashboard.casual-heroes.com/warden/guild/{guild.id}/found-games/"
+                dashboard_url = f"https://dashboard.casual-heroes.com/questlog/guild/{guild.id}/found-games/"
                 summary_embed.add_field(
                     name="🔗 View Public Games",
                     value=f"[Click here to view all {public_games_count} games on the dashboard]({dashboard_url})",
@@ -1414,7 +1415,7 @@ class ActionProcessorCog(commands.Cog):
 
         if public_games_count > 0:
             result_message += f"📢 Announced {announced} public games to Discord\n"
-            dashboard_url = f"https://dashboard.casual-heroes.com/warden/guild/{guild.id}/found-games/"
+            dashboard_url = f"https://dashboard.casual-heroes.com/questlog/guild/{guild.id}/found-games/"
             result_message += f"🔗 View all public games: {dashboard_url}"
         else:
             dashboard_url = None

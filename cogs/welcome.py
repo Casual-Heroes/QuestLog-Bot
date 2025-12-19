@@ -1,6 +1,6 @@
 # cogs/welcome.py - Welcome & Goodbye Messages
 """
-Welcome message system for Warden bot.
+Welcome message system for QuestLog.
 
 Features:
 - Customizable welcome messages in channel

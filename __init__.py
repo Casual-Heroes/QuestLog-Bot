@@ -1,6 +1,6 @@
 # warden/__init__.py
 """
-Warden Bot - Discord Security & Engagement Platform
+QuestLog - Discord Security & Engagement Platform
 
 Multi-tenant Discord bot for gaming communities featuring:
 - Anti-raid protection

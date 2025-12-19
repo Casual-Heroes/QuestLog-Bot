@@ -1,6 +1,6 @@
 # warden/cogs/__init__.py
 """
-Warden Bot Cogs
+QuestLog Cogs
 
 Cog loading order matters for dependencies:
 1. core - Base events, guild sync

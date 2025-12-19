@@ -1,5 +1,5 @@
 # warden/utils/__init__.py
-"""Utility modules for Warden bot."""
+"""Utility modules for QuestLog."""
 
 from . import igdb
 

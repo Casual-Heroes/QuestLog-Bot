@@ -1,6 +1,6 @@
 # cogs/admin.py - Admin Commands & Settings
 """
-Admin cog for Warden bot.
+Admin cog for QuestLog.
 Server settings, feature toggles, and administrative commands.
 """
 
@@ -164,7 +164,8 @@ class SendMessageModal(discord.ui.Modal):
         body = replace_mentions(body, interaction.guild)
 
         channel = self.target_channel or interaction.channel
-        allowed = discord.AllowedMentions.none() if self.silent else discord.AllowedMentions.all()
+        # Safe default: allow user/role mentions but NOT @everyone/@here (prevent abuse)
+        allowed = discord.AllowedMentions.none() if self.silent else discord.AllowedMentions(everyone=False, roles=True, users=True)
         try:
             msg = await channel.send(body, allowed_mentions=allowed)
         except discord.Forbidden:
@@ -194,7 +195,7 @@ class AdminCog(commands.Cog):
     )
 
     # Feature toggles
-    @settings.command(name="toggle", description="Enable/disable Warden features")
+    @settings.command(name="toggle", description="Enable/disable QuestLog features")
     @commands.has_permissions(administrator=True)
     @discord.option(
         "feature", str, description="Feature to toggle",
@@ -228,7 +229,7 @@ class AdminCog(commands.Cog):
                 # Check premium for discovery
                 if feature == "discovery" and enabled and not guild.is_premium():
                     await ctx.respond(
-                        "⭐ Discovery requires **Warden Premium**.",
+                        "⭐ Discovery requires **QuestLog Premium**.",
                         ephemeral=True
                     )
                     return
@@ -243,7 +244,7 @@ class AdminCog(commands.Cog):
                 await ctx.respond("❌ Unknown feature.", ephemeral=True)
 
     # Channel settings
-    @settings.command(name="channel", description="Set a channel for Warden features")
+    @settings.command(name="channel", description="Set a channel for QuestLog features")
     @commands.has_permissions(administrator=True)
     @discord.option(
         "channel_type", str, description="Type of channel to set",
@@ -285,7 +286,7 @@ class AdminCog(commands.Cog):
                 await ctx.respond("❌ Unknown channel type.", ephemeral=True)
 
     # Role settings
-    @settings.command(name="role", description="Set a role for Warden features")
+    @settings.command(name="role", description="Set a role for QuestLog features")
     @commands.has_permissions(administrator=True)
     @discord.option(
         "role_type", str, description="Type of role to set",
@@ -324,7 +325,7 @@ class AdminCog(commands.Cog):
                 await ctx.respond("❌ Unknown role type.", ephemeral=True)
 
     # View settings
-    @settings.command(name="view", description="View current Warden settings")
+    @settings.command(name="view", description="View current QuestLog settings")
     @commands.has_permissions(manage_guild=True)
     async def settings_view(self, ctx: discord.ApplicationContext):
         """View all settings."""

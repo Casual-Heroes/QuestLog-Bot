@@ -1,6 +1,6 @@
 # cogs/core.py - Core Bot Events & Commands
 """
-Core cog for Warden bot.
+Core cog for QuestLog.
 Handles basic bot events and essential commands.
 """
 
@@ -25,24 +25,24 @@ class CoreCog(commands.Cog):
         self.bot = bot
 
     # Slash command groups
-    warden = SlashCommandGroup(
-        name="warden",
-        description="Warden bot commands",
-        
+    questlog = SlashCommandGroup(
+        name="questlog",
+        description="QuestLog commands",
+
     )
 
     # Basic commands
-    @discord.slash_command(name="ping", description="Check if Warden is responsive")
+    @discord.slash_command(name="ping", description="Check if QuestLog is responsive")
     async def ping(self, ctx: discord.ApplicationContext):
         """Check bot latency."""
         latency = round(self.bot.latency * 1000)
         await ctx.respond(f"🏓 Pong! Latency: **{latency}ms**", ephemeral=True)
 
-    @discord.slash_command(name="help", description="Get help with Warden commands")
+    @discord.slash_command(name="help", description="Get help with QuestLog commands")
     async def help(self, ctx: discord.ApplicationContext):
         """Show help information."""
         embed = discord.Embed(
-            title="🛡️ Warden Bot Help",
+            title="🛡️ QuestLog Help",
             description="Your all-in-one Discord security & engagement platform.",
             color=discord.Color.brand_green()
         )
@@ -51,7 +51,7 @@ class CoreCog(commands.Cog):
         embed.add_field(
             name="🆓 Free Features",
             value=(
-                "`/warden setup` - Quick setup wizard\n"
+                "`/questlog setup` - Quick setup wizard\n"
                 "`/xp profile` - View your XP & level\n"
                 "`/xp leaderboard` - Server leaderboard\n"
                 "`/verify` - Verify yourself\n"
@@ -88,18 +88,18 @@ class CoreCog(commands.Cog):
         embed.add_field(
             name="⚙️ Admin",
             value=(
-                "`/warden settings` - Bot settings\n"
-                "`/warden premium` - Subscription info\n"
-                "`/warden dashboard` - Web dashboard"
+                "`/questlog settings` - Bot settings\n"
+                "`/questlog premium` - Subscription info\n"
+                "`/questlog dashboard` - Web dashboard"
             ),
             inline=False
         )
 
-        embed.set_footer(text="💡 Need more help? Join discord.gg/warden")
+        embed.set_footer(text="💡 Need more help? Join discord.gg/questlog")
 
         await ctx.respond(embed=embed, ephemeral=True)
 
-    @discord.slash_command(name="info", description="View Warden bot information")
+    @discord.slash_command(name="info", description="View QuestLog information")
     async def info(self, ctx: discord.ApplicationContext):
         """Show bot information and stats."""
         uptime_seconds = int(time.time() - self.bot.start_time) if self.bot.start_time else 0
@@ -107,7 +107,7 @@ class CoreCog(commands.Cog):
         minutes, seconds = divmod(remainder, 60)
 
         embed = discord.Embed(
-            title="🛡️ Warden Bot",
+            title="🛡️ QuestLog",
             description="All-in-one Discord security & engagement platform for gaming communities.",
             color=discord.Color.brand_green()
         )
@@ -126,7 +126,7 @@ class CoreCog(commands.Cog):
             name="🔗 Links",
             value=(
                 "[Website](https://bot)\n"
-                "[Support Server](https://discord.gg/warden)\n"
+                "[Support Server](https://discord.gg/questlog)\n"
                 "[Documentation](https://docs.bot)"
             ),
             inline=True
@@ -198,7 +198,7 @@ class CoreCog(commands.Cog):
                     value=(
                         "Unlock self-promo, discovery network, "
                         "game server sync, and more!\n"
-                        "`/warden premium` for details"
+                        "`/questlog premium` for details"
                     ),
                     inline=False
                 )
@@ -213,8 +213,8 @@ class CoreCog(commands.Cog):
             is_premium = guild.is_premium() if guild else False
 
         embed = discord.Embed(
-            title="⭐ Warden Premium",
-            description="Unlock the full power of Warden for your community.",
+            title="⭐ QuestLog Premium",
+            description="Unlock the full power of QuestLog for your community.",
             color=discord.Color.gold()
         )
 
@@ -262,17 +262,17 @@ class CoreCog(commands.Cog):
                 name="🚀 Get Premium",
                 value=(
                     "Visit [bot/premium](https://bot/premium) to subscribe.\n"
-                    "Or use `/warden subscribe` to start your free trial!"
+                    "Or use `/questlog subscribe` to start your free trial!"
                 ),
                 inline=False
             )
 
-        embed.set_footer(text="Questions? Join discord.gg/warden")
+        embed.set_footer(text="Questions? Join discord.gg/questlog")
 
         await ctx.respond(embed=embed, ephemeral=True)
 
     # Guild setup command
-    @warden.command(name="setup", description="Quick setup wizard for Warden")
+    @questlog.command(name="setup", description="Quick setup wizard for QuestLog")
     @commands.has_permissions(administrator=True)
     async def setup(self, ctx: discord.ApplicationContext):
         """Interactive setup wizard."""
@@ -281,8 +281,8 @@ class CoreCog(commands.Cog):
 
         # TODO: Implement interactive setup with buttons/modals
         embed = discord.Embed(
-            title="⚙️ Warden Setup",
-            description="Let's get Warden configured for your server!",
+            title="⚙️ QuestLog Setup",
+            description="Let's get QuestLog configured for your server!",
             color=discord.Color.brand_green()
         )
 
@@ -290,9 +290,9 @@ class CoreCog(commands.Cog):
             name="Step 1: Channels",
             value=(
                 "Set up these channels:\n"
-                "• `/warden set-channel logs #mod-logs`\n"
-                "• `/warden set-channel levelup #level-ups`\n"
-                "• `/warden set-channel verification #verify`"
+                "• `/questlog set-channel logs #mod-logs`\n"
+                "• `/questlog set-channel levelup #level-ups`\n"
+                "• `/questlog set-channel verification #verify`"
             ),
             inline=False
         )
@@ -301,8 +301,8 @@ class CoreCog(commands.Cog):
             name="Step 2: Roles",
             value=(
                 "Configure roles:\n"
-                "• `/warden set-role verified @Verified`\n"
-                "• `/warden set-role quarantine @Quarantine`\n"
+                "• `/questlog set-role verified @Verified`\n"
+                "• `/questlog set-role quarantine @Quarantine`\n"
                 "• `/level-roles add 5 @Level5`"
             ),
             inline=False
@@ -312,14 +312,14 @@ class CoreCog(commands.Cog):
             name="Step 3: Enable Features",
             value=(
                 "Turn on features:\n"
-                "• `/warden enable xp`\n"
-                "• `/warden enable verification`\n"
-                "• `/warden enable anti-raid`"
+                "• `/questlog enable xp`\n"
+                "• `/questlog enable verification`\n"
+                "• `/questlog enable anti-raid`"
             ),
             inline=False
         )
 
-        embed.set_footer(text="Need help? Use /warden help or join discord.gg/warden")
+        embed.set_footer(text="Need help? Use /questlog help or join discord.gg/questlog")
 
         await ctx.followup.send(embed=embed, ephemeral=True)
 
