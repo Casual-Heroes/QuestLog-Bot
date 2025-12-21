@@ -17,7 +17,7 @@ FEATURES:
 """
 
 import time
-import random
+import secrets  # SECURITY FIX: Use secrets instead of random for CAPTCHA
 import string
 import asyncio
 import discord
@@ -46,11 +46,12 @@ def get_guild_tier(session, guild_id: int) -> str:
 
 
 def generate_captcha(length: int = 6) -> str:
-    """Generate a random alphanumeric captcha code."""
+    """Generate a cryptographically secure random captcha code."""
     chars = string.ascii_uppercase + string.digits
     # Remove confusing characters
     chars = chars.replace("O", "").replace("0", "").replace("I", "").replace("1", "")
-    return "".join(random.choices(chars, k=length))
+    # SECURITY FIX: Use secrets.choice() for cryptographic randomness
+    return "".join(secrets.choice(chars) for _ in range(length))
 
 
 def check_account_age(user: discord.User, min_days: int) -> tuple[bool, int]:
@@ -661,6 +662,7 @@ class VerificationCog(commands.Cog):
             )
 
     @verify.command(name="user", description="Manually verify a user (Admin)")
+    @discord.default_permissions(manage_roles=True)
     @commands.has_permissions(manage_roles=True)
     @discord.option("member", discord.Member, description="Member to verify")
     @discord.option("reason", str, description="Reason for manual verification", required=False)
@@ -744,6 +746,7 @@ class VerificationCog(commands.Cog):
         logger.info(f"Manually verified {member} in {ctx.guild.name} by {ctx.author}")
 
     @verify.command(name="pending", description="View pending verifications")
+    @discord.default_permissions(manage_roles=True)
     @commands.has_permissions(manage_roles=True)
     async def verify_pending(self, ctx: discord.ApplicationContext):
         """View members pending verification."""
@@ -784,6 +787,7 @@ class VerificationCog(commands.Cog):
         await ctx.respond(embed=embed, ephemeral=True)
 
     @verify.command(name="kick-unverified", description="Kick all unverified members (Admin)")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option("older_than_hours", int, description="Only kick if joined more than X hours ago", default=24)
     async def verify_kick_unverified(
@@ -827,6 +831,7 @@ class VerificationCog(commands.Cog):
         )
 
     @verify.command(name="setup", description="Send verification embed to a channel (Admin)")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option("channel", discord.TextChannel, description="Channel to send verification message")
     async def verify_setup(
@@ -913,6 +918,7 @@ class VerificationCog(commands.Cog):
             )
 
     @verify.command(name="config", description="Configure verification settings (Admin)")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option(
         "type",
@@ -1019,6 +1025,7 @@ class VerificationCog(commands.Cog):
                 )
 
     @verify.command(name="intro-channel", description="Set intro channel for multi-step (Premium)")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option("channel", discord.TextChannel, description="Channel for introductions")
     @discord.option("required", bool, description="Require intro post to verify", default=True)

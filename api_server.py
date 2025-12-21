@@ -5,11 +5,39 @@ Allows the web app to trigger actions like forcing a guild sync.
 from aiohttp import web
 import logging
 import os
+import discord
 
 logger = logging.getLogger("api_server")
 
 # Store bot reference (set by bot.py on startup)
 bot_instance = None
+
+# SECURITY: Load API token from environment
+API_TOKEN = os.getenv("DISCORD_BOT_API_TOKEN")
+if not API_TOKEN:
+    logger.warning("DISCORD_BOT_API_TOKEN not set - API will be unauthenticated!")
+
+
+@web.middleware
+async def auth_middleware(request, handler):
+    """Require Bearer token authentication for all non-health endpoints."""
+    # Skip auth for health check
+    if request.path == '/health':
+        return await handler(request)
+
+    # Require authentication
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        logger.warning(f"Unauthorized API request from {request.remote}")
+        return web.json_response({'error': 'Unauthorized - Missing Bearer token'}, status=401)
+
+    token = auth_header.split('Bearer ', 1)[1]
+    if token != API_TOKEN:
+        logger.warning(f"Invalid API token from {request.remote}")
+        return web.json_response({'error': 'Unauthorized - Invalid token'}, status=401)
+
+    # Token is valid, proceed
+    return await handler(request)
 
 
 async def force_guild_sync(request):
@@ -39,10 +67,19 @@ async def force_guild_sync(request):
                         db_guild = Guild(guild_id=guild_id, name=guild.name)
                         session.add(db_guild)
 
+                    # Count members excluding bots (same as guild_sync_cog)
+                    member_count = sum(1 for m in guild.members if not m.bot)
+                    online_count = sum(
+                        1 for m in guild.members
+                        if not m.bot and m.status != discord.Status.offline
+                    )
+
                     # Update guild info
                     db_guild.name = guild.name
                     db_guild.icon_url = guild.icon.url if guild.icon else None
-                    db_guild.member_count = guild.member_count
+                    db_guild.member_count = member_count  # Exclude bots
+                    db_guild.online_count = online_count  # Exclude bots
+                    db_guild.guild_icon_hash = guild.icon.key if guild.icon else None  # For CDN URLs
 
                     # Cache channels
                     channels_data = []
@@ -125,16 +162,31 @@ async def get_guild_ids(request):
         return web.json_response({'guild_ids': guild_ids})
     except Exception as e:
         logger.error(f"Error getting guild IDs: {e}", exc_info=True)
-        return web.json_response({'error': str(e)}, status=500)
+        return web.json_response({'error': 'An internal error occurred. Please try again later.'}, status=500)
 
 
 async def mod_untimeout(request):
     """Remove timeout from a user."""
     try:
         data = await request.json()
-        guild_id = int(data.get('guild_id'))
-        user_id = int(data.get('user_id'))
+
+        # SECURITY: Validate all required fields before type conversion
+        guild_id_raw = data.get('guild_id')
+        user_id_raw = data.get('user_id')
+        requester_id = data.get('requester_id')
         reason = data.get('reason', 'Timeout removed via web dashboard')
+
+        if not guild_id_raw or not user_id_raw or not requester_id:
+            return web.json_response({'error': 'guild_id, user_id, and requester_id are required'}, status=400)
+
+        # Convert to integers with error handling
+        try:
+            guild_id = int(guild_id_raw)
+            user_id = int(user_id_raw)
+            requester_id = int(requester_id)
+        except (ValueError, TypeError) as e:
+            logger.error(f"Invalid ID format in mod_untimeout: {e}")
+            return web.json_response({'error': 'Invalid ID format - must be integers'}, status=400)
 
         if not bot_instance:
             return web.json_response({'error': 'Bot not ready'}, status=503)
@@ -143,9 +195,25 @@ async def mod_untimeout(request):
         if not guild:
             return web.json_response({'error': 'Guild not found'}, status=404)
 
+        # SECURITY: Verify requester has admin permissions in this guild
+        requester = guild.get_member(requester_id)
+        if not requester or not requester.guild_permissions.administrator:
+            logger.warning(f"User {requester_id} attempted to untimeout in guild {guild_id} without admin permissions")
+            return web.json_response({'error': 'No admin permission in this guild'}, status=403)
+
+        # SECURITY: Check role hierarchy - cannot moderate users with equal or higher roles
         member = guild.get_member(user_id)
         if not member:
             return web.json_response({'error': 'Member not found'}, status=404)
+
+        if member.top_role >= requester.top_role:
+            logger.warning(f"User {requester_id} attempted to untimeout {user_id} who has equal or higher role")
+            return web.json_response({'error': 'Cannot moderate users with equal or higher roles'}, status=403)
+
+        # SECURITY: Never allow moderating the server owner
+        if member.id == guild.owner_id:
+            logger.warning(f"User {requester_id} attempted to untimeout the server owner {user_id}")
+            return web.json_response({'error': 'Cannot moderate the server owner'}, status=403)
 
         if not member.timed_out:
             return web.json_response({'error': 'User is not timed out'}, status=400)
@@ -153,21 +221,39 @@ async def mod_untimeout(request):
         # Remove timeout
         await member.remove_timeout(reason=reason)
 
-        logger.info(f"Removed timeout from {member} in {guild.name} via API")
+        logger.info(f"Removed timeout from {member} in {guild.name} via API (requester: {requester})")
         return web.json_response({'success': True, 'message': f'Timeout removed from {member}'})
 
+    except ValueError as e:
+        logger.error(f"Invalid input in mod_untimeout: {e}")
+        return web.json_response({'error': 'Invalid guild_id, user_id, or requester_id'}, status=400)
     except Exception as e:
         logger.error(f"Error in mod_untimeout: {e}", exc_info=True)
-        return web.json_response({'error': str(e)}, status=500)
+        return web.json_response({'error': 'An internal error occurred. Please try again later.'}, status=500)
 
 
 async def mod_kick(request):
     """Kick a user from the server."""
     try:
         data = await request.json()
-        guild_id = int(data.get('guild_id'))
-        user_id = int(data.get('user_id'))
+
+        # SECURITY: Validate all required fields before type conversion
+        guild_id_raw = data.get('guild_id')
+        user_id_raw = data.get('user_id')
+        requester_id = data.get('requester_id')
         reason = data.get('reason', 'Kicked via web dashboard')
+
+        if not guild_id_raw or not user_id_raw or not requester_id:
+            return web.json_response({'error': 'guild_id, user_id, and requester_id are required'}, status=400)
+
+        # Convert to integers with error handling
+        try:
+            guild_id = int(guild_id_raw)
+            user_id = int(user_id_raw)
+            requester_id = int(requester_id)
+        except (ValueError, TypeError) as e:
+            logger.error(f"Invalid ID format in mod_kick: {e}")
+            return web.json_response({'error': 'Invalid ID format - must be integers'}, status=400)
 
         if not bot_instance:
             return web.json_response({'error': 'Bot not ready'}, status=503)
@@ -176,9 +262,25 @@ async def mod_kick(request):
         if not guild:
             return web.json_response({'error': 'Guild not found'}, status=404)
 
+        # SECURITY: Verify requester has admin permissions in this guild
+        requester = guild.get_member(requester_id)
+        if not requester or not requester.guild_permissions.administrator:
+            logger.warning(f"User {requester_id} attempted to kick in guild {guild_id} without admin permissions")
+            return web.json_response({'error': 'No admin permission in this guild'}, status=403)
+
+        # SECURITY: Check role hierarchy - cannot moderate users with equal or higher roles
         member = guild.get_member(user_id)
         if not member:
             return web.json_response({'error': 'Member not found'}, status=404)
+
+        if member.top_role >= requester.top_role:
+            logger.warning(f"User {requester_id} attempted to kick {user_id} who has equal or higher role")
+            return web.json_response({'error': 'Cannot moderate users with equal or higher roles'}, status=403)
+
+        # SECURITY: Never allow moderating the server owner
+        if member.id == guild.owner_id:
+            logger.warning(f"User {requester_id} attempted to kick the server owner {user_id}")
+            return web.json_response({'error': 'Cannot moderate the server owner'}, status=403)
 
         # Kick the user
         await member.kick(reason=reason)
@@ -194,21 +296,39 @@ async def mod_kick(request):
                 reason
             )
 
-        logger.info(f"Kicked {member} from {guild.name} via API")
+        logger.info(f"Kicked {member} from {guild.name} via API (requester: {requester})")
         return web.json_response({'success': True, 'message': f'Kicked {member}'})
 
+    except ValueError as e:
+        logger.error(f"Invalid input in mod_kick: {e}")
+        return web.json_response({'error': 'Invalid guild_id, user_id, or requester_id'}, status=400)
     except Exception as e:
         logger.error(f"Error in mod_kick: {e}", exc_info=True)
-        return web.json_response({'error': str(e)}, status=500)
+        return web.json_response({'error': 'An internal error occurred. Please try again later.'}, status=500)
 
 
 async def mod_ban(request):
     """Ban a user from the server."""
     try:
         data = await request.json()
-        guild_id = int(data.get('guild_id'))
-        user_id = int(data.get('user_id'))
+
+        # SECURITY: Validate all required fields before type conversion
+        guild_id_raw = data.get('guild_id')
+        user_id_raw = data.get('user_id')
+        requester_id = data.get('requester_id')
         reason = data.get('reason', 'Banned via web dashboard')
+
+        if not guild_id_raw or not user_id_raw or not requester_id:
+            return web.json_response({'error': 'guild_id, user_id, and requester_id are required'}, status=400)
+
+        # Convert to integers with error handling
+        try:
+            guild_id = int(guild_id_raw)
+            user_id = int(user_id_raw)
+            requester_id = int(requester_id)
+        except (ValueError, TypeError) as e:
+            logger.error(f"Invalid ID format in mod_ban: {e}")
+            return web.json_response({'error': 'Invalid ID format - must be integers'}, status=400)
 
         if not bot_instance:
             return web.json_response({'error': 'Bot not ready'}, status=503)
@@ -216,6 +336,12 @@ async def mod_ban(request):
         guild = bot_instance.get_guild(guild_id)
         if not guild:
             return web.json_response({'error': 'Guild not found'}, status=404)
+
+        # SECURITY: Verify requester has admin permissions in this guild
+        requester = guild.get_member(requester_id)
+        if not requester or not requester.guild_permissions.administrator:
+            logger.warning(f"User {requester_id} attempted to ban in guild {guild_id} without admin permissions")
+            return web.json_response({'error': 'No admin permission in this guild'}, status=403)
 
         member = guild.get_member(user_id)
         if not member:
@@ -235,10 +361,21 @@ async def mod_ban(request):
                         reason
                     )
 
-                logger.info(f"Banned user {user_id} from {guild.name} via API")
+                logger.info(f"Banned user {user_id} from {guild.name} via API (requester: {requester})")
                 return web.json_response({'success': True, 'message': f'Banned user {user_id}'})
             except Exception as e:
-                return web.json_response({'error': f'User not found: {str(e)}'}, status=404)
+                logger.error(f"Error banning user {user_id}: {e}", exc_info=True)
+                return web.json_response({'error': 'User not found'}, status=404)
+
+        # SECURITY: Check role hierarchy - cannot moderate users with equal or higher roles
+        if member.top_role >= requester.top_role:
+            logger.warning(f"User {requester_id} attempted to ban {user_id} who has equal or higher role")
+            return web.json_response({'error': 'Cannot moderate users with equal or higher roles'}, status=403)
+
+        # SECURITY: Never allow moderating the server owner
+        if member.id == guild.owner_id:
+            logger.warning(f"User {requester_id} attempted to ban the server owner {user_id}")
+            return web.json_response({'error': 'Cannot moderate the server owner'}, status=403)
 
         # Ban the member
         await member.ban(reason=reason)
@@ -254,21 +391,39 @@ async def mod_ban(request):
                 reason
             )
 
-        logger.info(f"Banned {member} from {guild.name} via API")
+        logger.info(f"Banned {member} from {guild.name} via API (requester: {requester})")
         return web.json_response({'success': True, 'message': f'Banned {member}'})
 
+    except ValueError as e:
+        logger.error(f"Invalid input in mod_ban: {e}")
+        return web.json_response({'error': 'Invalid guild_id, user_id, or requester_id'}, status=400)
     except Exception as e:
         logger.error(f"Error in mod_ban: {e}", exc_info=True)
-        return web.json_response({'error': str(e)}, status=500)
+        return web.json_response({'error': 'An internal error occurred. Please try again later.'}, status=500)
 
 
 async def mod_unban(request):
     """Unban a user from the server."""
     try:
         data = await request.json()
-        guild_id = int(data.get('guild_id'))
-        user_id = int(data.get('user_id'))
+
+        # SECURITY: Validate all required fields before type conversion
+        guild_id_raw = data.get('guild_id')
+        user_id_raw = data.get('user_id')
+        requester_id = data.get('requester_id')
         reason = data.get('reason', 'Unbanned via web dashboard')
+
+        if not guild_id_raw or not user_id_raw or not requester_id:
+            return web.json_response({'error': 'guild_id, user_id, and requester_id are required'}, status=400)
+
+        # Convert to integers with error handling
+        try:
+            guild_id = int(guild_id_raw)
+            user_id = int(user_id_raw)
+            requester_id = int(requester_id)
+        except (ValueError, TypeError) as e:
+            logger.error(f"Invalid ID format in mod_unban: {e}")
+            return web.json_response({'error': 'Invalid ID format - must be integers'}, status=400)
 
         if not bot_instance:
             return web.json_response({'error': 'Bot not ready'}, status=503)
@@ -277,11 +432,18 @@ async def mod_unban(request):
         if not guild:
             return web.json_response({'error': 'Guild not found'}, status=404)
 
+        # SECURITY: Verify requester has admin permissions in this guild
+        requester = guild.get_member(requester_id)
+        if not requester or not requester.guild_permissions.administrator:
+            logger.warning(f"User {requester_id} attempted to unban in guild {guild_id} without admin permissions")
+            return web.json_response({'error': 'No admin permission in this guild'}, status=403)
+
         # Get user object
         try:
             user = await bot_instance.fetch_user(user_id)
         except Exception as e:
-            return web.json_response({'error': f'User not found: {str(e)}'}, status=404)
+            logger.error(f"Error fetching user {user_id}: {e}", exc_info=True)
+            return web.json_response({'error': 'User not found'}, status=404)
 
         # Unban the user
         await guild.unban(user, reason=reason)
@@ -297,21 +459,39 @@ async def mod_unban(request):
                 reason
             )
 
-        logger.info(f"Unbanned {user} from {guild.name} via API")
+        logger.info(f"Unbanned {user} from {guild.name} via API (requester: {requester})")
         return web.json_response({'success': True, 'message': f'Unbanned {user}'})
 
+    except ValueError as e:
+        logger.error(f"Invalid input in mod_unban: {e}")
+        return web.json_response({'error': 'Invalid guild_id, user_id, or requester_id'}, status=400)
     except Exception as e:
         logger.error(f"Error in mod_unban: {e}", exc_info=True)
-        return web.json_response({'error': str(e)}, status=500)
+        return web.json_response({'error': 'An internal error occurred. Please try again later.'}, status=500)
 
 
 async def mod_unmute(request):
     """Unmute a user."""
     try:
         data = await request.json()
-        guild_id = int(data.get('guild_id'))
-        user_id = int(data.get('user_id'))
+
+        # SECURITY: Validate all required fields before type conversion
+        guild_id_raw = data.get('guild_id')
+        user_id_raw = data.get('user_id')
+        requester_id = data.get('requester_id')
         reason = data.get('reason', 'Unmuted via web dashboard')
+
+        if not guild_id_raw or not user_id_raw or not requester_id:
+            return web.json_response({'error': 'guild_id, user_id, and requester_id are required'}, status=400)
+
+        # Convert to integers with error handling
+        try:
+            guild_id = int(guild_id_raw)
+            user_id = int(user_id_raw)
+            requester_id = int(requester_id)
+        except (ValueError, TypeError) as e:
+            logger.error(f"Invalid ID format in mod_unmute: {e}")
+            return web.json_response({'error': 'Invalid ID format - must be integers'}, status=400)
 
         if not bot_instance:
             return web.json_response({'error': 'Bot not ready'}, status=503)
@@ -320,9 +500,25 @@ async def mod_unmute(request):
         if not guild:
             return web.json_response({'error': 'Guild not found'}, status=404)
 
+        # SECURITY: Verify requester has admin permissions in this guild
+        requester = guild.get_member(requester_id)
+        if not requester or not requester.guild_permissions.administrator:
+            logger.warning(f"User {requester_id} attempted to unmute in guild {guild_id} without admin permissions")
+            return web.json_response({'error': 'No admin permission in this guild'}, status=403)
+
+        # SECURITY: Check role hierarchy - cannot moderate users with equal or higher roles
         member = guild.get_member(user_id)
         if not member:
             return web.json_response({'error': 'Member not found'}, status=404)
+
+        if member.top_role >= requester.top_role:
+            logger.warning(f"User {requester_id} attempted to unmute {user_id} who has equal or higher role")
+            return web.json_response({'error': 'Cannot moderate users with equal or higher roles'}, status=403)
+
+        # SECURITY: Never allow moderating the server owner
+        if member.id == guild.owner_id:
+            logger.warning(f"User {requester_id} attempted to unmute the server owner {user_id}")
+            return web.json_response({'error': 'Cannot moderate the server owner'}, status=403)
 
         # Get moderation cog
         mod_cog = bot_instance.get_cog('ModerationCog')
@@ -333,23 +529,41 @@ async def mod_unmute(request):
         success = await mod_cog._unmute_user(guild, member, reason)
 
         if success:
-            logger.info(f"Unmuted {member} in {guild.name} via API")
+            logger.info(f"Unmuted {member} in {guild.name} via API (requester: {requester})")
             return web.json_response({'success': True, 'message': f'Unmuted {member}'})
         else:
             return web.json_response({'error': 'Failed to unmute user'}, status=500)
 
+    except ValueError as e:
+        logger.error(f"Invalid input in mod_unmute: {e}")
+        return web.json_response({'error': 'Invalid guild_id, user_id, or requester_id'}, status=400)
     except Exception as e:
         logger.error(f"Error in mod_unmute: {e}", exc_info=True)
-        return web.json_response({'error': str(e)}, status=500)
+        return web.json_response({'error': 'An internal error occurred. Please try again later.'}, status=500)
 
 
 async def mod_unjail(request):
     """Unjail a user."""
     try:
         data = await request.json()
-        guild_id = int(data.get('guild_id'))
-        user_id = int(data.get('user_id'))
+
+        # SECURITY: Validate all required fields before type conversion
+        guild_id_raw = data.get('guild_id')
+        user_id_raw = data.get('user_id')
+        requester_id = data.get('requester_id')
         reason = data.get('reason', 'Unjailed via web dashboard')
+
+        if not guild_id_raw or not user_id_raw or not requester_id:
+            return web.json_response({'error': 'guild_id, user_id, and requester_id are required'}, status=400)
+
+        # Convert to integers with error handling
+        try:
+            guild_id = int(guild_id_raw)
+            user_id = int(user_id_raw)
+            requester_id = int(requester_id)
+        except (ValueError, TypeError) as e:
+            logger.error(f"Invalid ID format in mod_unjail: {e}")
+            return web.json_response({'error': 'Invalid ID format - must be integers'}, status=400)
 
         if not bot_instance:
             return web.json_response({'error': 'Bot not ready'}, status=503)
@@ -358,9 +572,25 @@ async def mod_unjail(request):
         if not guild:
             return web.json_response({'error': 'Guild not found'}, status=404)
 
+        # SECURITY: Verify requester has admin permissions in this guild
+        requester = guild.get_member(requester_id)
+        if not requester or not requester.guild_permissions.administrator:
+            logger.warning(f"User {requester_id} attempted to unjail in guild {guild_id} without admin permissions")
+            return web.json_response({'error': 'No admin permission in this guild'}, status=403)
+
+        # SECURITY: Check role hierarchy - cannot moderate users with equal or higher roles
         member = guild.get_member(user_id)
         if not member:
             return web.json_response({'error': 'Member not found'}, status=404)
+
+        if member.top_role >= requester.top_role:
+            logger.warning(f"User {requester_id} attempted to unjail {user_id} who has equal or higher role")
+            return web.json_response({'error': 'Cannot moderate users with equal or higher roles'}, status=403)
+
+        # SECURITY: Never allow moderating the server owner
+        if member.id == guild.owner_id:
+            logger.warning(f"User {requester_id} attempted to unjail the server owner {user_id}")
+            return web.json_response({'error': 'Cannot moderate the server owner'}, status=403)
 
         # Get moderation cog
         mod_cog = bot_instance.get_cog('ModerationCog')
@@ -371,19 +601,23 @@ async def mod_unjail(request):
         success = await mod_cog._unjail_user(guild, member, reason)
 
         if success:
-            logger.info(f"Unjailed {member} in {guild.name} via API")
+            logger.info(f"Unjailed {member} in {guild.name} via API (requester: {requester})")
             return web.json_response({'success': True, 'message': f'Unjailed {member}'})
         else:
             return web.json_response({'error': 'Failed to unjail user'}, status=500)
 
+    except ValueError as e:
+        logger.error(f"Invalid input in mod_unjail: {e}")
+        return web.json_response({'error': 'Invalid guild_id, user_id, or requester_id'}, status=400)
     except Exception as e:
         logger.error(f"Error in mod_unjail: {e}", exc_info=True)
-        return web.json_response({'error': str(e)}, status=500)
+        return web.json_response({'error': 'An internal error occurred. Please try again later.'}, status=500)
 
 
 def create_app():
     """Create the aiohttp web application."""
-    app = web.Application()
+    # SECURITY: Add authentication middleware
+    app = web.Application(middlewares=[auth_middleware])
 
     # Routes
     app.router.add_get('/health', health_check)
@@ -391,7 +625,7 @@ def create_app():
     app.router.add_post('/api/sync', force_guild_sync)
     app.router.add_post('/api/sync/{guild_id}', force_guild_sync)
 
-    # Moderation endpoints
+    # Moderation endpoints (now protected by auth_middleware)
     app.router.add_post('/mod/untimeout', mod_untimeout)
     app.router.add_post('/mod/kick', mod_kick)
     app.router.add_post('/mod/ban', mod_ban)
@@ -399,6 +633,7 @@ def create_app():
     app.router.add_post('/mod/unmute', mod_unmute)
     app.router.add_post('/mod/unjail', mod_unjail)
 
+    logger.info("API server created with authentication middleware")
     return app
 
 

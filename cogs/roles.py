@@ -396,6 +396,7 @@ class RolesCog(commands.Cog):
     # Mass role operations
 
     @iam.command(name="mass-assign", description="Mass assign a role to multiple users")
+    @discord.default_permissions(manage_roles=True)
     @commands.has_permissions(manage_roles=True)
     @discord.option("role", discord.Role, description="Role to assign")
     @discord.option("target", str, description="Target: 'all', 'humans', 'bots', or @role mention")
@@ -474,6 +475,7 @@ class RolesCog(commands.Cog):
         )
 
     @iam.command(name="mass-remove", description="Mass remove a role from multiple users")
+    @discord.default_permissions(manage_roles=True)
     @commands.has_permissions(manage_roles=True)
     @discord.option("role", discord.Role, description="Role to remove")
     @discord.option("target", str, description="Target: 'all' or @role to filter", default="all")
@@ -541,6 +543,7 @@ class RolesCog(commands.Cog):
     # Role templates
 
     @iam.command(name="save-template", description="Save a role as a template")
+    @discord.default_permissions(manage_roles=True)
     @commands.has_permissions(manage_roles=True)
     @discord.option("role", discord.Role, description="Role to save as template")
     @discord.option("template_name", str, description="Name for the template")
@@ -596,6 +599,7 @@ class RolesCog(commands.Cog):
         await ctx.respond(f"✅ Saved **{role.name}** as template **{template_name}**", ephemeral=True)
 
     @iam.command(name="create-from-template", description="Create a role from a template")
+    @discord.default_permissions(manage_roles=True)
     @commands.has_permissions(manage_roles=True)
     @discord.option("template_name", str, description="Template name")
     @discord.option("role_name", str, description="Name for the new role")
@@ -646,6 +650,7 @@ class RolesCog(commands.Cog):
             await ctx.respond("❌ I don't have permission to create roles.", ephemeral=True)
 
     @iam.command(name="list-templates", description="List available role templates")
+    @discord.default_permissions(manage_roles=True)
     @commands.has_permissions(manage_roles=True)
     async def list_templates(self, ctx: discord.ApplicationContext):
         """List all role templates."""
@@ -675,6 +680,7 @@ class RolesCog(commands.Cog):
     # Temp roles
 
     @iam.command(name="temp-role", description="Assign a temporary role")
+    @discord.default_permissions(manage_roles=True)
     @commands.has_permissions(manage_roles=True)
     @discord.option("member", discord.Member, description="Member to assign")
     @discord.option("role", discord.Role, description="Role to assign")
@@ -749,6 +755,7 @@ class RolesCog(commands.Cog):
         await ctx.send_modal(modal)
 
     @iam.command(name="pending-requests", description="View pending role requests")
+    @discord.default_permissions(manage_roles=True)
     @commands.has_permissions(manage_roles=True)
     async def pending_requests(self, ctx: discord.ApplicationContext):
         """View pending role requests."""
@@ -786,6 +793,7 @@ class RolesCog(commands.Cog):
     # Access audit
 
     @iam.command(name="export-role", description="Export all users with a role to CSV")
+    @discord.default_permissions(manage_roles=True)
     @commands.has_permissions(manage_roles=True)
     @discord.option("role", discord.Role, description="Role to export")
     async def export_role(self, ctx: discord.ApplicationContext, role: discord.Role):
@@ -840,6 +848,7 @@ class RolesCog(commands.Cog):
         await ctx.respond(response, file=file, ephemeral=True)
 
     @iam.command(name="audit-mods", description="Audit moderator role assignments")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def audit_mods(self, ctx: discord.ApplicationContext):
         """Audit all users with dangerous permissions."""
@@ -878,6 +887,7 @@ class RolesCog(commands.Cog):
         await ctx.respond(embed=embed, ephemeral=True)
 
     @iam.command(name="permission-diff", description="Compare permissions between two roles")
+    @discord.default_permissions(manage_roles=True)
     @commands.has_permissions(manage_roles=True)
     @discord.option("role1", discord.Role, description="First role")
     @discord.option("role2", discord.Role, description="Second role")
@@ -914,6 +924,7 @@ class RolesCog(commands.Cog):
         await ctx.respond(embed=embed, ephemeral=True)
 
     @iam.command(name="emergency-strip", description="Emergency strip all elevated roles from a user")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option("member", discord.Member, description="Member to strip roles from")
     @discord.option("reason", str, description="Reason for emergency strip")
@@ -992,6 +1003,7 @@ class RolesCog(commands.Cog):
         await ctx.respond(embed=embed, ephemeral=True)
 
     @roles.command(name="add-react", description="Add a reaction role")
+    @discord.default_permissions(manage_roles=True)
     @commands.has_permissions(manage_roles=True)
     @discord.option("message_id", str, description="Message ID")
     @discord.option("emoji", str, description="Emoji to react with")

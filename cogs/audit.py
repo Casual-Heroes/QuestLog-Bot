@@ -733,6 +733,7 @@ class AuditCog(commands.Cog):
     )
 
     @audit.command(name="search", description="Search audit logs")
+    @discord.default_permissions(manage_guild=True)
     @commands.has_permissions(manage_guild=True)
     @discord.option("user", discord.Member, description="Filter by user (actor or target)", required=False)
     @discord.option(
@@ -824,6 +825,7 @@ class AuditCog(commands.Cog):
         await ctx.respond(embed=embed, ephemeral=True)
 
     @audit.command(name="recent", description="View recent audit logs")
+    @discord.default_permissions(manage_guild=True)
     @commands.has_permissions(manage_guild=True)
     @discord.option("limit", int, description="Number of logs to show (max 25)", required=False)
     async def audit_recent(
@@ -876,6 +878,7 @@ class AuditCog(commands.Cog):
         await ctx.respond(embed=embed, ephemeral=True)
 
     @audit.command(name="stats", description="View audit log statistics")
+    @discord.default_permissions(manage_guild=True)
     @commands.has_permissions(manage_guild=True)
     async def audit_stats(self, ctx: discord.ApplicationContext):
         """View audit log statistics."""
@@ -961,6 +964,7 @@ class AuditCog(commands.Cog):
         await ctx.respond(embed=embed, ephemeral=True)
 
     @audit.command(name="export", description="Export audit logs to CSV")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option(
         "category",
@@ -1034,6 +1038,7 @@ class AuditCog(commands.Cog):
         )
 
     @audit.command(name="user", description="View audit history for a specific user")
+    @discord.default_permissions(manage_guild=True)
     @commands.has_permissions(manage_guild=True)
     @discord.option("member", discord.Member, description="User to look up")
     async def audit_user(
@@ -1126,6 +1131,7 @@ class AuditCog(commands.Cog):
         await ctx.respond(embed=embed, ephemeral=True)
 
     @audit.command(name="config", description="Configure audit logging")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option("enabled", bool, description="Enable/disable audit logging", required=False)
     @discord.option("channel", discord.TextChannel, description="Channel for live audit logs", required=False)

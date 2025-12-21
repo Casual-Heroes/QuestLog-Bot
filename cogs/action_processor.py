@@ -47,13 +47,14 @@ class ActionProcessorCog(commands.Cog):
 
     async def _lookup_steam_url(self, game_name: str) -> str:
         """
-        Lookup Steam store page URL via Steam API.
+        Lookup Steam store page URL via Steam API with improved matching.
+        For DLC/seasons, links to the base game's Steam page.
 
         Args:
             game_name: Name of the game to search for
 
         Returns:
-            Direct Steam store URL if found, otherwise search URL
+            Direct Steam store URL if found, otherwise None (to avoid bad matches)
         """
         try:
             # Use Steam's store search API
@@ -67,27 +68,80 @@ class ActionProcessorCog(commands.Cog):
 
                         # Check if we got results
                         if data.get('total', 0) > 0 and data.get('items'):
-                            # Get the first result (usually the best match)
-                            first_result = data['items'][0]
-                            app_id = first_result.get('id')
+                            # Try to find a good match by comparing names
+                            game_name_lower = game_name.lower().strip()
 
-                            if app_id:
-                                # Construct direct Steam store page URL
-                                steam_url = f"https://store.steampowered.com/app/{app_id}/"
-                                logger.info(f"Steam API: Found direct link for '{game_name}': {steam_url}")
-                                return steam_url
+                            # Remove common suffixes that might not be in Steam name
+                            search_base = game_name_lower
+                            is_dlc_or_season = False
+                            dlc_suffixes = [
+                                ': season of', ': season ', ': episode ', '- dlc', '- expansion',
+                                ': the ', ' - the ', ': fate of', ': divine intervention'
+                            ]
+                            for suffix in dlc_suffixes:
+                                if suffix in search_base:
+                                    search_base = search_base.split(suffix)[0].strip()
+                                    is_dlc_or_season = True
+                                    break
 
-            # Fallback to search URL if API call failed or no results
-            logger.debug(f"Steam API: No direct link found for '{game_name}', using search URL")
+                            for item in data['items'][:5]:  # Check top 5 results
+                                result_name = item.get('name', '').lower().strip()
+                                app_id = item.get('id')
+
+                                if not app_id:
+                                    continue
+
+                                # Exact match (case-insensitive)
+                                if result_name == game_name_lower:
+                                    steam_url = f"https://store.steampowered.com/app/{app_id}/"
+                                    logger.info(f"Steam API: Exact match for '{game_name}': {steam_url}")
+                                    return steam_url
+
+                                # Check if the base name matches (for DLC/seasons)
+                                if search_base in result_name or result_name in search_base:
+                                    # Only accept if it's a very close match (>70% similarity)
+                                    # Simple similarity: check if most words match
+                                    game_words = set(search_base.split())
+                                    result_words = set(result_name.split())
+                                    if game_words and len(game_words & result_words) / len(game_words) >= 0.7:
+                                        steam_url = f"https://store.steampowered.com/app/{app_id}/"
+                                        if is_dlc_or_season:
+                                            logger.info(f"Steam API: DLC/Season '{game_name}' -> Base game '{item.get('name')}': {steam_url}")
+                                        else:
+                                            logger.info(f"Steam API: Close match for '{game_name}' -> '{item.get('name')}': {steam_url}")
+                                        return steam_url
+
+                            # If we detected DLC/season and didn't find exact match, try searching just the base name
+                            if is_dlc_or_season:
+                                base_search_term = urllib.parse.quote(search_base)
+                                base_api_url = f"https://store.steampowered.com/api/storesearch/?term={base_search_term}&cc=US"
+
+                                async with session.get(base_api_url, timeout=aiohttp.ClientTimeout(total=5)) as base_response:
+                                    if base_response.status == 200:
+                                        base_data = await base_response.json()
+
+                                        if base_data.get('total', 0) > 0 and base_data.get('items'):
+                                            # Take the first result for the base game
+                                            first_item = base_data['items'][0]
+                                            base_app_id = first_item.get('id')
+                                            base_name = first_item.get('name', '')
+
+                                            if base_app_id:
+                                                steam_url = f"https://store.steampowered.com/app/{base_app_id}/"
+                                                logger.info(f"Steam API: DLC/Season '{game_name}' -> Base game search '{base_name}': {steam_url}")
+                                                return steam_url
+
+            # No good match found - return None instead of search URL
+            logger.debug(f"Steam API: No confident match found for '{game_name}'")
+            return None
 
         except asyncio.TimeoutError:
             logger.warning(f"Steam API: Timeout looking up '{game_name}'")
         except Exception as e:
             logger.warning(f"Steam API: Error looking up '{game_name}': {e}")
 
-        # Fallback to search URL
-        search_term = urllib.parse.quote(game_name)
-        return f"https://store.steampowered.com/search/?term={search_term}"
+        # Return None on error (don't save bad links)
+        return None
 
     async def _trigger_immediate_sync(self, guild_id: int):
         """

@@ -1082,6 +1082,7 @@ class XPCog(commands.Cog):
     # Admin commands
 
     @xp.command(name="give", description="Give XP to a member (Admin)")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def xp_give(
         self,
@@ -1128,6 +1129,7 @@ class XPCog(commands.Cog):
         )
 
     @xp.command(name="give-tokens", description="Give Hero Tokens to a member (Admin)")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def xp_give_tokens(
         self,
@@ -1186,6 +1188,7 @@ class XPCog(commands.Cog):
         )
 
     @xp.command(name="export-members", description="Export all Discord members to Excel (Admin)")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def xp_export_members(self, ctx: discord.ApplicationContext):
         """Export all guild members to Excel with proper formatting (no scientific notation!)."""

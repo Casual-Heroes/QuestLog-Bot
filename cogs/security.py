@@ -379,6 +379,7 @@ class SecurityCog(commands.Cog):
 
     # Slash commands
     @raid.command(name="status", description="Check current raid protection status")
+    @discord.default_permissions(manage_guild=True)
     @commands.has_permissions(manage_guild=True)
     async def raid_status(self, ctx: discord.ApplicationContext):
         """Show raid protection status."""
@@ -442,6 +443,7 @@ class SecurityCog(commands.Cog):
         await ctx.respond(embed=embed, ephemeral=True)
 
     @raid.command(name="lockdown", description="Activate server lockdown (kicks new joins)")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option("duration", int, description="Lockdown duration in minutes", default=30)
     @discord.option("reason", str, description="Reason for lockdown", default="Manual lockdown")
@@ -471,6 +473,7 @@ class SecurityCog(commands.Cog):
         await ctx.respond(embed=embed)
 
     @raid.command(name="unlock", description="Deactivate server lockdown")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def raid_unlock(self, ctx: discord.ApplicationContext):
         """Deactivate lockdown mode."""
@@ -506,6 +509,7 @@ class SecurityCog(commands.Cog):
         logger.info(f"Lockdown deactivated in {ctx.guild.name} by {ctx.author}")
 
     @raid.command(name="config", description="Configure raid protection settings")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option("min_account_age", int, description="Minimum account age in days", required=False)
     @discord.option("auto_quarantine", bool, description="Auto-quarantine new accounts", required=False)
@@ -550,6 +554,7 @@ class SecurityCog(commands.Cog):
     # Mod audit commands
 
     @raid.command(name="mod-log", description="View recent moderator actions")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option("mod", discord.Member, description="Filter by moderator", required=False)
     @discord.option("action_type", str, description="Filter by action type", required=False)
@@ -605,6 +610,7 @@ class SecurityCog(commands.Cog):
         await ctx.respond(embed=embed, ephemeral=True)
 
     @raid.command(name="audit-bots", description="Audit bot permissions in the server")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def audit_bots(self, ctx: discord.ApplicationContext):
         """Audit all bots and their permissions."""
@@ -654,6 +660,7 @@ class SecurityCog(commands.Cog):
         await ctx.respond(embed=embed, ephemeral=True)
 
     @raid.command(name="audit-invites", description="Audit server invites")
+    @discord.default_permissions(manage_guild=True)
     @commands.has_permissions(manage_guild=True)
     async def audit_invites(self, ctx: discord.ApplicationContext):
         """Audit all server invites."""
@@ -693,6 +700,7 @@ class SecurityCog(commands.Cog):
         await ctx.respond(embed=embed, ephemeral=True)
 
     @raid.command(name="purge-invites", description="Delete all invites from a user")
+    @discord.default_permissions(manage_guild=True)
     @commands.has_permissions(manage_guild=True)
     @discord.option("user", discord.Member, description="User whose invites to delete")
     async def purge_invites(

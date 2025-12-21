@@ -286,6 +286,7 @@ class CoreCog(commands.Cog):
 
     # Guild setup command
     @questlog.command(name="setup", description="Quick setup wizard for QuestLog")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def setup(self, ctx: discord.ApplicationContext):
         """Interactive setup wizard."""

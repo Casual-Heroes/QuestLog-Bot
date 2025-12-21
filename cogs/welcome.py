@@ -234,6 +234,7 @@ class WelcomeCog(commands.Cog):
     # Slash commands
 
     @welcome.command(name="test", description="Test the welcome message")
+    @discord.default_permissions(manage_guild=True)
     @commands.has_permissions(manage_guild=True)
     async def welcome_test(self, ctx: discord.ApplicationContext):
         """Test welcome message by sending it for yourself."""
@@ -282,6 +283,7 @@ class WelcomeCog(commands.Cog):
         await ctx.respond(f"Test welcome message sent to {welcome_channel.mention}!", ephemeral=True)
 
     @welcome.command(name="config", description="Configure welcome messages")
+    @discord.default_permissions(manage_guild=True)
     @commands.has_permissions(manage_guild=True)
     @discord.option("enabled", bool, description="Enable/disable welcome messages", required=False)
     @discord.option("channel_message", bool, description="Enable channel welcome message", required=False)
@@ -350,6 +352,7 @@ class WelcomeCog(commands.Cog):
         await ctx.respond(embed=status_embed, ephemeral=True)
 
     @welcome.command(name="set-message", description="Set the welcome message")
+    @discord.default_permissions(manage_guild=True)
     @commands.has_permissions(manage_guild=True)
     @discord.option("message_type", str, description="Which message to set",
                     choices=["channel", "dm", "goodbye"])
@@ -381,6 +384,7 @@ class WelcomeCog(commands.Cog):
         await ctx.respond(embed=embed, ephemeral=True)
 
     @welcome.command(name="set-embed", description="Configure welcome embed appearance")
+    @discord.default_permissions(manage_guild=True)
     @commands.has_permissions(manage_guild=True)
     @discord.option("title", str, description="Embed title", required=False)
     @discord.option("color", str, description="Hex color (e.g., #5865F2)", required=False)
@@ -426,6 +430,7 @@ class WelcomeCog(commands.Cog):
         await ctx.respond("Embed settings updated! Preview:", embed=embed, ephemeral=True)
 
     @welcome.command(name="auto-role", description="Set a role to auto-assign on join")
+    @discord.default_permissions(manage_roles=True)
     @commands.has_permissions(manage_roles=True)
     @discord.option("role", discord.Role, description="Role to auto-assign (leave empty to disable)", required=False)
     async def welcome_auto_role(self, ctx: discord.ApplicationContext, role: discord.Role = None):
@@ -470,6 +475,7 @@ class WelcomeCog(commands.Cog):
         await ctx.respond(embed=embed, ephemeral=True)
 
     @welcome.command(name="status", description="View current welcome configuration")
+    @discord.default_permissions(manage_guild=True)
     @commands.has_permissions(manage_guild=True)
     async def welcome_status(self, ctx: discord.ApplicationContext):
         """View current welcome message configuration."""

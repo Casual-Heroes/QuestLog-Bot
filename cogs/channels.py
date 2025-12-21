@@ -280,6 +280,7 @@ class ChannelsCog(commands.Cog):
     # Mass channel operations
 
     @channels.command(name="mass-delete", description="Mass delete channels (DANGEROUS)")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option("category", discord.CategoryChannel, description="Delete all channels in this category")
     @discord.option("confirm", str, description="Type 'CONFIRM' to proceed")

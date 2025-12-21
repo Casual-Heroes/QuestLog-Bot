@@ -2923,6 +2923,7 @@ class DiscoveryCog(commands.Cog):
 # PHASE2:         await ctx.respond(embed=embed, ephemeral=True)
 # PHASE2: 
 # PHASE2:     @discovery.command(name="join", description="Join the discovery network (Admin, PRO)")
+# PHASE2:     @discord.default_permissions(administrator=True)
 # PHASE2:     @commands.has_permissions(administrator=True)
 # PHASE2:     async def discovery_join(self, ctx: discord.ApplicationContext):
 # PHASE2:         """Join the discovery network."""
@@ -2977,6 +2978,7 @@ class DiscoveryCog(commands.Cog):
 # PHASE2:         )
 # PHASE2: 
 # PHASE2:     @discovery.command(name="settings", description="Configure discovery settings (Admin, PRO)")
+# PHASE2:     @discord.default_permissions(administrator=True)
 # PHASE2:     @commands.has_permissions(administrator=True)
 # PHASE2:     @discord.option(
 # PHASE2:         name="incoming",
@@ -3070,6 +3072,7 @@ class DiscoveryCog(commands.Cog):
 # PHASE2:                 )
 # PHASE2: 
 # PHASE2:     @discovery.command(name="leave", description="Leave the discovery network (Admin)")
+# PHASE2:     @discord.default_permissions(administrator=True)
 # PHASE2:     @commands.has_permissions(administrator=True)
 # PHASE2:     async def discovery_leave(self, ctx: discord.ApplicationContext):
 # PHASE2:         """Leave the discovery network."""
@@ -3100,6 +3103,7 @@ class DiscoveryCog(commands.Cog):
 # PHASE2:     # ========== SERVER LISTING COMMANDS ==========
 # PHASE2: 
 # PHASE2:     @listing.command(name="create", description="Create your server listing (PRO)")
+# PHASE2:     @discord.default_permissions(administrator=True)
 # PHASE2:     @commands.has_permissions(administrator=True)
 # PHASE2:     @discord.option(name="title", description="Server title (max 100 chars)", required=True)
 # PHASE2:     @discord.option(name="description", description="Server description", required=True)
@@ -3178,6 +3182,7 @@ class DiscoveryCog(commands.Cog):
 # PHASE2:         )
 # PHASE2: 
 # PHASE2:     @listing.command(name="edit", description="Edit your server listing (PRO)")
+# PHASE2:     @discord.default_permissions(administrator=True)
 # PHASE2:     @commands.has_permissions(administrator=True)
 # PHASE2:     @discord.option(name="title", description="New title", required=False)
 # PHASE2:     @discord.option(name="description", description="New description", required=False)
@@ -3234,6 +3239,7 @@ class DiscoveryCog(commands.Cog):
 # PHASE2:             await ctx.respond("No changes provided. Use options to update fields.", ephemeral=True)
 # PHASE2: 
 # PHASE2:     @listing.command(name="publish", description="Publish/unpublish your listing (PRO)")
+# PHASE2:     @discord.default_permissions(administrator=True)
 # PHASE2:     @commands.has_permissions(administrator=True)
 # PHASE2:     @discord.option(name="published", description="Publish listing?", required=True)
 # PHASE2:     async def listing_publish(
@@ -3282,8 +3288,9 @@ class DiscoveryCog(commands.Cog):
 # PHASE2:                 embed.add_field(name="Join Rate", value=f"**{join_rate:.1f}%**", inline=True)
 # PHASE2: 
 # PHASE2:         await ctx.respond(embed=embed, ephemeral=True)
-# PHASE2: 
+# PHASE2:
 # PHASE2:     @listing.command(name="delete", description="Delete your server listing (Admin)")
+# PHASE2:     @discord.default_permissions(administrator=True)
 # PHASE2:     @commands.has_permissions(administrator=True)
 # PHASE2:     async def listing_delete(self, ctx: discord.ApplicationContext):
 # PHASE2:         """Delete your server listing."""
@@ -3294,10 +3301,11 @@ class DiscoveryCog(commands.Cog):
 # PHASE2:                 return
 # PHASE2: 
 # PHASE2:             session.delete(listing)
-# PHASE2: 
+# PHASE2:
 # PHASE2:         await ctx.respond("Your server listing has been deleted.", ephemeral=True)
 
     @promo.command(name="clearfeatured", description="Clear current featured person (Admin)")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def promo_clearfeatured(self, ctx: discord.ApplicationContext):
         """Clear the current featured person from the featured pool."""
@@ -3357,6 +3365,7 @@ class DiscoveryCog(commands.Cog):
     # ========== GAME DISCOVERY COMMANDS ==========
 
     @discovery.command(name="game-settings", description="Configure game discovery settings (Admin)")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option(
         name="enabled",
@@ -3452,6 +3461,7 @@ class DiscoveryCog(commands.Cog):
         await ctx.respond(embed=embed, ephemeral=True)
 
     @discovery.command(name="game-filters", description="Configure genre/mode/platform filters (Admin)")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option(
         name="genres",
@@ -3552,6 +3562,7 @@ class DiscoveryCog(commands.Cog):
         await ctx.respond(embed=embed, ephemeral=True)
 
     @discovery.command(name="check-games", description="Manually check for new games now (Admin)")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def check_games(self, ctx: discord.ApplicationContext):
         """Manually trigger game discovery check."""
@@ -3786,6 +3797,7 @@ class DiscoveryCog(commands.Cog):
         await self.bot.wait_until_ready()
 
     @discord.slash_command(name="send-featured-reminder", description="Send a reminder about how to get featured")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def send_featured_reminder(
         self,

@@ -188,6 +188,7 @@ class Guild(Base):
     cached_channels = Column(Text, nullable=True)  # JSON array of channel objects
     cached_roles = Column(Text, nullable=True)  # JSON array of role objects
     cached_emojis = Column(Text, nullable=True)  # JSON array of emoji objects
+    guild_icon_hash = Column(String(255), nullable=True)  # Discord guild icon hash for CDN URL
 
     # Cached Member Stats (synced by bot from Discord presence data)
     member_count = Column(Integer, nullable=True)  # Total members (excluding bots)
@@ -516,7 +517,7 @@ class AuditLog(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     guild_id = Column(BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"))
 
-    action = Column(SQLEnum(AuditAction), nullable=False)
+    action = Column(SQLEnum(AuditAction, native_enum=False, length=50), nullable=False)
     action_category = Column(String(50), nullable=True)
 
     actor_id = Column(BigInteger, nullable=True)
@@ -2031,4 +2032,95 @@ class ScheduledMessage(Base):
         Index("idx_scheduled_message_guild", "guild_id"),
         Index("idx_scheduled_message_status", "status", "scheduled_time"),
         Index("idx_scheduled_message_pending", "guild_id", "status", "scheduled_time"),
+    )
+
+
+# ==================== DISCOVERY NETWORK APPLICATION SYSTEM ====================
+
+class DiscoveryNetworkApplication(Base):
+    """
+    Applications for Discovery Network cross-server creator listing.
+    Requires admin review before approval.
+    """
+    __tablename__ = "discovery_network_applications"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, nullable=False)
+    guild_id = Column(BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"))
+
+    # Application data
+    bio = Column(Text, nullable=False)  # Creator bio/description
+    twitch_url = Column(Text, nullable=True)
+    youtube_url = Column(Text, nullable=True)
+    twitter_url = Column(Text, nullable=True)
+    tiktok_url = Column(Text, nullable=True)
+    instagram_url = Column(Text, nullable=True)
+    bsky_url = Column(Text, nullable=True)
+    other_links = Column(Text, nullable=True)  # JSON array
+
+    # Cached Discord profile data at time of application
+    username = Column(String(255), nullable=False)
+    display_name = Column(String(255), nullable=True)
+    avatar_url = Column(Text, nullable=True)
+    account_created_at = Column(BigInteger, nullable=False)  # Discord account creation timestamp
+
+    # Guidelines acceptance
+    guidelines_accepted = Column(Boolean, default=False, nullable=False)
+    tos_accepted = Column(Boolean, default=False, nullable=False)
+    content_policy_accepted = Column(Boolean, default=False, nullable=False)
+
+    # Application status
+    status = Column(String(20), nullable=False, default='pending')  # pending, approved, denied, banned
+
+    # Review data
+    reviewed_by = Column(BigInteger, nullable=True)  # Admin who reviewed
+    reviewed_at = Column(BigInteger, nullable=True)
+    review_notes = Column(Text, nullable=True)  # Admin notes
+    denial_reason = Column(Text, nullable=True)  # Public reason shown to user
+
+    # Timestamps
+    applied_at = Column(BigInteger, nullable=False, default=lambda: int(time.time()))
+    updated_at = Column(BigInteger, nullable=False, default=lambda: int(time.time()))
+
+    __table_args__ = (
+        Index("idx_discovery_app_user", "user_id"),
+        Index("idx_discovery_app_status", "status"),
+        Index("idx_discovery_app_guild", "guild_id", "status"),
+        Index("idx_discovery_app_pending", "status", "applied_at"),
+    )
+
+
+class DiscoveryNetworkBan(Base):
+    """
+    Permanent bans from Discovery Network for guideline violations.
+    Prevents reapplication.
+    """
+    __tablename__ = "discovery_network_bans"
+
+    user_id = Column(BigInteger, primary_key=True)
+
+    # Ban details
+    reason = Column(Text, nullable=False)  # Public reason
+    violation_type = Column(String(50), nullable=False)  # discord_tos, nsfw_content, harassment, spam, etc.
+    evidence = Column(Text, nullable=True)  # JSON: screenshots, links, etc.
+
+    # Ban metadata
+    banned_by = Column(BigInteger, nullable=False)  # Admin who issued ban
+    banned_at = Column(BigInteger, nullable=False, default=lambda: int(time.time()))
+
+    # Appeal tracking
+    appeal_allowed = Column(Boolean, default=True)  # Can they appeal?
+    appeal_submitted = Column(Boolean, default=False)
+    appeal_text = Column(Text, nullable=True)
+    appeal_reviewed = Column(Boolean, default=False)
+    appeal_approved = Column(Boolean, default=False)
+    appeal_reviewed_by = Column(BigInteger, nullable=True)
+    appeal_reviewed_at = Column(BigInteger, nullable=True)
+
+    # Cached user data
+    username = Column(String(255), nullable=False)
+
+    __table_args__ = (
+        Index("idx_discovery_ban_user", "user_id"),
+        Index("idx_discovery_ban_appeal", "appeal_submitted", "appeal_reviewed"),
     )

@@ -12,6 +12,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from contextlib import contextmanager
 from dotenv import load_dotenv
+from urllib.parse import quote_plus
 
 load_dotenv()
 
@@ -24,13 +25,16 @@ DB_USERNAME = os.getenv("DB_USERNAME", DB_USER)  # Support both DB_USER and DB_U
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 DB_NAME = os.getenv("DB_NAME", "warden")
 
+# SECURITY: URL-encode password to handle special characters like @, &, etc.
+encoded_password = quote_plus(DB_PASSWORD) if DB_PASSWORD else ""
+
 # Use Unix socket if specified (faster and more reliable), otherwise use TCP
 if DB_SOCKET:
-    DATABASE_URL = f"mysql+mysqlconnector://{DB_USERNAME}:{DB_PASSWORD}@/{DB_NAME}?unix_socket={DB_SOCKET}&charset=utf8mb4"
+    DATABASE_URL = f"mysql+mysqlconnector://{DB_USERNAME}:{encoded_password}@/{DB_NAME}?unix_socket={DB_SOCKET}&charset=utf8mb4"
 else:
     if not DB_HOST:
         DB_HOST = "localhost"
-    DATABASE_URL = f"mysql+mysqlconnector://{DB_USERNAME}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}?charset=utf8mb4"
+    DATABASE_URL = f"mysql+mysqlconnector://{DB_USERNAME}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}?charset=utf8mb4"
 
 # Create engine (shared connection pool)
 engine = create_engine(

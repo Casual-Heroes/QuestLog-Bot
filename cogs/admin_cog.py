@@ -262,6 +262,7 @@ class AdminCog(commands.Cog):
     # ─── EMBED COMMANDS ───────────────────────────────────────────────────────
 
     @slash_command(name="sendembed", description="Send an embed to a channel")
+    @discord.default_permissions(manage_messages=True)
     @commands.has_permissions(manage_messages=True)
     @discord.default_permissions(manage_messages=True)
     @option("channel", description="Target channel (default: current)", required=False)
@@ -275,6 +276,7 @@ class AdminCog(commands.Cog):
         await ctx.send_modal(modal)
 
     @slash_command(name="editembed", description="Edit an existing embed by message ID")
+    @discord.default_permissions(manage_messages=True)
     @commands.has_permissions(manage_messages=True)
     @discord.default_permissions(manage_messages=True)
     @option("message_id", description="The message ID to edit")
@@ -297,6 +299,7 @@ class AdminCog(commands.Cog):
     # ─── BROADCAST COMMANDS ───────────────────────────────────────────────────
 
     @slash_command(name="broadcast", description="Send a message to multiple channels")
+    @discord.default_permissions(manage_messages=True)
     @commands.has_permissions(manage_messages=True)
     @discord.default_permissions(manage_messages=True)
     @option("message", description="Message to send")
@@ -340,6 +343,7 @@ class AdminCog(commands.Cog):
         await ctx.respond(result, ephemeral=True)
 
     @slash_command(name="broadcast_select", description="Select channels from a list to broadcast to")
+    @discord.default_permissions(manage_messages=True)
     @commands.has_permissions(manage_messages=True)
     @discord.default_permissions(manage_messages=True)
     async def broadcast_select(self, ctx: discord.ApplicationContext):
@@ -377,6 +381,7 @@ class AdminCog(commands.Cog):
             await ctx.respond("Error loading feedback config!", ephemeral=True)
 
     @slash_command(name="feedback_setup", description="Configure the feedback system (Admin)")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.default_permissions(administrator=True)
     @option("channel", description="Channel for feedback submissions")
@@ -418,6 +423,7 @@ class AdminCog(commands.Cog):
     # ─── MESSAGE COMMANDS ─────────────────────────────────────────────────────
 
     @slash_command(name="say", description="Make the bot say something")
+    @discord.default_permissions(manage_messages=True)
     @commands.has_permissions(manage_messages=True)
     @discord.default_permissions(manage_messages=True)
     @option("message", description="What to say")
@@ -439,6 +445,31 @@ class AdminCog(commands.Cog):
 
         await target.send(message)
         await ctx.respond(f"Message sent to {target.mention}!", ephemeral=True)
+
+    @slash_command(name="sync", description="[BOT OWNER] Force sync slash commands")
+    async def sync_commands(self, ctx: discord.ApplicationContext):
+        """Force Discord to sync slash command permissions immediately."""
+        # Check if user is bot owner
+        if ctx.author.id != self.bot.owner_id:
+            return await ctx.respond("❌ This command is only available to the bot owner.", ephemeral=True)
+
+        await ctx.defer(ephemeral=True)
+
+        try:
+            # Sync commands globally
+            await self.bot.sync_commands()
+
+            await ctx.followup.send(
+                "✅ Commands synced successfully!\n\n"
+                "**Note:** Discord may take 1-2 hours to fully update command permissions on the client side.\n"
+                "For immediate effect, try:\n"
+                "• Restarting your Discord client\n"
+                "• Kicking and re-inviting the bot to your server",
+                ephemeral=True
+            )
+        except Exception as e:
+            logger.error(f"Error syncing commands: {e}")
+            await ctx.followup.send(f"❌ Error syncing commands: {str(e)}", ephemeral=True)
 
 
 def setup(bot: commands.Bot):

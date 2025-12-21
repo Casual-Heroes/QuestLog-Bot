@@ -119,6 +119,14 @@ async def on_ready():
         except Exception as e:
             logger.error(f"Failed to start API server: {e}")
 
+    # Force sync commands to ensure permissions are up-to-date (only on first ready)
+    if not bot._cogs_loaded:
+        try:
+            await bot.sync_commands()
+            logger.info("✅ Commands synced successfully")
+        except Exception as e:
+            logger.error(f"Failed to sync commands: {e}")
+
     # Sync guilds to database (only on first ready)
     if not bot._cogs_loaded:
         logger.info("Syncing guilds to database...")

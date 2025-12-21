@@ -389,6 +389,7 @@ class BillingCog(commands.Cog):
     # Slash commands
 
     @billing.command(name="status", description="View your server's subscription status")
+    @discord.default_permissions(manage_guild=True)
     @commands.has_permissions(manage_guild=True)
     async def billing_status(self, ctx: discord.ApplicationContext):
         """View subscription status."""
@@ -524,6 +525,7 @@ class BillingCog(commands.Cog):
         await ctx.respond(embed=embed, ephemeral=True)
 
     @billing.command(name="upgrade", description="Upgrade your server's subscription")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option("plan", str, description="Plan to upgrade to",
                     choices=["premium_monthly", "premium_yearly", "pro_monthly", "pro_yearly", "pro_lifetime"])
@@ -597,6 +599,7 @@ class BillingCog(commands.Cog):
             )
 
     @billing.command(name="manage", description="Manage your subscription (billing portal)")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def billing_manage(self, ctx: discord.ApplicationContext):
         """Open Stripe billing portal for subscription management."""
@@ -648,6 +651,7 @@ class BillingCog(commands.Cog):
             await ctx.respond(f"Error: {e.user_message or 'Unknown error'}", ephemeral=True)
 
     @billing.command(name="cancel", description="Cancel your subscription")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def billing_cancel(self, ctx: discord.ApplicationContext):
         """Cancel subscription (redirects to billing portal)."""

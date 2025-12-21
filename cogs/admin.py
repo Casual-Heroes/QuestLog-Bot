@@ -196,6 +196,7 @@ class AdminCog(commands.Cog):
 
     # Feature toggles
     @settings.command(name="toggle", description="Enable/disable QuestLog features")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option(
         "feature", str, description="Feature to toggle",
@@ -245,6 +246,7 @@ class AdminCog(commands.Cog):
 
     # Channel settings
     @settings.command(name="channel", description="Set a channel for QuestLog features")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option(
         "channel_type", str, description="Type of channel to set",
@@ -287,6 +289,7 @@ class AdminCog(commands.Cog):
 
     # Role settings
     @settings.command(name="role", description="Set a role for QuestLog features")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option(
         "role_type", str, description="Type of role to set",
@@ -326,6 +329,7 @@ class AdminCog(commands.Cog):
 
     # View settings
     @settings.command(name="view", description="View current QuestLog settings")
+    @discord.default_permissions(manage_guild=True)
     @commands.has_permissions(manage_guild=True)
     async def settings_view(self, ctx: discord.ApplicationContext):
         """View all settings."""
@@ -393,6 +397,7 @@ class AdminCog(commands.Cog):
     # =============================================================================
 
     @discord.slash_command(name="send_embed", description="Send a custom embed message")
+    @discord.default_permissions(manage_messages=True)
     @commands.has_permissions(manage_messages=True)
     @discord.option("channel", discord.TextChannel, description="Channel to send embed to", required=False)
     async def send_embed(
@@ -406,6 +411,7 @@ class AdminCog(commands.Cog):
 
     # New Message System commands
     @message.command(name="send", description="Send a message via modal")
+    @discord.default_permissions(manage_messages=True)
     @commands.has_permissions(manage_messages=True)
     @discord.option("channel", discord.TextChannel, description="Channel to send to", required=False)
     @discord.option("silent", bool, description="Suppress mentions?", required=False, default=False)
@@ -414,6 +420,7 @@ class AdminCog(commands.Cog):
         await ctx.send_modal(modal)
 
     @message.command(name="send_embed", description="Send an embed via modal")
+    @discord.default_permissions(manage_messages=True)
     @commands.has_permissions(manage_messages=True)
     @discord.option("channel", discord.TextChannel, description="Channel to send to", required=False)
     async def message_send_embed(self, ctx: discord.ApplicationContext, channel: Optional[discord.TextChannel] = None):
@@ -422,6 +429,7 @@ class AdminCog(commands.Cog):
 
 
     @discord.slash_command(name="edit_embed", description="Edit an existing embed message")
+    @discord.default_permissions(manage_messages=True)
     @commands.has_permissions(manage_messages=True)
     @discord.option("channel", discord.TextChannel, description="Channel containing the message")
     @discord.option("message_id", str, description="ID of the message to edit")
@@ -512,6 +520,7 @@ class AdminCog(commands.Cog):
     # =============================================================================
 
     @discord.slash_command(name="prune", description="Remove inactive members from the server")
+    @discord.default_permissions(kick_members=True)
     @commands.has_permissions(kick_members=True)
     @discord.option("days", int, description="Inactive for X days (7-30)", min_value=7, max_value=30)
     @discord.option("include_roles", bool, description="Include members with roles? (default: No)", required=False)
@@ -619,6 +628,7 @@ class AdminCog(commands.Cog):
     # =============================================================================
 
     @discord.slash_command(name="broadcast", description="Send a message to multiple channels")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option("message", str, description="Message to broadcast")
     @discord.option("channel_type", str, description="Which channels to send to", choices=[
@@ -840,6 +850,7 @@ class AdminCog(commands.Cog):
             await ctx.respond("❌ Error submitting suggestion!", ephemeral=True)
 
     @suggestion.command(name="review", description="Review and update a suggestion (Admin)")
+    @discord.default_permissions(manage_guild=True)
     @commands.has_permissions(manage_guild=True)
     @discord.option("suggestion_id", int, description="Suggestion ID number")
     @discord.option("status", str, description="New status", choices=[
@@ -926,6 +937,7 @@ class AdminCog(commands.Cog):
             await ctx.respond("❌ Error updating suggestion!", ephemeral=True)
 
     @suggestion.command(name="list", description="List suggestions (Admin)")
+    @discord.default_permissions(manage_guild=True)
     @commands.has_permissions(manage_guild=True)
     @discord.option("status", str, description="Filter by status", choices=[
         discord.OptionChoice(name="Pending", value="pending"),
@@ -981,6 +993,7 @@ class AdminCog(commands.Cog):
             await ctx.respond("❌ Error listing suggestions!", ephemeral=True)
 
     @suggestion.command(name="setup", description="Setup the suggestion system (Admin)")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option("channel", discord.TextChannel, description="Channel for suggestions")
     @discord.option("anonymous", bool, description="Allow anonymous suggestions?", required=False)
@@ -1387,6 +1400,7 @@ class AdminCog(commands.Cog):
         name="purgelfgs",
         description="Purge all LFG threads older than 24 hours (Admin)"
     )
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def purge_lfgs(self, ctx: discord.ApplicationContext):
         """Purge all LFG threads that are past the 24-hour threshold."""

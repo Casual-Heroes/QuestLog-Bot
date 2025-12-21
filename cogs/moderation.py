@@ -599,6 +599,7 @@ class ModerationCog(commands.Cog):
     # Slash commands
 
     @mod.command(name="warn", description="Issue a warning to a user")
+    @discord.default_permissions(moderate_members=True)
     @commands.has_permissions(moderate_members=True)
     @discord.option("user", discord.Member, description="User to warn")
     @discord.option("reason", str, description="Reason for warning")
@@ -623,6 +624,7 @@ class ModerationCog(commands.Cog):
         await ctx.respond(response, ephemeral=True)
 
     @mod.command(name="kick", description="Kick a user from the server")
+    @discord.default_permissions(kick_members=True)
     @commands.has_permissions(kick_members=True)
     @discord.option("user", discord.Member, description="User to kick")
     @discord.option("reason", str, description="Reason for kick", required=False)
@@ -660,6 +662,7 @@ class ModerationCog(commands.Cog):
         await ctx.respond(f"Kicked {user.mention}" + (f" for: **{reason}**" if reason else ""), ephemeral=True)
 
     @mod.command(name="ban", description="Ban a user from the server")
+    @discord.default_permissions(ban_members=True)
     @commands.has_permissions(ban_members=True)
     @discord.option("user", discord.Member, description="User to ban")
     @discord.option("reason", str, description="Reason for ban")
@@ -705,6 +708,7 @@ class ModerationCog(commands.Cog):
         await ctx.respond(f"Banned {user.mention} for: **{reason}**", ephemeral=True)
 
     @mod.command(name="timeout", description="Timeout a user (prevent them from interacting)")
+    @discord.default_permissions(moderate_members=True)
     @commands.has_permissions(moderate_members=True)
     @discord.option("user", discord.Member, description="User to timeout")
     @discord.option("duration", int, description="Duration in minutes")
@@ -751,6 +755,7 @@ class ModerationCog(commands.Cog):
         )
 
     @mod.command(name="untimeout", description="Remove timeout from a user")
+    @discord.default_permissions(moderate_members=True)
     @commands.has_permissions(moderate_members=True)
     @discord.option("user", discord.Member, description="User to untimeout")
     @discord.option("reason", str, description="Reason for removing timeout", required=False)
@@ -771,6 +776,7 @@ class ModerationCog(commands.Cog):
         await ctx.respond(f"Removed timeout from {user.mention}.", ephemeral=True)
 
     @mod.command(name="jail", description="Jail a user (remove all access, send to jail channel)")
+    @discord.default_permissions(moderate_members=True)
     @commands.has_permissions(moderate_members=True)
     @discord.option("user", discord.Member, description="User to jail")
     @discord.option("reason", str, description="Reason for jailing")
@@ -818,6 +824,7 @@ class ModerationCog(commands.Cog):
         await ctx.respond(f"Jailed {user.mention}: **{reason}**", ephemeral=True)
 
     @mod.command(name="unjail", description="Release a user from jail")
+    @discord.default_permissions(moderate_members=True)
     @commands.has_permissions(moderate_members=True)
     @discord.option("user", discord.Member, description="User to unjail")
     @discord.option("reason", str, description="Reason for unjailing", required=False)
@@ -840,6 +847,7 @@ class ModerationCog(commands.Cog):
         await ctx.respond(f"Unjailed {user.mention}.", ephemeral=True)
 
     @mod.command(name="mute", description="Mute a user (remove send message permissions)")
+    @discord.default_permissions(moderate_members=True)
     @commands.has_permissions(moderate_members=True)
     @discord.option("user", discord.Member, description="User to mute")
     @discord.option("reason", str, description="Reason for muting", required=False)
@@ -877,6 +885,7 @@ class ModerationCog(commands.Cog):
         )
 
     @mod.command(name="unmute", description="Unmute a user")
+    @discord.default_permissions(moderate_members=True)
     @commands.has_permissions(moderate_members=True)
     @discord.option("user", discord.Member, description="User to unmute")
     async def mod_unmute(self, ctx: discord.ApplicationContext, user: discord.Member):
@@ -903,6 +912,7 @@ class ModerationCog(commands.Cog):
         await ctx.respond(f"Unmuted {user.mention}.", ephemeral=True)
 
     @mod.command(name="warnings", description="View warnings for a user")
+    @discord.default_permissions(moderate_members=True)
     @commands.has_permissions(moderate_members=True)
     @discord.option("user", discord.Member, description="User to check")
     @discord.option("include_pardoned", bool, description="Include pardoned warnings", default=False)
@@ -953,6 +963,7 @@ class ModerationCog(commands.Cog):
         await ctx.respond(embed=embed, ephemeral=True)
 
     @mod.command(name="pardon", description="Pardon (remove) a warning")
+    @discord.default_permissions(moderate_members=True)
     @commands.has_permissions(moderate_members=True)
     @discord.option("warning_id", int, description="Warning ID to pardon")
     @discord.option("reason", str, description="Reason for pardon", required=False)
@@ -991,6 +1002,7 @@ class ModerationCog(commands.Cog):
         await ctx.respond(f"Pardoned warning #{warning_id} for {user_mention}.", ephemeral=True)
 
     @mod.command(name="setup-jail", description="Set up the jail system")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option("jail_role", discord.Role, description="Role that denies all channel access")
     @discord.option("jail_channel", discord.TextChannel, description="Channel jailed users can see")
@@ -1054,6 +1066,7 @@ class ModerationCog(commands.Cog):
     # Auto-mod configuration
 
     @automod.command(name="config", description="Configure auto-moderation settings")
+    @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option("enabled", bool, description="Enable/disable auto-mod", required=False)
     @discord.option("filter_slurs", bool, description="Filter slurs/isms", required=False)
@@ -1122,6 +1135,7 @@ class ModerationCog(commands.Cog):
         await ctx.respond(embed=embed, ephemeral=True)
 
     @automod.command(name="status", description="View auto-mod status")
+    @discord.default_permissions(manage_messages=True)
     @commands.has_permissions(manage_messages=True)
     async def automod_status(self, ctx: discord.ApplicationContext):
         """View current auto-mod status."""
