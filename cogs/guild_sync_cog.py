@@ -30,7 +30,7 @@ class GuildSyncCog(commands.Cog):
         """Stop background tasks when cog unloads."""
         self.sync_guild_stats.cancel()
 
-    @tasks.loop(minutes=15)
+    @tasks.loop(minutes=30)
     async def sync_guild_stats(self):
         """
         Sync member counts, online status, and member avatars for all guilds.

@@ -1588,6 +1588,16 @@ class DiscoveryCog(commands.Cog):
                         continue
 
                     try:
+                        # Check if already in pool FIRST to avoid unnecessary API calls
+                        existing = session.query(FeaturedPool).filter_by(
+                            guild_id=guild_id,
+                            forum_thread_id=thread.id
+                        ).first()
+
+                        if existing:
+                            logger.debug(f"[Forum Scanner] Thread {thread.id} already in pool, skipping")
+                            continue
+
                         # Get starter message (pycord forum threads)
                         # Try with retry logic since message might not be immediately available
                         starter_message = None
@@ -1613,16 +1623,6 @@ class DiscoveryCog(commands.Cog):
 
                         if not starter_message:
                             logger.debug(f"[Forum Scanner] Could not get starter message for thread {thread.id} after {max_retries} attempts")
-                            continue
-
-                        # Check if already in pool
-                        existing = session.query(FeaturedPool).filter_by(
-                            guild_id=guild_id,
-                            forum_thread_id=thread.id
-                        ).first()
-
-                        if existing:
-                            logger.debug(f"[Forum Scanner] Thread {thread.id} already in pool, skipping")
                             continue
 
                         # Get member record to check tokens
