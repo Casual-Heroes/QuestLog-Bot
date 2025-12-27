@@ -188,6 +188,7 @@ class Guild(Base):
     cached_channels = Column(Text, nullable=True)  # JSON array of channel objects
     cached_roles = Column(Text, nullable=True)  # JSON array of role objects
     cached_emojis = Column(Text, nullable=True)  # JSON array of emoji objects
+    cached_members = Column(Text, nullable=True)  # JSON array of member objects (id, username, discriminator, roles, avatar)
     guild_icon_hash = Column(String(255), nullable=True)  # Discord guild icon hash for CDN URL
 
     # Cached Member Stats (synced by bot from Discord presence data)
@@ -739,6 +740,9 @@ class DiscoveryConfig(Base):
 
     # Message Response Channel
     message_response_channel_id = Column(BigInteger, nullable=True)  # Channel to send automated messages (instead of replying in self-promo)
+
+    # Game Discovery Notifications
+    public_game_ping_role_id = Column(BigInteger, nullable=True)  # Role to ping when public games are found
 
     # Featured Reminder Scheduling
     reminder_schedule = Column(String(50), default='disabled')  # disabled, hourly, every_6_hours, daily, weekly, monthly

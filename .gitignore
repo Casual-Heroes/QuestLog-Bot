@@ -88,3 +88,5 @@ SECURITY_FIXES.md
 
 
 cogs/action_processor.py.backup
+add_public_game_ping_role.py
+update_steam_urls.py

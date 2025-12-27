@@ -1193,7 +1193,10 @@ class ActionProcessorCog(commands.Cog):
                 session.delete(old_check)
 
             # Process ALL games - save to FoundGame database
-            # ONLY announce games with "Share on Discovery Network" enabled
+            # Track ALL new games for local Discord embed
+            # ONLY add public games to Discovery Network (AnnouncedGame table)
+            new_games_for_embed = []  # ALL new games (public + private) for local announcement
+
             for game_id, meta in all_games_to_announce.items():
                 game = meta["game"]
                 is_public = meta["is_public"]
@@ -1245,18 +1248,20 @@ class ActionProcessorCog(commands.Cog):
                     )
                     session.add(found_game)
                     new_games_count += 1
-                    logger.info(f"Saved game '{game.name}' to FoundGame database")
+                    # Track ALL new games (both public and private) for local Discord embed
+                    new_games_for_embed.append((game, search_config, is_public))
+                    logger.info(f"Saved game '{game.name}' to FoundGame database (public={is_public})")
 
-                # ONLY record announcement for games with "Share on Discovery Network" enabled
+                # ONLY add to Discovery Network for games with "Share on Discovery Network" enabled
                 if is_public:
-                    # Check if already announced
+                    # Check if already announced to Discovery Network
                     already_announced = session.query(AnnouncedGame).filter(
                         AnnouncedGame.guild_id == guild.id,
                         AnnouncedGame.igdb_id == game.id
                     ).first()
 
                     if not already_announced:
-                        # Record announcement in database (without posting individual messages)
+                        # Record announcement in Discovery Network database
                         try:
                             announced = AnnouncedGame(
                                 guild_id=guild.id,
@@ -1273,25 +1278,166 @@ class ActionProcessorCog(commands.Cog):
                             )
                             session.add(announced)
                             announced_count += 1
-                            logger.info(f"Recorded game '{game.name}' (IGDB:{game.id}) for announcement")
+                            logger.info(f"Added game '{game.name}' (IGDB:{game.id}) to Discovery Network")
                         except Exception as e:
-                            logger.error(f"Failed to record game '{game.name}' in guild {guild.id}: {e}")
+                            logger.error(f"Failed to add game '{game.name}' to Discovery Network in guild {guild.id}: {e}")
 
-            # Send ONE summary embed for all games shared on Discovery Network
-            if announced_count > 0 and discovery_channel:
+            # Send ONE summary embed for ALL new games (both public and private) to local Discord
+            if new_games_count > 0 and discovery_channel:
                 try:
                     dash_url = f"https://dashboard.casual-heroes.com/questlog/guild/{guild.id}/found-games/"
+
+                    # Collect statistics about ALL new games (from tracked new games)
+                    games_by_search = {}
+                    all_platforms = set()
+                    all_genres = set()
+                    top_rated = []
+                    most_hyped = []
+                    earliest_release = None
+                    latest_release = None
+                    cover_image = None
+
+                    # Track game with most hypes for thumbnail
+                    most_hyped_game = None
+                    max_hypes = 0
+
+                    for game, search_config, is_public in new_games_for_embed:
+                        search_name = search_config.name
+
+                        # Group by search config
+                        if search_name not in games_by_search:
+                            games_by_search[search_name] = 0
+                        games_by_search[search_name] += 1
+
+                        # Collect platforms and genres
+                        if hasattr(game, 'platforms') and game.platforms:
+                            all_platforms.update(game.platforms)
+                        if hasattr(game, 'genres') and game.genres:
+                            all_genres.update(game.genres)
+
+                        # Track top rated and most hyped
+                        if hasattr(game, 'rating') and game.rating:
+                            top_rated.append((game.name, game.rating))
+                        if hasattr(game, 'hypes') and game.hypes:
+                            most_hyped.append((game.name, game.hypes))
+                            # Track game with most hypes for thumbnail
+                            if game.hypes > max_hypes:
+                                max_hypes = game.hypes
+                                most_hyped_game = game
+
+                        # Track release date range
+                        if game.release_date:
+                            if earliest_release is None or game.release_date < earliest_release:
+                                earliest_release = game.release_date
+                            if latest_release is None or game.release_date > latest_release:
+                                latest_release = game.release_date
+
+                    # Use cover from most hyped game, fallback to first game with cover
+                    cover_image = None
+                    if most_hyped_game and hasattr(most_hyped_game, 'cover_url') and most_hyped_game.cover_url:
+                        cover_image = most_hyped_game.cover_url
+                    else:
+                        # Fallback: use first game with a cover
+                        for game, _, _ in new_games_for_embed:
+                            if hasattr(game, 'cover_url') and game.cover_url:
+                                cover_image = game.cover_url
+                                break
+
+                    # Sort and limit top games
+                    top_rated.sort(key=lambda x: x[1], reverse=True)
+                    most_hyped.sort(key=lambda x: x[1], reverse=True)
+
+                    # Build enhanced embed
                     summary_embed = discord.Embed(
-                        title="🎮 New Games Discovered!",
-                        description=f"Found **{announced_count}** new game{'s' if announced_count != 1 else ''} matching your searches!",
-                        color=discord.Color.green()
+                        title="New Games Discovered",
+                        description=f"Found **{new_games_count}** new game{'s' if new_games_count != 1 else ''} matching your discovery searches.",
+                        color=0x5865F2  # Discord blurple
                     )
+
+                    # Add thumbnail if available
+                    if cover_image:
+                        summary_embed.set_thumbnail(url=cover_image)
+
+                    # Show breakdown by search config (limit to 3 for space)
+                    if games_by_search:
+                        breakdown_lines = []
+                        for search_name, count in sorted(games_by_search.items(), key=lambda x: x[1], reverse=True)[:3]:
+                            breakdown_lines.append(f"**{search_name}**: {count} game{'s' if count != 1 else ''}")
+                        if len(games_by_search) > 3:
+                            remaining = len(games_by_search) - 3
+                            breakdown_lines.append(f"*+{remaining} more search{'es' if remaining != 1 else ''}*")
+                        summary_embed.add_field(
+                            name="By Search Configuration",
+                            value="\n".join(breakdown_lines),
+                            inline=False
+                        )
+
+                    # Show top rated or most hyped (show if we have ANY data)
+                    if len(top_rated) >= 1:
+                        # Show up to 3 top rated games
+                        top_games = "\n".join([f"**{name}** — {int(rating)}/100" for name, rating in top_rated[:3]])
+                        summary_embed.add_field(
+                            name="Top Rated",
+                            value=top_games,
+                            inline=True
+                        )
+                    elif len(most_hyped) >= 1:
+                        # Show up to 3 most hyped games
+                        hyped_games = "\n".join([f"**{name}** — {int(hypes)} follows" for name, hypes in most_hyped[:3]])
+                        summary_embed.add_field(
+                            name="Most Anticipated",
+                            value=hyped_games,
+                            inline=True
+                        )
+
+                    # Show platform/genre stats
+                    stats_lines = []
+                    if all_platforms:
+                        platform_count = len(all_platforms)
+                        platform_preview = ", ".join(sorted(list(all_platforms))[:3])
+                        if platform_count > 3:
+                            platform_preview += f" +{platform_count - 3} more"
+                        stats_lines.append(f"**Platforms**: {platform_preview}")
+                    if all_genres:
+                        genre_count = len(all_genres)
+                        genre_preview = ", ".join(sorted(list(all_genres))[:3])
+                        if genre_count > 3:
+                            genre_preview += f" +{genre_count - 3} more"
+                        stats_lines.append(f"**Genres**: {genre_preview}")
+
+                    if stats_lines:
+                        summary_embed.add_field(
+                            name="Quick Stats",
+                            value="\n".join(stats_lines),
+                            inline=True
+                        )
+
+                    # Release date range
+                    if earliest_release and latest_release:
+                        from datetime import datetime
+                        earliest_str = datetime.fromtimestamp(earliest_release).strftime("%b %Y")
+                        latest_str = datetime.fromtimestamp(latest_release).strftime("%b %Y")
+                        if earliest_str == latest_str:
+                            release_info = f"Releasing in **{earliest_str}**"
+                        else:
+                            release_info = f"Releasing **{earliest_str}** - **{latest_str}**"
+                        summary_embed.add_field(
+                            name="Release Window",
+                            value=release_info,
+                            inline=False
+                        )
+
+                    # Dashboard link (prominent)
                     summary_embed.add_field(
-                        name="📊 View All Games",
-                        value=f"[Click here to view all {announced_count} games on the dashboard]({dash_url})",
+                        name="View Full Details",
+                        value=f"[Browse all {new_games_count} games on the dashboard]({dash_url})",
                         inline=False
                     )
-                    summary_embed.set_footer(text=f"Based on {len(search_configs)} active search configuration{'s' if len(search_configs) != 1 else ''}")
+
+                    # Footer with timestamp
+                    from datetime import datetime
+                    check_time = datetime.fromtimestamp(now).strftime("%b %d, %Y at %I:%M %p UTC")
+                    summary_embed.set_footer(text=f"Discovery check completed {check_time}")
 
                     # Add role ping if configured
                     ping_content = None
@@ -1299,7 +1445,7 @@ class ActionProcessorCog(commands.Cog):
                         ping_content = f"<@&{config.public_game_ping_role_id}>"
 
                     await discovery_channel.send(content=ping_content, embed=summary_embed)
-                    logger.info(f"Sent game summary for {announced_count} games in guild {guild.id}")
+                    logger.info(f"Sent enhanced game summary for {new_games_count} games ({announced_count} public, {new_games_count - announced_count} private) in guild {guild.id}")
                 except Exception as e:
                     logger.warning(f"Failed to send game summary in guild {guild.id}: {e}")
 

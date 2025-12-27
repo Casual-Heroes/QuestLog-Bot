@@ -174,6 +174,20 @@ async def sync_all_guilds():
                     'animated': emoji.animated
                 })
 
+            # Cache guild members (industry standard: cache from Gateway events)
+            members_data = []
+            for member in guild.members:
+                if not member.bot:  # Exclude bots from cache
+                    members_data.append({
+                        'id': str(member.id),
+                        'username': member.name,
+                        'discriminator': member.discriminator,
+                        'display_name': member.display_name,
+                        'avatar': member.avatar.url if member.avatar else None,
+                        'roles': [str(role.id) for role in member.roles if role.name != "@everyone"],
+                        'joined_at': member.joined_at.isoformat() if member.joined_at else None
+                    })
+
             if not existing:
                 new_guild = Guild(
                     guild_id=guild.id,
@@ -185,6 +199,7 @@ async def sync_all_guilds():
                     cached_channels=json.dumps(channels_data),
                     cached_roles=json.dumps(roles_data),
                     cached_emojis=json.dumps(emojis_data),
+                    cached_members=json.dumps(members_data),
                 )
                 session.add(new_guild)
                 synced += 1
@@ -199,6 +214,7 @@ async def sync_all_guilds():
                 existing.cached_channels = json.dumps(channels_data)
                 existing.cached_roles = json.dumps(roles_data)
                 existing.cached_emojis = json.dumps(emojis_data)
+                existing.cached_members = json.dumps(members_data)
 
     logger.info(f"✅ Synced {synced} new guilds, reactivated {reactivated} guilds")
 
@@ -237,6 +253,20 @@ async def on_guild_join(guild: discord.Guild):
             'animated': emoji.animated
         })
 
+    # Cache guild members
+    members_data = []
+    for member in guild.members:
+        if not member.bot:  # Exclude bots from cache
+            members_data.append({
+                'id': str(member.id),
+                'username': member.name,
+                'discriminator': member.discriminator,
+                'display_name': member.display_name,
+                'avatar': member.avatar.url if member.avatar else None,
+                'roles': [str(role.id) for role in member.roles if role.name != "@everyone"],
+                'joined_at': member.joined_at.isoformat() if member.joined_at else None
+            })
+
     with db_session_scope() as session:
         existing = session.get(Guild, guild.id)
         if not existing:
@@ -250,6 +280,7 @@ async def on_guild_join(guild: discord.Guild):
                 cached_channels=json.dumps(channels_data),
                 cached_roles=json.dumps(roles_data),
                 cached_emojis=json.dumps(emojis_data),
+                cached_members=json.dumps(members_data),
             )
             session.add(new_guild)
             logger.info(f"✅ Added new guild {guild.name} to database")
@@ -261,6 +292,7 @@ async def on_guild_join(guild: discord.Guild):
             existing.cached_channels = json.dumps(channels_data)
             existing.cached_roles = json.dumps(roles_data)
             existing.cached_emojis = json.dumps(emojis_data)
+            existing.cached_members = json.dumps(members_data)
             logger.info(f"✅ Reactivated guild {guild.name} - all data preserved!")
 
     activity = discord.Activity(

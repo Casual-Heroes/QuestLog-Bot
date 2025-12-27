@@ -117,6 +117,22 @@ async def force_guild_sync(request):
                         emojis_data.append(emoji_data)
                     db_guild.cached_emojis = json_lib.dumps(emojis_data)
 
+                    # Cache members (industry standard: cache from Gateway)
+                    members_data = []
+                    for member in guild.members:
+                        if not member.bot:  # Exclude bots from cache
+                            member_data = {
+                                'id': str(member.id),
+                                'username': member.name,
+                                'discriminator': member.discriminator,
+                                'display_name': member.display_name,
+                                'avatar': member.avatar.url if member.avatar else None,
+                                'roles': [str(role.id) for role in member.roles if role.name != "@everyone"],
+                                'joined_at': member.joined_at.isoformat() if member.joined_at else None
+                            }
+                            members_data.append(member_data)
+                    db_guild.cached_members = json_lib.dumps(members_data)
+
                     session.commit()
 
                 # Invalidate Django cache so changes appear immediately
@@ -129,7 +145,7 @@ async def force_guild_sync(request):
                 except Exception as cache_error:
                     logger.warning(f"Failed to invalidate Django cache for guild {guild_id}: {cache_error}")
 
-                logger.info(f"✅ Forced sync for guild {guild_id} - {len(channels_data)} channels, {len(roles_data)} roles")
+                logger.info(f"✅ Forced sync for guild {guild_id} - {len(channels_data)} channels, {len(roles_data)} roles, {len(members_data)} members")
                 return web.json_response({
                     'success': True,
                     'guild_id': guild_id,
