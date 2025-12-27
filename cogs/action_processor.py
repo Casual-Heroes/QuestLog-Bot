@@ -323,7 +323,7 @@ class ActionProcessorCog(commands.Cog):
         elif action_type == ActionType.TEST_FORUM_EMBED:
             return await self._action_test_forum_embed(guild, payload)
         elif action_type == ActionType.CHECK_GAMES:
-            return await self._action_check_games(guild, payload)
+            result = await self._action_check_games(guild, payload)
 
         # Flair Management
         elif action_type == ActionType.FLAIR_ASSIGN:
@@ -1109,7 +1109,7 @@ class ActionProcessorCog(commands.Cog):
         now = int(time.time())
         total_found = 0
         new_games_count = 0
-        announced = 0
+        announced_count = 0
         check_id = str(uuid.uuid4())  # Unique ID for this check run
 
         with db_session_scope() as session:
@@ -1117,15 +1117,11 @@ class ActionProcessorCog(commands.Cog):
             if not config or not config.game_discovery_enabled:
                 raise ValueError("Game discovery is not enabled")
 
-            # Get public and private channels (at least one must be configured)
-            public_channel = guild.get_channel(config.public_game_channel_id) if config.public_game_channel_id else None
-            private_channel = guild.get_channel(config.private_game_channel_id) if config.private_game_channel_id else None
+            # Get the ONE discovery channel for all announcements
+            discovery_channel = guild.get_channel(config.public_game_channel_id) if config.public_game_channel_id else None
 
-            if not public_channel and not private_channel:
-                raise ValueError("No public or private game discovery channels configured")
-
-            # Use whichever channel is available for summary messages
-            summary_channel = public_channel or private_channel
+            if not discovery_channel:
+                raise ValueError("No game discovery channel configured")
 
             # Get all enabled search configurations
             search_configs = (
@@ -1137,13 +1133,8 @@ class ActionProcessorCog(commands.Cog):
             if not search_configs:
                 raise ValueError("No enabled search configurations found. Please add at least one search via the dashboard.")
 
-            # Get Discovery cog for embed creation
-            discovery_cog = self.bot.get_cog("DiscoveryCog")
-            if not discovery_cog:
-                raise ValueError("Discovery cog not loaded")
-
-            # Track games per search (don't deduplicate across searches for privacy)
-            searches_and_games = []  # List of (search_config, games_list)
+            # Track all games found across searches
+            all_games_to_announce = {}  # Key: IGDB ID, Value: {game, is_public}
 
             # Run each search configuration
             for search_config in search_configs:
@@ -1176,16 +1167,23 @@ class ActionProcessorCog(commands.Cog):
                     announcement_cutoff = now + (announcement_window * 24 * 60 * 60)
                     games = [g for g in games if g.release_date and g.release_date <= announcement_cutoff]
 
-                    # Store games for this search
-                    searches_and_games.append((search_config, games))
-                    logger.info(f"Search '{search_config.name}' found {len(games)} games for announcement")
+                    # Add to master list (avoid duplicates across searches), track privacy
+                    for game in games:
+                        if game.id not in all_games_to_announce:
+                            all_games_to_announce[game.id] = {
+                                "game": game,
+                                "is_public": bool(search_config.show_on_website),
+                                "search_config": search_config
+                            }
+
+                    logger.info(f"Search '{search_config.name}' found {len(games)} games")
 
                 except Exception as e:
                     logger.error(f"Error running search '{search_config.name}': {e}")
                     continue
 
             # Calculate total
-            total_found = sum(len(games) for _, games in searches_and_games)
+            total_found = len(all_games_to_announce)
 
             # Clear previous found games for this guild (keep last 3 checks)
             old_checks = session.query(FoundGame).filter(
@@ -1194,301 +1192,138 @@ class ActionProcessorCog(commands.Cog):
             for old_check in old_checks:
                 session.delete(old_check)
 
-            # Process each search configuration with privacy settings
-            public_games_to_announce = {}  # For main channel announcements
+            # Process ALL games - save to FoundGame database
+            # ONLY announce games with "Share on Discovery Network" enabled
+            for game_id, meta in all_games_to_announce.items():
+                game = meta["game"]
+                is_public = meta["is_public"]
+                search_config = meta["search_config"]
 
-            for search_config, games in searches_and_games:
-                if not games:
-                    continue
+                # Check if this game already exists for this search config
+                existing = session.query(FoundGame).filter(
+                    FoundGame.guild_id == guild.id,
+                    FoundGame.search_config_id == search_config.id,
+                    FoundGame.igdb_id == game.id
+                ).first()
 
-                # PUBLIC SEARCH: Save to database for website display
-                if search_config.show_on_website:
-                    logger.info(f"Processing PUBLIC search '{search_config.name}': {len(games)} games")
-
-                    new_games_saved = 0
-                    for game in games:
-                        # Check if this game already exists for this search config
-                        existing = session.query(FoundGame).filter(
-                            FoundGame.guild_id == guild.id,
-                            FoundGame.search_config_id == search_config.id,
-                            FoundGame.igdb_id == game.id
-                        ).first()
-
-                        if existing:
-                            logger.debug(f"Game '{game.name}' already exists for search '{search_config.name}', skipping")
-                            # Still add to announcement pool (will check announced_games separately)
-                            public_games_to_announce[game.id] = game
-                            continue
-
-                        # Extract Steam URL from websites
-                        steam_url = None
-                        if hasattr(game, 'websites') and game.websites:
-                            for website in game.websites:
-                                if website.get('category') == 13:  # Steam
-                                    steam_url = website.get('url')
-                                    break
-
-                        # If IGDB doesn't provide Steam URL, lookup via Steam API
-                        if not steam_url:
-                            steam_url = await self._lookup_steam_url(game.name)
-
-                        found_game = FoundGame(
-                            guild_id=guild.id,
-                            igdb_id=game.id,
-                            igdb_slug=game.slug if hasattr(game, 'slug') else None,
-                            game_name=game.name,
-                            release_date=game.release_date,
-                            summary=game.summary if hasattr(game, 'summary') else None,
-                            genres=json.dumps(game.genres) if hasattr(game, 'genres') else None,
-                            themes=json.dumps(game.themes) if hasattr(game, 'themes') else None,
-                            game_modes=json.dumps(game.game_modes) if hasattr(game, 'game_modes') else None,
-                            platforms=json.dumps(game.platforms) if hasattr(game, 'platforms') else None,
-                            cover_url=game.cover_url,
-                            igdb_url=game.igdb_url if hasattr(game, 'igdb_url') else None,
-                            steam_url=steam_url,
-                            hypes=game.hypes if hasattr(game, 'hypes') else None,
-                            rating=game.rating if hasattr(game, 'rating') else None,
-                            search_config_id=search_config.id,
-                            search_config_name=search_config.name,
-                            found_at=now,
-                            check_id=check_id
-                        )
-                        session.add(found_game)
-                        new_games_saved += 1
-
-                        # Add to public announcement pool
-                        public_games_to_announce[game.id] = game
-
-                    logger.info(f"Saved {new_games_saved} new games from '{search_config.name}' to database ({len(games) - new_games_saved} duplicates skipped)")
-
-                # PRIVATE SEARCH: Post to Discord thread only
+                if existing:
+                    logger.debug(f"Game '{game.name}' already exists in FoundGame, skipping save")
                 else:
-                    if not private_channel:
-                        logger.warning(f"Skipping private search '{search_config.name}' - no private channel configured")
-                        continue
+                    # Save to FoundGame database (for ALL games, public or not)
+                    # Extract Steam URL from websites
+                    steam_url = None
+                    if hasattr(game, 'websites') and game.websites:
+                        for website in game.websites:
+                            if website.get('category') == 13:  # Steam
+                                steam_url = website.get('url')
+                                break
 
-                    logger.info(f"Processing PRIVATE search '{search_config.name}': {len(games)} games")
+                    # If IGDB doesn't provide Steam URL, lookup via Steam API
+                    if not steam_url:
+                        steam_url = await self._lookup_steam_url(game.name)
 
-                    try:
-                        # Get or create persistent thread
-                        thread = None
-                        if search_config.discovery_thread_id:
-                            try:
-                                thread = await private_channel.guild.fetch_channel(search_config.discovery_thread_id)
-                                logger.info(f"Found existing thread {thread.id} for '{search_config.name}'")
-                            except discord.NotFound:
-                                logger.warning(f"Thread {search_config.discovery_thread_id} not found, creating new one")
-                                search_config.discovery_thread_id = None
+                    found_game = FoundGame(
+                        guild_id=guild.id,
+                        igdb_id=game.id,
+                        igdb_slug=game.slug if hasattr(game, 'slug') else None,
+                        game_name=game.name,
+                        release_date=game.release_date,
+                        summary=game.summary if hasattr(game, 'summary') else None,
+                        genres=json.dumps(game.genres) if hasattr(game, 'genres') else None,
+                        themes=json.dumps(game.themes) if hasattr(game, 'themes') else None,
+                        game_modes=json.dumps(game.game_modes) if hasattr(game, 'game_modes') else None,
+                        platforms=json.dumps(game.platforms) if hasattr(game, 'platforms') else None,
+                        cover_url=game.cover_url,
+                        igdb_url=game.igdb_url if hasattr(game, 'igdb_url') else None,
+                        steam_url=steam_url,
+                        hypes=game.hypes if hasattr(game, 'hypes') else None,
+                        rating=game.rating if hasattr(game, 'rating') else None,
+                        search_config_id=search_config.id,
+                        search_config_name=search_config.name,
+                        found_at=now,
+                        check_id=check_id
+                    )
+                    session.add(found_game)
+                    new_games_count += 1
+                    logger.info(f"Saved game '{game.name}' to FoundGame database")
 
-                        # Create new thread if needed
-                        if not thread:
-                            thread = await private_channel.create_thread(
-                                name=f"🔒 {search_config.name} - Private Discoveries",
-                                auto_archive_duration=10080  # 7 days
-                            )
-                            search_config.discovery_thread_id = thread.id
-                            logger.info(f"Created new private thread {thread.id} for '{search_config.name}'")
-
-                            # Send intro message
-                            await thread.send(
-                                f"🎮 **Private Game Discovery: {search_config.name}**\n"
-                                f"This thread contains games matching your search criteria. "
-                                f"These games are **not shown on the website** for privacy."
-                            )
-
-                            # Auto-join members with specified role (if configured)
-                            if search_config.auto_join_role_id:
-                                try:
-                                    role = private_channel.guild.get_role(search_config.auto_join_role_id)
-                                    if role:
-                                        added_count = 0
-                                        for member in role.members:
-                                            try:
-                                                await thread.add_user(member)
-                                                added_count += 1
-                                            except Exception as e:
-                                                logger.warning(f"Failed to add {member.name} to thread: {e}")
-                                        logger.info(f"Auto-joined {added_count} members with role '{role.name}' to private thread")
-                                    else:
-                                        logger.warning(f"Auto-join role {search_config.auto_join_role_id} not found")
-                                except Exception as e:
-                                    logger.error(f"Error auto-joining role members to thread: {e}")
-
-                        # Post ALL games to thread (no limit for private searches)
-                        posted_count = 0
-                        for game in games:
-                            # Check if already announced (reuse announced_games table for private threads too)
-                            already_posted = session.query(AnnouncedGame).filter(
-                                AnnouncedGame.guild_id == guild.id,
-                                AnnouncedGame.igdb_id == game.id
-                            ).first()
-
-                            if already_posted:
-                                logger.debug(f"Game '{game.name}' already posted to thread, skipping")
-                                continue
-
-                            try:
-                                # Add Steam URL lookup for private games
-                                steam_url = None
-                                if hasattr(game, 'websites') and game.websites:
-                                    # Check if IGDB already has Steam URL
-                                    for website in game.websites:
-                                        if website.get('category') == 13:  # Steam
-                                            steam_url = website.get('url')
-                                            break
-
-                                # If IGDB doesn't provide Steam URL, lookup via Steam API
-                                if not steam_url:
-                                    steam_url = await self._lookup_steam_url(game.name)
-
-                                    # Add Steam URL to game's websites for the embed
-                                    if steam_url and "/app/" in steam_url:  # Only add direct links
-                                        if not hasattr(game, 'websites') or not game.websites:
-                                            game.websites = []
-                                        game.websites.append({
-                                            'category': 13,  # Steam
-                                            'url': steam_url
-                                        })
-
-                                embed = discovery_cog.create_game_announcement_embed(game)
-                                message = await thread.send(embed=embed)
-                                new_games_count += 1
-                                posted_count += 1
-
-                                # Track that we posted this game (PRIVACY: Mask sensitive fields for private searches)
-                                announced_game = AnnouncedGame(
-                                    guild_id=guild.id,
-                                    igdb_id=game.id,  # Keep for deduplication
-                                    igdb_slug="[PRIVATE]",  # Masked
-                                    game_name="[PRIVATE]",  # Masked
-                                    release_date=None,  # Masked
-                                    genres=None,  # Masked
-                                    platforms=None,  # Masked
-                                    cover_url=None,  # Masked
-                                    announced_at=now,
-                                    announcement_message_id=message.id
-                                )
-                                session.add(announced_game)
-
-                            except Exception as e:
-                                logger.error(f"Failed to post game '{game.name}' to thread: {e}")
-                                continue
-
-                        logger.info(f"Posted {posted_count} new games to private thread for '{search_config.name}' ({len(games) - posted_count} duplicates skipped)")
-
-                    except Exception as e:
-                        logger.error(f"Failed to handle private search '{search_config.name}': {e}")
-                        continue
-
-            # Announce public games to public channel (limit to 10)
-            logger.info(f"Attempting to announce up to 10 games from {len(public_games_to_announce)} public games")
-
-            if public_channel and public_games_to_announce:
-                for game_id, game in list(public_games_to_announce.items())[:10]:
+                # ONLY record announcement for games with "Share on Discovery Network" enabled
+                if is_public:
+                    # Check if already announced
                     already_announced = session.query(AnnouncedGame).filter(
                         AnnouncedGame.guild_id == guild.id,
                         AnnouncedGame.igdb_id == game.id
                     ).first()
 
-                    if already_announced:
-                        logger.debug(f"Game '{game.name}' already announced, skipping")
-                        continue
+                    if not already_announced:
+                        # Record announcement in database (without posting individual messages)
+                        try:
+                            announced = AnnouncedGame(
+                                guild_id=guild.id,
+                                igdb_id=game.id,
+                                igdb_slug=game.slug if hasattr(game, 'slug') else None,
+                                steam_id=None,
+                                game_name=game.name,
+                                release_date=game.release_date,
+                                genres=json.dumps(game.genres) if hasattr(game, 'genres') else None,
+                                platforms=json.dumps(game.platforms),
+                                cover_url=game.cover_url,
+                                announced_at=now,
+                                announcement_message_id=None  # No individual message
+                            )
+                            session.add(announced)
+                            announced_count += 1
+                            logger.info(f"Recorded game '{game.name}' (IGDB:{game.id}) for announcement")
+                        except Exception as e:
+                            logger.error(f"Failed to record game '{game.name}' in guild {guild.id}: {e}")
 
-                    try:
-                        # Create and post announcement
-                        embed = discovery_cog.create_game_announcement_embed(game)
-                        message = await public_channel.send(embed=embed)
-                        logger.info(f"✅ Announced '{game.name}' to public channel {public_channel.name}")
+            # Send ONE summary embed for all games shared on Discovery Network
+            if announced_count > 0 and discovery_channel:
+                try:
+                    dash_url = f"https://dashboard.casual-heroes.com/questlog/guild/{guild.id}/found-games/"
+                    summary_embed = discord.Embed(
+                        title="🎮 New Games Discovered!",
+                        description=f"Found **{announced_count}** new game{'s' if announced_count != 1 else ''} matching your searches!",
+                        color=discord.Color.green()
+                    )
+                    summary_embed.add_field(
+                        name="📊 View All Games",
+                        value=f"[Click here to view all {announced_count} games on the dashboard]({dash_url})",
+                        inline=False
+                    )
+                    summary_embed.set_footer(text=f"Based on {len(search_configs)} active search configuration{'s' if len(search_configs) != 1 else ''}")
 
-                        # Record announcement
-                        announced_game = AnnouncedGame(
-                            guild_id=guild.id,
-                            igdb_id=game.id,
-                            igdb_slug=game.slug if hasattr(game, 'slug') else None,
-                            game_name=game.name,
-                            release_date=game.release_date,
-                            genres=json.dumps(game.genres),
-                            platforms=json.dumps(game.platforms),
-                            cover_url=game.cover_url,
-                            announced_at=now,
-                            announcement_message_id=message.id
-                        )
-                        session.add(announced_game)
-                        announced += 1
-                        new_games_count += 1
+                    # Add role ping if configured
+                    ping_content = None
+                    if config.public_game_ping_role_id:
+                        ping_content = f"<@&{config.public_game_ping_role_id}>"
 
-                    except Exception as e:
-                        logger.error(f"Failed to announce game '{game.name}': {e}")
-                        continue
-
-            logger.info(f"Announced {announced} games to main channel")
-
-            # Count public vs private games
-            public_searches_count = sum(1 for s, _ in searches_and_games if s.show_on_website)
-            private_searches_count = sum(1 for s, _ in searches_and_games if not s.show_on_website)
-            public_games_count = sum(len(g) for s, g in searches_and_games if s.show_on_website)
-            private_games_count = sum(len(g) for s, g in searches_and_games if not s.show_on_website)
-
-            # Post summary message to Discord
-            summary_embed = discord.Embed(
-                title="🎮 Game Discovery Check Complete",
-                description=f"Found **{total_found} games** across {len(searches_and_games)} search configurations.",
-                color=0x5865F2  # Discord blurple
-            )
-
-            if public_games_count > 0:
-                summary_embed.add_field(name="📢 Announced", value=f"{announced} games to this channel", inline=True)
-                summary_embed.add_field(name="💾 Saved", value=f"{public_games_count} games total", inline=True)
-                dashboard_url = f"https://dashboard.casual-heroes.com/questlog/guild/{guild.id}/found-games/"
-                summary_embed.add_field(
-                    name="🔗 View Public Games",
-                    value=f"[Click here to view all {public_games_count} games on the dashboard]({dashboard_url})",
-                    inline=False
-                )
-
-            if private_games_count > 0:
-                summary_embed.add_field(
-                    name="🔒 Private Discoveries",
-                    value=f"{private_games_count} games posted to {private_searches_count} private thread(s)",
-                    inline=False
-                )
-
-            summary_embed.set_footer(text="Public games → Dashboard • Private games → Discord threads")
-
-            try:
-                await summary_channel.send(embed=summary_embed)
-                logger.info(f"Posted summary: {public_games_count} public, {private_games_count} private")
-            except Exception as e:
-                logger.error(f"Failed to post summary embed: {e}")
+                    await discovery_channel.send(content=ping_content, embed=summary_embed)
+                    logger.info(f"Sent game summary for {announced_count} games in guild {guild.id}")
+                except Exception as e:
+                    logger.warning(f"Failed to send game summary in guild {guild.id}: {e}")
 
             # Update last check time
             config.last_game_check_at = now
 
-        # Build result message based on public vs private searches
-        result_message = f"🎮 Found {total_found} games across {len(searches_and_games)} searches\n"
+        # Build result message
+        dashboard_url = f"https://dashboard.casual-heroes.com/questlog/guild/{guild.id}/found-games/"
+        result_message = f"🎮 Found {total_found} games across {len(search_configs)} searches\n"
+        result_message += f"💾 Saved {new_games_count} new games to Found Games\n"
 
-        if public_games_count > 0:
-            result_message += f"📢 Announced {announced} public games to Discord\n"
-            dashboard_url = f"https://dashboard.casual-heroes.com/questlog/guild/{guild.id}/found-games/"
-            result_message += f"🔗 View all public games: {dashboard_url}"
-        else:
-            dashboard_url = None
+        if announced_count > 0:
+            result_message += f"📢 Announced {announced_count} games shared on Discovery Network\n"
 
-        if private_games_count > 0:
-            if public_games_count > 0:
-                result_message += "\n"
-            result_message += f"🔒 {private_games_count} private games posted to Discord threads"
+        result_message += f"🔗 View all games: {dashboard_url}"
 
         return {
             "success": True,
             "total_found": total_found,
             "new_games": new_games_count,
-            "announced": announced,
+            "announced": announced_count,
             "check_id": check_id,
             "message": result_message,
-            "dashboard_url": dashboard_url,
-            "public_count": public_games_count,
-            "private_count": private_games_count
+            "dashboard_url": dashboard_url
         }
 
     # ═══════════════════════════════════════════════════════════════

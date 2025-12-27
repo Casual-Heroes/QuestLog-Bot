@@ -1193,12 +1193,11 @@ class DiscoveryCog(commands.Cog):
                         logger.warning(f"Could not find guild {config.guild_id}")
                         continue
 
-                    # Verify at least one channel is accessible
-                    public_channel = guild.get_channel(config.public_game_channel_id) if config.public_game_channel_id else None
-                    private_channel = guild.get_channel(config.private_game_channel_id) if config.private_game_channel_id else None
+                    # Get the ONE discovery channel for all announcements
+                    discovery_channel = guild.get_channel(config.public_game_channel_id) if config.public_game_channel_id else None
 
-                    if not public_channel and not private_channel:
-                        logger.warning(f"Could not find any game discovery channels in guild {config.guild_id}")
+                    if not discovery_channel:
+                        logger.warning(f"Could not find game discovery channel in guild {config.guild_id}")
                         continue
 
                     # Check if IGDB is configured
@@ -1272,19 +1271,17 @@ class DiscoveryCog(commands.Cog):
 
                     logger.info(f"Total unique games found across all searches: {len(all_games_to_announce)}")
 
-                    max_public = getattr(config, "max_public_announcements", None) or 5
-                    max_private = getattr(config, "max_private_announcements", None) or 5
-                    public_sent = 0
-                    private_sent = 0
+                    # Filter to ONLY games with "Share on Discovery Network" enabled
+                    games_to_announce = []
+                    announced_count = 0
 
-                    # Announce up to configured limits for public/private games
                     for game_id, meta in all_games_to_announce.items():
                         game = meta["game"]
                         is_public = meta["is_public"]
 
-                        if is_public and public_sent >= max_public:
-                            continue
-                        if (not is_public) and private_sent >= max_private:
+                        # ONLY announce games with "Share on Discovery Network" enabled
+                        if not is_public:
+                            logger.info(f"Skipping server-only game '{game.name}' (IGDB:{game.id}) - not shared on Discovery Network")
                             continue
 
                         # Check if already announced
@@ -1296,22 +1293,10 @@ class DiscoveryCog(commands.Cog):
                         if already_announced:
                             continue
 
-                        # Pick channel based on search privacy
-                        target_channel = public_channel if is_public else private_channel
-                        if not target_channel:
-                            logger.warning(f"No target channel for game announcement in guild {config.guild_id} (public={public_channel}, private={private_channel})")
-                            continue
+                        games_to_announce.append(game)
 
-                        # Create and post announcement
+                        # Record announcement in database (without posting individual messages)
                         try:
-                            embed = self.create_game_announcement_embed(game)
-                            message = await target_channel.send(embed=embed)
-                            if is_public:
-                                public_sent += 1
-                            else:
-                                private_sent += 1
-
-                            # Record announcement
                             announced = AnnouncedGame(
                                 guild_id=config.guild_id,
                                 igdb_id=game.id,
@@ -1323,31 +1308,40 @@ class DiscoveryCog(commands.Cog):
                                 platforms=json.dumps(game.platforms),
                                 cover_url=game.cover_url,
                                 announced_at=now,
-                                announcement_message_id=message.id
+                                announcement_message_id=None  # No individual message
                             )
                             session.add(announced)
                             announced_count += 1
-
-                            logger.info(f"Announced game '{game.name}' (IGDB:{game.id}) in guild {config.guild_id}")
-
+                            logger.info(f"Recorded game '{game.name}' (IGDB:{game.id}) in guild {config.guild_id}")
                         except Exception as e:
-                            logger.error(f"Failed to announce game '{game.name}' in guild {config.guild_id}: {e}")
+                            logger.error(f"Failed to record game '{game.name}' in guild {config.guild_id}: {e}")
                             continue
 
-                    # Always post a summary embed
-                    summary_channel = public_channel or private_channel
-                    if summary_channel:
+                    # Send ONE summary embed for all games shared on Discovery Network
+                    if games_to_announce and discovery_channel:
                         try:
-                            summary_embed = self._build_game_summary_embed(
-                                guild_id=config.guild_id,
-                                total_found=len(all_games_to_announce),
-                                search_count=len(search_configs),
-                                announced_count=announced_count,
-                                target_channel=summary_channel
+                            dash_url = f"{DASHBOARD_BASE_URL}/questlog/guild/{config.guild_id}/found-games/"
+                            summary_embed = discord.Embed(
+                                title="🎮 New Games Discovered!",
+                                description=f"Found **{announced_count}** new game{'s' if announced_count != 1 else ''} matching your searches!",
+                                color=discord.Color.green()
                             )
-                            await summary_channel.send(embed=summary_embed)
+                            summary_embed.add_field(
+                                name="📊 View All Games",
+                                value=f"[Click here to view all {announced_count} games on the dashboard]({dash_url})",
+                                inline=False
+                            )
+                            summary_embed.set_footer(text=f"Based on {len(search_configs)} active search configuration{'s' if len(search_configs) != 1 else ''}")
+
+                            # Add role ping if configured
+                            ping_content = None
+                            if config.public_game_ping_role_id:
+                                ping_content = f"<@&{config.public_game_ping_role_id}>"
+
+                            await discovery_channel.send(content=ping_content, embed=summary_embed)
+                            logger.info(f"Sent game summary for {announced_count} games in guild {config.guild_id}")
                         except Exception as e:
-                            logger.warning(f"Failed to send discovery summary in guild {config.guild_id}: {e}")
+                            logger.warning(f"Failed to send game summary in guild {config.guild_id}: {e}")
 
                     logger.info(f"Game discovery for guild {config.guild_id} complete. Announced {announced_count} new games.")
 
@@ -3587,79 +3581,96 @@ class DiscoveryCog(commands.Cog):
                 await ctx.respond("❌ IGDB is not configured. Add TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET to your .env file.", ephemeral=True)
                 return
 
-            # Get at least one channel
-            public_channel = ctx.guild.get_channel(config.public_game_channel_id) if config.public_game_channel_id else None
-            private_channel = ctx.guild.get_channel(config.private_game_channel_id) if config.private_game_channel_id else None
+            # Get discovery channel (ONE channel for all announcements)
+            discovery_channel = ctx.guild.get_channel(config.public_game_channel_id) if config.public_game_channel_id else None
 
-            if not public_channel and not private_channel:
-                await ctx.respond("❌ Game discovery channels not found.", ephemeral=True)
+            if not discovery_channel:
+                await ctx.respond("❌ No game discovery channel configured.", ephemeral=True)
                 return
 
-            # Parse filters
-            genres = json.loads(config.game_genres) if config.game_genres else None
-            themes = json.loads(config.game_themes) if config.game_themes else None
-            modes = json.loads(config.game_modes) if config.game_modes else None
-            platforms = json.loads(config.game_platforms) if config.game_platforms else None
-            announcement_window = config.game_days_ahead or 30  # How far ahead to announce
-            min_hype = config.game_min_hype
-            min_rating = config.game_min_rating
+            # Get all enabled search configurations
+            search_configs = session.query(GameSearchConfig).filter(
+                GameSearchConfig.guild_id == ctx.guild.id,
+                GameSearchConfig.enabled == True
+            ).all()
 
-            # Fetch games from IGDB - search wide window (1 year) with filters
-            # Then we'll filter down to only announce games within the announcement window
-            games = []
-            try:
-                now = int(time.time())
-                games = await igdb.search_upcoming_games(
-                    days_ahead=365,  # Search next year
-                    days_behind=0,   # Only upcoming games
-                    genres=genres,
-                    themes=themes,
-                    game_modes=modes,
-                    platforms=platforms,
-                    min_hype=min_hype,
-                    min_rating=min_rating,
-                    limit=100  # Increased limit since we're filtering wider
-                )
-                logger.info(f"Found {len(games)} total games from IGDB")
-
-                # Filter to only games within announcement window
-                announcement_cutoff = now + (announcement_window * 24 * 60 * 60)
-                games = [g for g in games if g.release_date and g.release_date <= announcement_cutoff]
-                logger.info(f"Filtered to {len(games)} games within {announcement_window} day announcement window")
-            except Exception as e:
-                logger.error(f"Error fetching from IGDB: {e}")
-                await ctx.respond(f"❌ Error fetching games from IGDB: {str(e)}", ephemeral=True)
+            if not search_configs:
+                await ctx.respond("❌ No enabled search configurations found. Create searches on the web dashboard.", ephemeral=True)
                 return
 
-            if not games:
-                await ctx.respond("ℹ️ No upcoming games found matching your filters.", ephemeral=True)
+            now = int(time.time())
+            all_games_to_announce = {}  # Key: IGDB ID, Value: {game, is_public}
+
+            # Run each search configuration
+            for search_config in search_configs:
+                try:
+                    # Parse filters
+                    genres = json.loads(search_config.genres) if search_config.genres else None
+                    themes = json.loads(search_config.themes) if search_config.themes else None
+                    modes = json.loads(search_config.game_modes) if search_config.game_modes else None
+                    platforms = json.loads(search_config.platforms) if search_config.platforms else None
+                    announcement_window = search_config.days_ahead or 30
+                    min_hype = search_config.min_hype
+                    min_rating = search_config.min_rating
+
+                    # Fetch games from IGDB
+                    games = await igdb.search_upcoming_games(
+                        days_ahead=365,
+                        days_behind=0,
+                        genres=genres,
+                        themes=themes,
+                        game_modes=modes,
+                        platforms=platforms,
+                        min_hype=min_hype,
+                        min_rating=min_rating,
+                        limit=100
+                    )
+
+                    # Filter to announcement window
+                    announcement_cutoff = now + (announcement_window * 24 * 60 * 60)
+                    games = [g for g in games if g.release_date and g.release_date <= announcement_cutoff]
+
+                    # Add to master list, track privacy
+                    for game in games:
+                        if game.id not in all_games_to_announce:
+                            all_games_to_announce[game.id] = {
+                                "game": game,
+                                "is_public": bool(search_config.show_on_website),
+                            }
+
+                except Exception as e:
+                    logger.error(f"Error running search '{search_config.name}': {e}")
+                    continue
+
+            if not all_games_to_announce:
+                await ctx.respond("ℹ️ No upcoming games found matching your search filters.", ephemeral=True)
                 return
 
-            # Check which are new
-            new_games = []
-            for game in games:
+            # Filter to ONLY games with "Share on Discovery Network" enabled
+            games_to_announce = []
+            announced_count = 0
+
+            for game_id, meta in all_games_to_announce.items():
+                game = meta["game"]
+                is_public = meta["is_public"]
+
+                # ONLY announce games with "Share on Discovery Network" enabled
+                if not is_public:
+                    continue
+
+                # Check if already announced
                 already_announced = session.query(AnnouncedGame).filter(
                     AnnouncedGame.guild_id == ctx.guild.id,
                     AnnouncedGame.igdb_id == game.id
                 ).first()
 
-                if not already_announced:
-                    new_games.append(game)
+                if already_announced:
+                    continue
 
-            if not new_games:
-                await ctx.respond(f"ℹ️ Found {len(games)} upcoming games, but all have already been announced.", ephemeral=True)
-                return
+                games_to_announce.append(game)
 
-            # Announce new games (use public channel if available, else private)
-            announcement_channel = public_channel or private_channel
-            announced_count = 0
-
-            for game in new_games[:10]:  # Limit to 10 games per manual check
+                # Record announcement in database
                 try:
-                    embed = self.create_game_announcement_embed(game)
-                    message = await announcement_channel.send(embed=embed)
-
-                    # Record announcement
                     announced = AnnouncedGame(
                         guild_id=ctx.guild.id,
                         igdb_id=game.id,
@@ -3671,29 +3682,50 @@ class DiscoveryCog(commands.Cog):
                         platforms=json.dumps(game.platforms),
                         cover_url=game.cover_url,
                         announced_at=now,
-                        announcement_message_id=message.id
+                        announcement_message_id=None
                     )
                     session.add(announced)
                     announced_count += 1
-
                 except Exception as e:
-                    logger.error(f"Failed to announce game '{game.name}': {e}")
+                    logger.error(f"Failed to record game '{game.name}': {e}")
                     continue
+
+            if announced_count == 0:
+                await ctx.respond(f"ℹ️ Found {len(all_games_to_announce)} games, but all have already been announced.", ephemeral=True)
+                return
 
             # Update last check time
             config.last_game_check_at = now
 
-            summary_embed = self._build_game_summary_embed(
-                guild_id=ctx.guild.id,
-                total_found=len(games),
-                search_count=1,  # Manual command runs across current config set; using 1 to mirror dashboard button
-                announced_count=announced_count,
-                target_channel=announcement_channel
+            # Send ONE summary embed for games with "Share on Discovery Network" enabled
+            dash_url = f"{DASHBOARD_BASE_URL}/questlog/guild/{ctx.guild.id}/found-games/"
+            summary_embed = discord.Embed(
+                title="🎮 New Games Discovered!",
+                description=f"Found **{announced_count}** new game{'s' if announced_count != 1 else ''} matching your searches!",
+                color=discord.Color.green()
             )
+            summary_embed.add_field(
+                name="📊 View All Games",
+                value=f"[Click here to view all {announced_count} games on the dashboard]({dash_url})",
+                inline=False
+            )
+            public_search_count = len([s for s in search_configs if s.show_on_website])
+            summary_embed.set_footer(text=f"Based on {public_search_count} active search configuration{'s' if public_search_count != 1 else ''}")
 
-        # Send summary to channel and respond
-        await announcement_channel.send(embed=summary_embed)
-        await ctx.respond(embed=summary_embed)
+            ping_content = None
+            if config.public_game_ping_role_id:
+                ping_content = f"<@&{config.public_game_ping_role_id}>"
+
+            await discovery_channel.send(content=ping_content, embed=summary_embed)
+
+        # Respond to command
+        response_embed = discord.Embed(
+            title="✅ Game Discovery Complete",
+            description=f"Announced **{announced_count}** new game{'s' if announced_count != 1 else ''}!",
+            color=discord.Color.green()
+        )
+        response_embed.add_field(name="Dashboard", value=f"[View Games]({dash_url})", inline=False)
+        await ctx.respond(embed=response_embed)
 
     @tasks.loop(hours=1)
     async def featured_reminder_task(self):

@@ -339,6 +339,30 @@ async def on_application_command_error(
         )
 
 
+# Monkey-patch pycord's HTTP client to add better rate limit logging
+original_request = discord.http.HTTPClient.request
+
+async def patched_request(self, *args, **kwargs):
+    """Wrapper around HTTPClient.request to log rate limit details."""
+    try:
+        return await original_request(self, *args, **kwargs)
+    except discord.HTTPException as e:
+        if e.status == 429:
+            # Extract route/endpoint info
+            route = args[0] if args else "unknown"
+            logger.error(
+                f"Discord API Rate Limited (429):\n"
+                f"  Route: {route}\n"
+                f"  Status: {e.status}\n"
+                f"  Code: {e.code}\n"
+                f"  Response: {e.response}\n"
+                f"  Text: {e.text}"
+            )
+        raise
+
+discord.http.HTTPClient.request = patched_request
+
+
 
 def main():
     """Entry point for running the bot."""
