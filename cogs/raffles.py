@@ -96,9 +96,19 @@ class RafflesCog(commands.Cog):
 
         content = _render_announcement(raffle, raffle.announce_role_id, guild.name)
         entry_count = session.query(RaffleEntry).filter_by(raffle_id=raffle.id).count()
+
+        # Add link to raffle browser
+        raffle_url = f"https://dashboard.casual-heroes.com/questlog/guild/{raffle.guild_id}/raffle-browser/"
+        emoji = raffle.entry_emoji or "🎟️"
+        description = raffle.description or ""
+        if description:
+            description += f"\n\n{emoji} **React with the emoji to enter** or [**go to the dashboard!**]({raffle_url})"
+        else:
+            description = f"{emoji} **React with the emoji to enter** or [**go to the dashboard!**]({raffle_url})"
+
         embed = discord.Embed(
             title=raffle.title,
-            description=raffle.description or "",
+            description=description,
             color=discord.Color.gold()
         )
         embed.add_field(name="Cost", value=f"{raffle.cost_tokens} tokens", inline=True)
@@ -345,13 +355,37 @@ class RafflesCog(commands.Cog):
                 if not member:
                     return
 
-                # Avoid duplicate entries via reaction
-                existing = session.query(RaffleEntry).filter_by(
-                    raffle_id=raffle.id,
-                    user_id=payload.user_id
-                ).first()
-                if existing:
-                    return
+                # Check max entries per user limit
+                if raffle.max_entries_per_user:
+                    from sqlalchemy import func
+                    existing_entries = session.query(func.sum(RaffleEntry.tickets)).filter_by(
+                        raffle_id=raffle.id,
+                        user_id=payload.user_id
+                    ).scalar() or 0
+
+                    if existing_entries >= raffle.max_entries_per_user:
+                        # Remove reaction and send DM
+                        guild = self.bot.get_guild(raffle.guild_id)
+                        channel = guild.get_channel(payload.channel_id) if guild else None
+                        try:
+                            if channel:
+                                message = await channel.fetch_message(msg_id)
+                                user = guild.get_member(payload.user_id)
+                                await message.remove_reaction(payload.emoji, user)
+                                # Send DM to user explaining they hit the limit
+                                try:
+                                    await user.send(
+                                        f"❌ You've already reached the maximum entries for **{raffle.title}**.\n"
+                                        f"**Max entries per person:** {raffle.max_entries_per_user}\n"
+                                        f"**Your entries:** {existing_entries}\n\n"
+                                        f"This limit applies across both Discord reactions and dashboard entries."
+                                    )
+                                except Exception:
+                                    # User has DMs disabled, skip
+                                    pass
+                        except Exception:
+                            pass
+                        return
 
                 cost = raffle.cost_tokens
                 if member.hero_tokens < cost:

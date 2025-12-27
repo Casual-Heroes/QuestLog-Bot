@@ -1957,6 +1957,7 @@ class Raffle(Base):
     description = Column(Text, nullable=True)
     cost_tokens = Column(Integer, default=0)
     max_winners = Column(Integer, default=1)
+    max_entries_per_user = Column(Integer, nullable=True)  # Max entries one person can buy (null = unlimited)
     start_at = Column(BigInteger, nullable=True)
     end_at = Column(BigInteger, nullable=True)
     auto_pick = Column(Boolean, default=False)
