@@ -1,12 +1,11 @@
 # cogs/billing.py - Stripe Billing & Subscriptions
 """
-Stripe integration for QuestLog subscriptions.
+Stripe integration for QuestLog modular subscriptions.
 
 Features:
-- Checkout session creation for Premium/Pro upgrades
 - Webhook handler for subscription lifecycle events
-- Subscription management commands
-- Lifetime purchase handling
+- View subscription plan command
+- All subscription management handled via dashboard
 
 Webhook Events Handled:
 - checkout.session.completed - New subscription started
@@ -17,8 +16,7 @@ Webhook Events Handled:
 
 Setup:
 1. Set STRIPE_API_KEY and STRIPE_WEBHOOK_SECRET in environment
-2. Set STRIPE_PRICE_* environment variables for each plan
-3. Configure webhook endpoint in Stripe Dashboard to point to your server
+2. Configure webhook endpoint in Stripe Dashboard to point to your server
 """
 
 import time
@@ -38,11 +36,17 @@ from models import Guild, Subscription, SubscriptionTier
 # Import Stripe if available
 try:
     import stripe
-    stripe.api_key = STRIPE_API_KEY
-    STRIPE_AVAILABLE = bool(STRIPE_API_KEY)
+    # Check if we have a valid Stripe API key (not placeholder)
+    if STRIPE_API_KEY and not STRIPE_API_KEY.endswith('_your_key_here'):
+        stripe.api_key = STRIPE_API_KEY
+        STRIPE_AVAILABLE = True
+    else:
+        STRIPE_AVAILABLE = False
+        logger.warning("Stripe API key not configured - billing features disabled")
 except ImportError:
     STRIPE_AVAILABLE = False
     stripe = None
+    logger.warning("Stripe library not installed - billing features disabled")
 
 
 class BillingCog(commands.Cog):
@@ -345,7 +349,7 @@ class BillingCog(commands.Cog):
                 f"Your subscription for **{guild.name}** has ended.\n\n"
                 "The server has been downgraded to the **Free** tier. "
                 "All your data is preserved, but some features are now limited.\n\n"
-                "Use `/billing upgrade` to reactivate your subscription!"
+                f"[Reactivate your subscription](https://questlog.gg/guild/{guild_id}/billing)"
             ),
             color=discord.Color.red()
         )
@@ -388,11 +392,11 @@ class BillingCog(commands.Cog):
 
     # Slash commands
 
-    @billing.command(name="status", description="View your server's subscription status")
+    @billing.command(name="plan", description="View your server's subscription plan")
     @discord.default_permissions(manage_guild=True)
     @commands.has_permissions(manage_guild=True)
-    async def billing_status(self, ctx: discord.ApplicationContext):
-        """View subscription status."""
+    async def billing_plan(self, ctx: discord.ApplicationContext):
+        """View current subscription plan and active modules."""
         with db_session_scope() as session:
             db_guild = session.get(Guild, ctx.guild.id)
 
@@ -400,23 +404,59 @@ class BillingCog(commands.Cog):
                 await ctx.respond("Guild not found in database.", ephemeral=True)
                 return
 
-            tier = db_guild.subscription_tier.upper() if db_guild.subscription_tier else "FREE"
-            is_vip = db_guild.is_vip
+            # Get active modules
+            active_modules = []
+            if db_guild.engagement_enabled:
+                active_modules.append("Engagement Suite")
+            if db_guild.roles_enabled:
+                active_modules.append("Role Management")
+            if db_guild.mod_enabled:
+                active_modules.append("Moderation & Security")
+            if db_guild.discovery_enabled:
+                active_modules.append("Discovery & Promotion")
+            if db_guild.lfg_enabled:
+                active_modules.append("Events & Attendance")
+
+            # Check if complete bundle (all 5 modules)
+            has_complete = len(active_modules) == 5
+
+            # Get billing cycle and expiration
+            billing_cycle = db_guild.billing_cycle or "monthly"
             expires = db_guild.subscription_expires
+            is_lifetime = billing_cycle == "lifetime" or db_guild.is_vip
 
             embed = discord.Embed(
-                title=f"{self._tier_emoji(tier)} Subscription Status",
-                color=discord.Color.gold() if tier != "FREE" else discord.Color.greyple()
+                title="📋 Your Subscription Plan",
+                description=(
+                    f"**{ctx.guild.name}** is using QuestLog's modular subscription system.\n"
+                    f"Visit the [dashboard](https://questlog.gg/guild/{ctx.guild.id}/billing) to manage your subscription."
+                ),
+                color=discord.Color.gold() if active_modules else discord.Color.greyple()
             )
+
+            # Current plan
+            if has_complete:
+                plan_name = "Complete Suite"
+                if is_lifetime:
+                    plan_value = "Complete Suite (Lifetime)"
+                else:
+                    cycle_display = billing_cycle.replace("3month", "3-Month").replace("6month", "6-Month").title()
+                    plan_value = f"Complete Suite ({cycle_display})"
+            elif active_modules:
+                plan_name = f"{len(active_modules)} Module{'s' if len(active_modules) > 1 else ''}"
+                plan_value = ", ".join(active_modules)
+            else:
+                plan_name = "Free Tier"
+                plan_value = "No paid modules active"
 
             embed.add_field(
                 name="Current Plan",
-                value=f"**{tier}**" + (" (VIP)" if is_vip else ""),
-                inline=True
+                value=plan_value,
+                inline=False
             )
 
-            if expires and not is_vip:
-                expires_dt = datetime.fromtimestamp(expires, tz=timezone.utc)
+            # Expiration/renewal
+            if expires and not is_lifetime:
                 if expires > int(time.time()):
                     embed.add_field(
                         name="Renews",
@@ -425,238 +465,43 @@ class BillingCog(commands.Cog):
                     )
                 else:
                     embed.add_field(
-                        name="Expired",
-                        value=f"<t:{expires}:R>",
+                        name="Status",
+                        value=f"Expired <t:{expires}:R>",
                         inline=True
                     )
-            elif is_vip:
+            elif is_lifetime:
                 embed.add_field(
                     name="Expires",
                     value="Never (Lifetime)",
                     inline=True
                 )
 
-            # Show limits
-            limits = FeatureLimits.get_limits(tier)
-            key_limits = [
-                ("Bulk Operations", limits.get("bulk_users_per_action") or "Unlimited"),
-                ("Audit Log Retention", f"{limits.get('mod_log_days', 7)} days"),
-                ("Daily Self-Promo", limits.get("self_promo_per_day") or "Unlimited"),
-                ("Templates", limits.get("templates") or "Unlimited"),
-            ]
-
-            limit_text = "\n".join([f"**{k}:** {v}" for k, v in key_limits])
-            embed.add_field(name="Current Limits", value=limit_text, inline=False)
-
-            if tier == "FREE":
+            # Active modules list
+            if active_modules:
+                modules_text = "\n".join([f"✅ {module}" for module in active_modules])
                 embed.add_field(
-                    name="Upgrade",
-                    value="Use `/billing upgrade` to unlock more features!",
+                    name=f"Active Modules ({len(active_modules)}/5)",
+                    value=modules_text,
                     inline=False
                 )
 
-        await ctx.respond(embed=embed, ephemeral=True)
-
-    @billing.command(name="plans", description="View available subscription plans")
-    async def billing_plans(self, ctx: discord.ApplicationContext):
-        """View available plans and pricing."""
-        embed = discord.Embed(
-            title="QuestLog Subscription Plans",
-            description="All features available on all tiers - only quantities differ!",
-            color=discord.Color.gold()
-        )
-
-        # Free tier
-        embed.add_field(
-            name=" FREE",
-            value=(
-                "**$0/month**\n"
-                "10 users per bulk op\n"
-                "5 templates\n"
-                "7-day audit logs\n"
-                "2 self-promo/day"
-            ),
-            inline=True
-        )
-
-        # Premium tier
-        embed.add_field(
-            name=" PREMIUM",
-            value=(
-                f"**${Pricing.PREMIUM_MONTHLY}/month**\n"
-                f"*${Pricing.PREMIUM_YEARLY}/year (30% off)*\n\n"
-                "100 users per bulk op\n"
-                "25 templates\n"
-                "30-day audit logs\n"
-                "10 self-promo/day\n"
-                "Featured pool access\n"
-                "Game server sync"
-            ),
-            inline=True
-        )
-
-        # Pro tier
-        embed.add_field(
-            name=" PRO",
-            value=(
-                f"**${Pricing.PRO_MONTHLY}/month**\n"
-                f"*${Pricing.PRO_YEARLY}/year (30% off)*\n"
-                f"*${Pricing.PRO_LIFETIME} lifetime*\n\n"
-                "**UNLIMITED** everything\n"
-                "90-day audit logs\n"
-                "Discovery network\n"
-                "Custom branding\n"
-                "API access\n"
-                "Priority support"
-            ),
-            inline=True
-        )
-
-        # Discounts
-        discount_text = "\n".join([
-            " **Veterans/First Responders:** 30-35% off",
-            " **Yearly billing:** 30% off",
-            " **Game server bundle:** 40% off (stacks with yearly!)",
-        ])
-        embed.add_field(name="Available Discounts", value=discount_text, inline=False)
-
-        embed.set_footer(text="Use /billing upgrade to get started!")
-
-        await ctx.respond(embed=embed, ephemeral=True)
-
-    @billing.command(name="upgrade", description="Upgrade your server's subscription")
-    @discord.default_permissions(administrator=True)
-    @commands.has_permissions(administrator=True)
-    @discord.option("plan", str, description="Plan to upgrade to",
-                    choices=["premium_monthly", "premium_yearly", "pro_monthly", "pro_yearly", "pro_lifetime"])
-    async def billing_upgrade(self, ctx: discord.ApplicationContext, plan: str):
-        """Create Stripe checkout session for upgrade."""
-        if not STRIPE_AVAILABLE:
-            await ctx.respond(
-                "Billing is not configured. Please contact the bot owner.",
-                ephemeral=True
-            )
-            return
-
-        price_id = STRIPE_PRICES.get(plan.replace("pro_lifetime", "lifetime"))
-        if not price_id:
-            await ctx.respond("Invalid plan selected.", ephemeral=True)
-            return
-
-        # Check if already subscribed
-        with db_session_scope() as session:
-            db_guild = session.get(Guild, ctx.guild.id)
-            if db_guild and db_guild.is_vip:
-                await ctx.respond("This server already has lifetime access!", ephemeral=True)
-                return
-
-        await ctx.defer(ephemeral=True)
-
-        try:
-            # Create checkout session
-            mode = "payment" if "lifetime" in plan else "subscription"
-
-            checkout_session = stripe.checkout.Session.create(
-                payment_method_types=["card"],
-                line_items=[{"price": price_id, "quantity": 1}],
-                mode=mode,
-                success_url=f"https://discord.com/channels/{ctx.guild.id}?payment=success",
-                cancel_url=f"https://discord.com/channels/{ctx.guild.id}?payment=cancelled",
-                metadata={
-                    "guild_id": str(ctx.guild.id),
-                    "guild_name": ctx.guild.name,
-                    "user_id": str(ctx.author.id),
-                    "plan": plan,
-                },
-                customer_email=None,  # Let Stripe collect
-                allow_promotion_codes=True,
-            )
-
-            embed = discord.Embed(
-                title="Complete Your Purchase",
-                description=(
-                    f"Click the button below to upgrade **{ctx.guild.name}** to **{plan.replace('_', ' ').title()}**!\n\n"
-                    "You'll be redirected to our secure payment page."
-                ),
-                color=discord.Color.gold()
-            )
-
-            # Create button view
+            # Manage subscription button
             view = discord.ui.View()
             view.add_item(discord.ui.Button(
-                label="Proceed to Checkout",
-                url=checkout_session.url,
-                style=discord.ButtonStyle.link
+                label="Manage Subscription",
+                url=f"https://questlog.gg/guild/{ctx.guild.id}/billing",
+                style=discord.ButtonStyle.link,
+                emoji="💳"
             ))
 
-            await ctx.respond(embed=embed, view=view, ephemeral=True)
-
-        except stripe.error.StripeError as e:
-            logger.error(f"Stripe error creating checkout: {e}")
-            await ctx.respond(
-                f"Error creating checkout session: {e.user_message or 'Unknown error'}",
-                ephemeral=True
-            )
-
-    @billing.command(name="manage", description="Manage your subscription (billing portal)")
-    @discord.default_permissions(administrator=True)
-    @commands.has_permissions(administrator=True)
-    async def billing_manage(self, ctx: discord.ApplicationContext):
-        """Open Stripe billing portal for subscription management."""
-        if not STRIPE_AVAILABLE:
-            await ctx.respond("Billing is not configured.", ephemeral=True)
-            return
-
-        with db_session_scope() as session:
-            db_guild = session.get(Guild, ctx.guild.id)
-            if not db_guild or not db_guild.stripe_customer_id:
-                await ctx.respond(
-                    "No billing account found. Use `/billing upgrade` first.",
-                    ephemeral=True
+            if not active_modules:
+                embed.add_field(
+                    name="Get Started",
+                    value="Visit the dashboard to subscribe and unlock premium features!",
+                    inline=False
                 )
-                return
-            customer_id = db_guild.stripe_customer_id
 
-        await ctx.defer(ephemeral=True)
-
-        try:
-            portal_session = stripe.billing_portal.Session.create(
-                customer=customer_id,
-                return_url=f"https://discord.com/channels/{ctx.guild.id}",
-            )
-
-            embed = discord.Embed(
-                title="Manage Your Subscription",
-                description=(
-                    "Click below to open the billing portal where you can:\n"
-                    " Update payment method\n"
-                    " Change plan\n"
-                    " View invoices\n"
-                    " Cancel subscription"
-                ),
-                color=discord.Color.blurple()
-            )
-
-            view = discord.ui.View()
-            view.add_item(discord.ui.Button(
-                label="Open Billing Portal",
-                url=portal_session.url,
-                style=discord.ButtonStyle.link
-            ))
-
-            await ctx.respond(embed=embed, view=view, ephemeral=True)
-
-        except stripe.error.StripeError as e:
-            logger.error(f"Stripe error creating portal session: {e}")
-            await ctx.respond(f"Error: {e.user_message or 'Unknown error'}", ephemeral=True)
-
-    @billing.command(name="cancel", description="Cancel your subscription")
-    @discord.default_permissions(administrator=True)
-    @commands.has_permissions(administrator=True)
-    async def billing_cancel(self, ctx: discord.ApplicationContext):
-        """Cancel subscription (redirects to billing portal)."""
-        # Just redirect to manage portal
-        await self.billing_manage(ctx)
+        await ctx.respond(embed=embed, view=view, ephemeral=True)
 
 
 def setup(bot: commands.Bot):

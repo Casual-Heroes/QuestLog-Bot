@@ -292,6 +292,7 @@ class GuildMember(Base):
     is_quarantined = Column(Boolean, default=False)
     quarantined_at = Column(BigInteger, nullable=True)
     quarantine_reason = Column(String(500), nullable=True)
+    quarantined_roles = Column(Text, nullable=True)  # JSON array of role IDs to restore on unjail
     warn_count = Column(Integer, default=0)
 
     # Timestamps

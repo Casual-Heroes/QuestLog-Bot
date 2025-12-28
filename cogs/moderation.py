@@ -381,21 +381,25 @@ class ModerationCog(commands.Cog):
             return False
 
         try:
-            # Remove all other roles (except @everyone and managed roles)
+            # Save current roles before removing (except @everyone and managed roles)
             roles_to_remove = [r for r in user.roles if not r.is_default() and not r.managed]
+            saved_role_ids = [str(r.id) for r in roles_to_remove]
+
             if roles_to_remove:
                 await user.remove_roles(*roles_to_remove, reason=f"Jailed: {reason}")
 
             # Add jail role
             await user.add_roles(jail_role, reason=f"Jailed: {reason}")
 
-            # Update database
+            # Update database with saved roles
+            import json
             with db_session_scope() as session:
                 db_member = session.get(GuildMember, (guild.id, user.id))
                 if db_member:
                     db_member.is_quarantined = True
                     db_member.quarantined_at = int(time.time())
                     db_member.quarantine_reason = f"Jailed: {reason}"
+                    db_member.quarantined_roles = json.dumps(saved_role_ids)
 
             return True
         except discord.Forbidden:
@@ -403,32 +407,52 @@ class ModerationCog(commands.Cog):
             return False
 
     async def _unjail_user(self, guild: discord.Guild, user: discord.Member, reason: str):
-        """Remove jail role from user."""
+        """Remove jail role from user and restore previous roles."""
+        import json
+
         with db_session_scope() as session:
             db_guild = session.get(Guild, guild.id)
             if not db_guild or not db_guild.jail_role_id:
                 return False
             jail_role_id = db_guild.jail_role_id
-            verified_role_id = db_guild.verified_role_id
+
+            # Get saved roles
+            db_member = session.get(GuildMember, (guild.id, user.id))
+            saved_role_ids = []
+            if db_member and db_member.quarantined_roles:
+                try:
+                    saved_role_ids = json.loads(db_member.quarantined_roles)
+                except:
+                    saved_role_ids = []
 
         jail_role = guild.get_role(jail_role_id)
         if not jail_role or jail_role not in user.roles:
             return False
 
         try:
+            # Remove jail role
             await user.remove_roles(jail_role, reason=f"Unjailed: {reason}")
 
-            # Add back verified role if exists
-            if verified_role_id:
-                verified_role = guild.get_role(verified_role_id)
-                if verified_role:
-                    await user.add_roles(verified_role, reason="Unjailed - restoring verified role")
+            # Restore saved roles
+            if saved_role_ids:
+                roles_to_add = []
+                for role_id_str in saved_role_ids:
+                    try:
+                        role = guild.get_role(int(role_id_str))
+                        if role:
+                            roles_to_add.append(role)
+                    except:
+                        pass
+
+                if roles_to_add:
+                    await user.add_roles(*roles_to_add, reason=f"Unjailed - restoring previous roles: {reason}")
 
             # Update database
             with db_session_scope() as session:
                 db_member = session.get(GuildMember, (guild.id, user.id))
                 if db_member:
                     db_member.is_quarantined = False
+                    db_member.quarantined_roles = None
 
             # Log the action
             await self.log_mod_action(guild.id, guild.me, "unjail", user, reason)
@@ -1023,45 +1047,75 @@ class ModerationCog(commands.Cog):
             db_guild.jail_role_id = jail_role.id
             db_guild.jail_channel_id = jail_channel.id
 
-        # Set up permissions on the jail channel
+        # Set up permissions
+        await ctx.respond("Setting up jail permissions... This may take a moment.", ephemeral=True)
+
         try:
-            # Jail role can view and send in jail channel
-            await jail_channel.set_permissions(
-                jail_role,
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                reason="Jail system setup"
-            )
-            # @everyone cannot view jail channel
-            await jail_channel.set_permissions(
-                ctx.guild.default_role,
-                view_channel=False,
-                reason="Jail system setup"
-            )
-        except discord.Forbidden:
-            await ctx.respond("I couldn't set up permissions on the jail channel.", ephemeral=True)
+            # Set permissions on ALL channels
+            permissions_set = 0
+            permissions_failed = 0
+
+            for channel in ctx.guild.channels:
+                try:
+                    if channel.id == jail_channel.id:
+                        # Jail role can view and send in jail channel
+                        await jail_channel.set_permissions(
+                            jail_role,
+                            view_channel=True,
+                            send_messages=True,
+                            read_message_history=True,
+                            reason="Jail system setup"
+                        )
+                        # @everyone cannot view jail channel
+                        await jail_channel.set_permissions(
+                            ctx.guild.default_role,
+                            view_channel=False,
+                            reason="Jail system setup"
+                        )
+                    else:
+                        # Jail role cannot view any other channel
+                        await channel.set_permissions(
+                            jail_role,
+                            view_channel=False,
+                            reason="Jail system setup - deny access"
+                        )
+                    permissions_set += 1
+                except discord.Forbidden:
+                    permissions_failed += 1
+                    continue
+                except Exception as e:
+                    logger.warning(f"Error setting permissions on {channel.name}: {e}")
+                    permissions_failed += 1
+                    continue
+
+        except Exception as e:
+            await ctx.edit(content=f"Error setting up permissions: {e}", ephemeral=True)
             return
 
         embed = discord.Embed(
-            title="Jail System Configured",
-            description="The jail system has been set up!",
+            title="✅ Jail System Configured",
+            description=f"The jail system has been set up successfully!\n\n**Permissions configured:** {permissions_set} channels\n**Failed:** {permissions_failed} channels",
             color=discord.Color.green()
         )
         embed.add_field(name="Jail Role", value=jail_role.mention, inline=True)
         embed.add_field(name="Jail Channel", value=jail_channel.mention, inline=True)
         embed.add_field(
-            name="Important",
+            name="✅ What was configured",
             value=(
-                "Make sure the jail role:\n"
-                "1. Denies `View Channel` on ALL other channels\n"
-                "2. Is below the bot's role in the hierarchy\n"
-                "3. Has no dangerous permissions"
+                f"• Jail role can **only** view {jail_channel.mention}\n"
+                f"• Jail role **cannot view** all other channels\n"
+                f"• {jail_channel.mention} is hidden from @everyone"
             ),
             inline=False
         )
+        if permissions_failed > 0:
+            embed.add_field(
+                name="⚠️ Note",
+                value=f"{permissions_failed} channel(s) could not be configured due to missing permissions. Manually set permissions on those channels to deny the jail role.",
+                inline=False
+            )
 
-        await ctx.respond(embed=embed, ephemeral=True)
+        await ctx.edit(content=None, embed=embed)
 
     # Auto-mod configuration
 
