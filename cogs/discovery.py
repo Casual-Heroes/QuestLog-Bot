@@ -176,7 +176,8 @@ class DiscoveryCog(commands.Cog):
         self.bot = bot
         self.featured_selection_task.start()
         self.game_discovery_task.start()
-        self.forum_scanner_task.start()
+        # DISABLED: forum_scanner_task - redundant with on_thread_create event listener (line 519)
+        # self.forum_scanner_task.start()
         self.creator_of_week_task.start()
         self.creator_of_month_task.start()
         self.cleanup_inactive_creators_task.start()
@@ -186,7 +187,8 @@ class DiscoveryCog(commands.Cog):
     def cog_unload(self):
         self.featured_selection_task.cancel()
         self.game_discovery_task.cancel()
-        self.forum_scanner_task.cancel()
+        # forum_scanner_task disabled - not started, no need to cancel
+        # self.forum_scanner_task.cancel()
         self.creator_of_week_task.cancel()
         self.cotw_cotm_auto_rotation_task.cancel()
         self.creator_of_month_task.cancel()
