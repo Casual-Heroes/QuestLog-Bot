@@ -31,7 +31,7 @@ from config import (
     STRIPE_API_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICES,
     Pricing, FeatureLimits
 )
-from models import Guild, Subscription, SubscriptionTier
+from models import Guild, Subscription, SubscriptionTier, GuildModule
 
 # Import Stripe if available
 try:
@@ -349,7 +349,7 @@ class BillingCog(commands.Cog):
                 f"Your subscription for **{guild.name}** has ended.\n\n"
                 "The server has been downgraded to the **Free** tier. "
                 "All your data is preserved, but some features are now limited.\n\n"
-                f"[Reactivate your subscription](https://questlog.gg/guild/{guild_id}/billing)"
+                f"[Reactivate your subscription](https://dashboard.casual-heroes.com/questlog/guild/{guild_id}/billing/)"
             ),
             color=discord.Color.red()
         )
@@ -404,50 +404,48 @@ class BillingCog(commands.Cog):
                 await ctx.respond("Guild not found in database.", ephemeral=True)
                 return
 
-            # Get active modules
-            active_modules = []
-            if db_guild.engagement_enabled:
-                active_modules.append("Engagement Suite")
-            if db_guild.roles_enabled:
-                active_modules.append("Role Management")
-            if db_guild.mod_enabled:
-                active_modules.append("Moderation & Security")
-            if db_guild.discovery_enabled:
-                active_modules.append("Discovery & Promotion")
-            if db_guild.lfg_enabled:
-                active_modules.append("Events & Attendance")
+            # Query active modules
+            active_modules = session.query(GuildModule).filter(
+                GuildModule.guild_id == ctx.guild.id,
+                GuildModule.enabled == True
+            ).all()
 
-            # Check if complete bundle (all 5 modules)
-            has_complete = len(active_modules) == 5
+            # Module name mapping
+            module_display_names = {
+                'engagement': '🔥 Engagement Suite',
+                'roles': '👥 Role Management',
+                'moderation': '🛡️ Moderation & Security',
+                'discovery': '⭐ Discovery & Promotion',
+                'lfg': '📅 Events & Attendance'
+            }
 
-            # Get billing cycle and expiration
+            # Get subscription info
+            tier = db_guild.subscription_tier if db_guild.subscription_tier else "free"
             billing_cycle = db_guild.billing_cycle or "monthly"
             expires = db_guild.subscription_expires
             is_lifetime = billing_cycle == "lifetime" or db_guild.is_vip
+            has_complete = tier.lower() == "complete" or len(active_modules) == 5
 
             embed = discord.Embed(
                 title="📋 Your Subscription Plan",
                 description=(
                     f"**{ctx.guild.name}** is using QuestLog's modular subscription system.\n"
-                    f"Visit the [dashboard](https://questlog.gg/guild/{ctx.guild.id}/billing) to manage your subscription."
+                    f"Visit the [dashboard](https://dashboard.casual-heroes.com/questlog/guild/{ctx.guild.id}/billing/) to manage your subscription."
                 ),
                 color=discord.Color.gold() if active_modules else discord.Color.greyple()
             )
 
             # Current plan
             if has_complete:
-                plan_name = "Complete Suite"
                 if is_lifetime:
-                    plan_value = "Complete Suite (Lifetime)"
+                    plan_value = "Complete Suite (Lifetime) ✨"
                 else:
                     cycle_display = billing_cycle.replace("3month", "3-Month").replace("6month", "6-Month").title()
                     plan_value = f"Complete Suite ({cycle_display})"
             elif active_modules:
-                plan_name = f"{len(active_modules)} Module{'s' if len(active_modules) > 1 else ''}"
-                plan_value = ", ".join(active_modules)
+                plan_value = f"{len(active_modules)} Module{'s' if len(active_modules) != 1 else ''} Active"
             else:
-                plan_name = "Free Tier"
-                plan_value = "No paid modules active"
+                plan_value = "Free Tier - All features available with limits"
 
             embed.add_field(
                 name="Current Plan",
@@ -466,40 +464,51 @@ class BillingCog(commands.Cog):
                 else:
                     embed.add_field(
                         name="Status",
-                        value=f"Expired <t:{expires}:R>",
+                        value=f"⚠️ Expired <t:{expires}:R>",
                         inline=True
                     )
             elif is_lifetime:
                 embed.add_field(
                     name="Expires",
-                    value="Never (Lifetime)",
+                    value="Never ♾️",
                     inline=True
                 )
 
-            # Active modules list
+            # Show active modules
             if active_modules:
-                modules_text = "\n".join([f"✅ {module}" for module in active_modules])
+                modules_list = []
+                for module in active_modules:
+                    display_name = module_display_names.get(module.module_name, module.module_name.title())
+                    modules_list.append(display_name)
+
                 embed.add_field(
                     name=f"Active Modules ({len(active_modules)}/5)",
-                    value=modules_text,
+                    value="\n".join(modules_list),
+                    inline=False
+                )
+            else:
+                embed.add_field(
+                    name="Free Tier Limits",
+                    value=(
+                        "• Up to 3 raffles\n"
+                        "• 2 reaction role menus\n"
+                        "• 3 templates\n"
+                        "• 7-day audit logs"
+                    ),
                     inline=False
                 )
 
             # Manage subscription button
             view = discord.ui.View()
             view.add_item(discord.ui.Button(
-                label="Manage Subscription",
-                url=f"https://questlog.gg/guild/{ctx.guild.id}/billing",
+                label="Manage Subscription" if active_modules else "Upgrade Now",
+                url=f"https://dashboard.casual-heroes.com/questlog/guild/{ctx.guild.id}/billing/",
                 style=discord.ButtonStyle.link,
                 emoji="💳"
             ))
 
             if not active_modules:
-                embed.add_field(
-                    name="Get Started",
-                    value="Visit the dashboard to subscribe and unlock premium features!",
-                    inline=False
-                )
+                embed.set_footer(text="💡 Upgrade to unlock unlimited features and support development!")
 
         await ctx.respond(embed=embed, view=view, ephemeral=True)
 

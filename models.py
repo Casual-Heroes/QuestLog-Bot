@@ -228,6 +228,7 @@ class Guild(Base):
     verification_config = relationship("VerificationConfig", back_populates="guild", uselist=False, cascade="all, delete-orphan")
     level_roles = relationship("LevelRole", back_populates="guild", cascade="all, delete-orphan")
     react_roles = relationship("ReactRole", back_populates="guild", cascade="all, delete-orphan")
+    creator_profiles = relationship("CreatorProfile", back_populates="guild", cascade="all, delete-orphan")
 
     def is_premium(self) -> bool:
         """Check if guild has active premium or VIP status."""
@@ -241,6 +242,43 @@ class Guild(Base):
 
     def __repr__(self):
         return f"<Guild(id={self.guild_id}, name={self.guild_name}, tier={self.subscription_tier})>"
+
+
+# Guild Modules (Modular Subscription System)
+
+class GuildModule(Base):
+    """
+    Tracks which modules each guild has subscribed to.
+    Supports modular pricing where guilds can subscribe to individual modules.
+    """
+    __tablename__ = "guild_modules"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    guild_id = Column(BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"), nullable=False)
+    module_name = Column(String(50), nullable=False)  # 'engagement', 'roles', 'moderation', 'discovery', 'lfg'
+    enabled = Column(Boolean, nullable=False, default=True)
+
+    # Stripe subscription info for this specific module
+    stripe_subscription_id = Column(String(255), nullable=True)
+    stripe_product_id = Column(String(255), nullable=True)
+    stripe_price_id = Column(String(255), nullable=True)
+
+    # Expiration
+    expires_at = Column(BigInteger, nullable=True)
+
+    # Activation tracking
+    activated_at = Column(BigInteger, nullable=False, default=lambda: int(time.time()))
+    activated_by = Column(BigInteger, nullable=True)  # User ID who activated
+
+    __table_args__ = (
+        Index("idx_guild_module_guild", "guild_id"),
+        Index("idx_guild_module_name", "module_name"),
+        Index("idx_guild_module_subscription", "stripe_subscription_id"),
+        UniqueConstraint("guild_id", "module_name", name="uq_guild_module"),
+    )
+
+    def __repr__(self):
+        return f"<GuildModule(guild_id={self.guild_id}, module={self.module_name}, enabled={self.enabled})>"
 
 
 # Guild Member
@@ -725,6 +763,8 @@ class DiscoveryConfig(Base):
     cotm_last_message_id = Column(BigInteger, nullable=True)  # Last COTM message ID (for deletion)
     cotm_last_posted_at = Column(BigInteger, nullable=True)  # Unix timestamp of last COTM post
     cotm_last_featured_user_id = Column(BigInteger, nullable=True)  # Last featured user (to avoid repeats)
+    cotm_auto_rotate = Column(Boolean, default=False)  # Enable automatic monthly rotation
+    cotm_rotation_day = Column(Integer, default=1)  # Day of month to rotate (1-31)
 
     # Creator of the Week (PRO)
     cotw_enabled = Column(Boolean, default=False)  # Enable Creator of the Week feature
@@ -732,6 +772,8 @@ class DiscoveryConfig(Base):
     cotw_last_message_id = Column(BigInteger, nullable=True)  # Last COTW message ID (for deletion)
     cotw_last_posted_at = Column(BigInteger, nullable=True)  # Unix timestamp of last COTW post
     cotw_last_featured_user_id = Column(BigInteger, nullable=True)  # Last featured user (to avoid repeats)
+    cotw_auto_rotate = Column(Boolean, default=False)  # Enable automatic weekly rotation
+    cotw_rotation_day = Column(Integer, default=1)  # Day of week to rotate (0=Monday, 6=Sunday)
 
     # Feature rotation settings
     feature_interval_hours = Column(Integer, default=3)  # Hours between random feature picks
@@ -783,6 +825,13 @@ class DiscoveryConfig(Base):
     game_min_hype = Column(Integer, nullable=True)  # Minimum hype score (follows before release) for game announcements
     game_min_rating = Column(Integer, nullable=True)  # Minimum rating (IGDB Double field) for game announcements
     last_game_check_at = Column(BigInteger, nullable=True)  # Last time we checked for new games
+
+    # Network Creator Announcements (opt-in to see Network COTW/COTM in your server)
+    network_announcements_enabled = Column(Boolean, default=False)  # Receive Network COTW/COTM announcements
+    network_announcement_channel_id = Column(BigInteger, nullable=True)  # Channel to post network creator announcements
+
+    # Custom Role Flair System (badges/prefixes for creators)
+    role_flair_config = Column(Text, nullable=True)  # JSON: [{"role_id": 123, "flair_text": "Verified Streamer", "flair_icon": "🎮", "color": "#5865F2"}]
 
     # Timestamps
     created_at = Column(BigInteger, default=lambda: int(time.time()))
@@ -2129,4 +2178,189 @@ class DiscoveryNetworkBan(Base):
     __table_args__ = (
         Index("idx_discovery_ban_user", "user_id"),
         Index("idx_discovery_ban_appeal", "appeal_submitted", "appeal_reviewed"),
+    )
+
+
+# ============================================================================
+# CREATOR DISCOVERY SYSTEM - Phase 1
+# ============================================================================
+
+class StreamPlatform(str, Enum):
+    """Supported streaming platforms."""
+    TWITCH = "twitch"
+    YOUTUBE = "youtube"
+    KICK = "kick"
+
+
+class CreatorProfile(Base):
+    """
+    Creator profiles - Users who register as content creators.
+    One profile per user per guild (can be in multiple guilds).
+    """
+    __tablename__ = "creator_profiles"
+
+    # Primary key
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # Identity
+    discord_id = Column(BigInteger, nullable=False, index=True)
+    guild_id = Column(BigInteger, ForeignKey("guilds.guild_id"), nullable=False, index=True)
+
+    # Profile content
+    display_name = Column(String(100), nullable=False)  # How they want to be shown
+    bio = Column(Text, nullable=True)  # Max 500 chars enforced in form
+    content_categories = Column(Text, nullable=True)  # JSON array: ["Gaming", "Art", "Music"]
+
+    # Social media handles (not linked, just for display)
+    twitter_handle = Column(String(100), nullable=True)
+    tiktok_handle = Column(String(100), nullable=True)
+    instagram_handle = Column(String(100), nullable=True)
+    bluesky_handle = Column(String(100), nullable=True)
+    twitch_handle = Column(String(100), nullable=True)
+    youtube_handle = Column(String(100), nullable=True)
+
+    # Stream schedule (free text field)
+    stream_schedule = Column(Text, nullable=True)
+
+    # Stats and metadata
+    times_featured = Column(Integer, default=0)  # COTW/COTM count
+    is_current_cotw = Column(Boolean, default=False)  # Currently Creator of the Week (guild-specific)
+    is_current_cotm = Column(Boolean, default=False)  # Currently Creator of the Month (guild-specific)
+    cotw_last_featured = Column(BigInteger, nullable=True)  # Timestamp (guild-specific)
+    cotm_last_featured = Column(BigInteger, nullable=True)  # Timestamp (guild-specific)
+
+    # Network-level featured creator status (separate from guild-specific)
+    is_current_network_cotw = Column(Boolean, default=False)  # Currently Network Creator of the Week
+    is_current_network_cotm = Column(Boolean, default=False)  # Currently Network Creator of the Month
+    network_cotw_last_featured = Column(BigInteger, nullable=True)  # Timestamp
+    network_cotm_last_featured = Column(BigInteger, nullable=True)  # Timestamp
+
+    # Discovery Network opt-in
+    share_to_network = Column(Boolean, default=False)  # Can admins share this creator to network?
+
+    # Timestamps
+    created_at = Column(BigInteger, nullable=False, default=lambda: int(time.time()))
+    updated_at = Column(BigInteger, nullable=False, default=lambda: int(time.time()), onupdate=lambda: int(time.time()))
+
+    # Relationships
+    guild = relationship("Guild", back_populates="creator_profiles")
+    linked_accounts = relationship("LinkedAccount", back_populates="creator_profile", cascade="all, delete-orphan")
+    stream_sessions = relationship("LiveStreamSession", back_populates="creator_profile", cascade="all, delete-orphan", foreign_keys="LiveStreamSession.creator_profile_id")
+
+    __table_args__ = (
+        UniqueConstraint("discord_id", "guild_id", name="uq_creator_per_guild"),
+        Index("idx_creator_guild", "guild_id"),
+        Index("idx_creator_discord", "discord_id"),
+        Index("idx_creator_cotw", "is_current_cotw"),
+        Index("idx_creator_cotm", "is_current_cotm"),
+        Index("idx_creator_network", "share_to_network"),
+    )
+
+
+class LinkedAccount(Base):
+    """
+    OAuth-linked streaming accounts (Twitch, YouTube, Kick).
+    Stores encrypted tokens and platform-specific data.
+    Discovery Module feature only.
+    """
+    __tablename__ = "linked_accounts"
+
+    # Primary key
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # Foreign keys
+    creator_profile_id = Column(Integer, ForeignKey("creator_profiles.id"), nullable=False, index=True)
+
+    # Platform info
+    platform = Column(SQLEnum(StreamPlatform), nullable=False)
+    platform_user_id = Column(String(255), nullable=False)  # Twitch user ID, YouTube channel ID, etc.
+    platform_username = Column(String(255), nullable=False)  # Display name on platform
+    platform_avatar_url = Column(Text, nullable=True)  # Profile picture from platform
+
+    # OAuth tokens (encrypted in production)
+    access_token = Column(Text, nullable=False)  # Encrypted
+    refresh_token = Column(Text, nullable=True)  # Encrypted
+    token_expires_at = Column(BigInteger, nullable=True)  # Unix timestamp
+
+    # Verification
+    is_verified = Column(Boolean, default=False)  # Verified ownership
+    is_partner = Column(Boolean, default=False)  # Twitch Partner, YouTube Partner, etc.
+
+    # Stats (cached from API)
+    follower_count = Column(Integer, default=0)
+    subscriber_count = Column(Integer, default=0)  # YouTube or Twitch subs
+    last_follower_milestone = Column(Integer, default=0)  # Last milestone celebrated (100, 1000, etc.)
+
+    # Polling metadata
+    last_checked = Column(BigInteger, nullable=False, default=lambda: int(time.time()))
+    is_currently_live = Column(Boolean, default=False, index=True)
+
+    # Timestamps
+    linked_at = Column(BigInteger, nullable=False, default=lambda: int(time.time()))
+    updated_at = Column(BigInteger, nullable=False, default=lambda: int(time.time()), onupdate=lambda: int(time.time()))
+
+    # Relationships
+    creator_profile = relationship("CreatorProfile", back_populates="linked_accounts")
+
+    __table_args__ = (
+        UniqueConstraint("creator_profile_id", "platform", name="uq_one_platform_per_creator"),
+        Index("idx_linked_platform", "platform"),
+        Index("idx_linked_live_status", "is_currently_live"),
+        Index("idx_linked_last_checked", "last_checked"),
+    )
+
+
+class LiveStreamSession(Base):
+    """
+    Tracks individual live stream sessions.
+    Created when creator goes live, ended when stream stops.
+    Discovery Module feature only.
+    """
+    __tablename__ = "live_stream_sessions"
+
+    # Primary key
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # Foreign keys
+    creator_profile_id = Column(Integer, ForeignKey("creator_profiles.id"), nullable=False, index=True)
+    linked_account_id = Column(Integer, ForeignKey("linked_accounts.id"), nullable=False, index=True)
+
+    # Stream metadata
+    platform = Column(SQLEnum(StreamPlatform), nullable=False)
+    stream_title = Column(Text, nullable=True)
+    game_category = Column(String(255), nullable=True)  # Game/category being streamed
+    thumbnail_url = Column(Text, nullable=True)
+    stream_url = Column(Text, nullable=False)  # Direct link to stream (NO EMBED)
+
+    # Session timing
+    started_at = Column(BigInteger, nullable=False, index=True)
+    ended_at = Column(BigInteger, nullable=True, index=True)
+    duration_seconds = Column(Integer, nullable=True)  # Calculated when ended
+
+    # Analytics
+    peak_viewers = Column(Integer, default=0)
+    average_viewers = Column(Integer, default=0)
+
+    # Discord announcement tracking
+    announcement_channel_id = Column(BigInteger, nullable=True)  # Where it was announced
+    announcement_message_id = Column(BigInteger, nullable=True)  # Message ID for deletion
+    announcement_deleted = Column(Boolean, default=False)  # Track if we deleted it
+
+    # Raid tracking (Phase 2 feature)
+    raided_to_creator_id = Column(Integer, ForeignKey("creator_profiles.id"), nullable=True)  # Who they raided
+    raided_from_creator_id = Column(Integer, ForeignKey("creator_profiles.id"), nullable=True)  # Who raided them
+    raid_viewer_count = Column(Integer, nullable=True)
+
+    # Timestamps
+    created_at = Column(BigInteger, nullable=False, default=lambda: int(time.time()))
+
+    # Relationships
+    creator_profile = relationship("CreatorProfile", back_populates="stream_sessions", foreign_keys=[creator_profile_id])
+    linked_account = relationship("LinkedAccount")
+
+    __table_args__ = (
+        Index("idx_stream_creator", "creator_profile_id"),
+        Index("idx_stream_platform", "platform"),
+        Index("idx_stream_active", "ended_at"),  # NULL = still live
+        Index("idx_stream_timing", "started_at", "ended_at"),
     )

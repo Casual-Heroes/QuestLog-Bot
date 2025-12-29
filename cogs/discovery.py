@@ -181,12 +181,14 @@ class DiscoveryCog(commands.Cog):
         self.creator_of_month_task.start()
         self.cleanup_inactive_creators_task.start()
         self.featured_reminder_task.start()
+        self.cotw_cotm_auto_rotation_task.start()
 
     def cog_unload(self):
         self.featured_selection_task.cancel()
         self.game_discovery_task.cancel()
         self.forum_scanner_task.cancel()
         self.creator_of_week_task.cancel()
+        self.cotw_cotm_auto_rotation_task.cancel()
         self.creator_of_month_task.cancel()
         self.cleanup_inactive_creators_task.cancel()
         self.featured_reminder_task.cancel()
@@ -3888,6 +3890,401 @@ class DiscoveryCog(commands.Cog):
             except Exception as e:
                 logger.error(f"Failed to send featured reminder: {e}")
                 await ctx.respond(f"❌ Failed to send reminder: {str(e)}", ephemeral=True)
+
+    # ====== COTW/COTM Auto-Rotation Task ======
+
+    @tasks.loop(hours=24)  # Run daily at midnight UTC
+    async def cotw_cotm_auto_rotation_task(self):
+        """
+        Automatic rotation task for Creator of the Week and Creator of the Month.
+        Checks each guild's auto-rotation settings and rotates on the configured day.
+        """
+        from datetime import datetime, timezone
+        import calendar
+
+        now = datetime.now(timezone.utc)
+        current_weekday = now.weekday()  # 0=Monday, 6=Sunday
+        current_day_of_month = now.day   # 1-31
+
+        # Get the last day of the current month
+        last_day_of_month = calendar.monthrange(now.year, now.month)[1]
+
+        logger.info(f"[COTW/COTM Auto-Rotation] Running daily check (Weekday: {current_weekday}, Day of Month: {current_day_of_month}/{last_day_of_month})")
+
+        with db_session_scope() as session:
+            # Get all guilds with auto-rotation enabled
+            configs = session.query(DiscoveryConfig).filter(
+                (DiscoveryConfig.cotw_auto_rotate == True) | (DiscoveryConfig.cotm_auto_rotate == True)
+            ).all()
+
+            logger.info(f"[COTW/COTM Auto-Rotation] Found {len(configs)} guilds with auto-rotation enabled")
+
+            for config in configs:
+                try:
+                    guild = self.bot.get_guild(config.guild_id)
+                    if not guild:
+                        continue
+
+                    # Check COTW rotation
+                    if config.cotw_enabled and config.cotw_auto_rotate and config.cotw_rotation_day == current_weekday:
+                        await self._rotate_creator_of_week(session, guild, config)
+
+                    # Check COTM rotation
+                    # If configured day is beyond this month's length, rotate on the last day instead
+                    if config.cotm_enabled and config.cotm_auto_rotate:
+                        rotation_day = min(config.cotm_rotation_day, last_day_of_month)
+                        if current_day_of_month == rotation_day:
+                            await self._rotate_creator_of_month(session, guild, config)
+
+                except Exception as e:
+                    logger.error(f"[COTW/COTM Auto-Rotation] Error processing guild {config.guild_id}: {e}", exc_info=True)
+
+            # Network-wide COTW/COTM rotation (runs every Sunday for COTW, 1st of month for COTM)
+            try:
+                # Rotate Network COTW every Sunday (6=Sunday)
+                if current_weekday == 6:
+                    await self._rotate_network_creator_of_week(session)
+
+                # Rotate Network COTM on the 1st of each month
+                if current_day_of_month == 1:
+                    await self._rotate_network_creator_of_month(session)
+
+            except Exception as e:
+                logger.error(f"[Network COTW/COTM Auto-Rotation] Error during network rotation: {e}", exc_info=True)
+
+    @cotw_cotm_auto_rotation_task.before_loop
+    async def before_cotw_cotm_auto_rotation_task(self):
+        await self.bot.wait_until_ready()
+
+    async def _rotate_creator_of_week(self, session, guild: discord.Guild, config: DiscoveryConfig):
+        """Rotate Creator of the Week for a guild."""
+        from models import CreatorProfile
+        from sqlalchemy import or_
+
+        logger.info(f"[COTW Rotation] Rotating Creator of the Week for guild {guild.id} ({guild.name})")
+
+        # Calculate cooldown timestamp (2 weeks = 14 days)
+        cooldown_seconds = 14 * 24 * 60 * 60  # 14 days in seconds
+        cooldown_timestamp = int(time.time()) - cooldown_seconds
+
+        # Get all eligible creators for this guild
+        # Exclude: current COTW, current COTM, and anyone who was COTW in the last 2 weeks
+        eligible_creators = session.query(CreatorProfile).filter(
+            CreatorProfile.guild_id == guild.id,
+            CreatorProfile.is_current_cotw == False,
+            CreatorProfile.is_current_cotm == False,  # Don't pick current COTM
+            or_(
+                CreatorProfile.cotw_last_featured == None,  # Never been COTW before
+                CreatorProfile.cotw_last_featured < cooldown_timestamp  # Last COTW was 2+ weeks ago
+            )
+        ).all()
+
+        if not eligible_creators:
+            logger.warning(f"[COTW Rotation] No eligible creators for guild {guild.id}")
+            return
+
+        # Clear previous COTW
+        session.query(CreatorProfile).filter(
+            CreatorProfile.guild_id == guild.id,
+            CreatorProfile.is_current_cotw == True
+        ).update({'is_current_cotw': False})
+
+        # Randomly select new COTW
+        new_cotw = random.choice(eligible_creators)
+        new_cotw.is_current_cotw = True
+        new_cotw.cotw_last_featured = int(time.time())
+        session.commit()
+
+        logger.info(f"[COTW Rotation] Selected {new_cotw.display_name} ({new_cotw.discord_id}) as new COTW for guild {guild.id}")
+
+        # Post announcement to Discord if channel is configured
+        if config.cotw_channel_id:
+            channel = guild.get_channel(config.cotw_channel_id)
+            if channel:
+                try:
+                    member = guild.get_member(new_cotw.discord_id)
+                    if member:
+                        embed = discord.Embed(
+                            title="🏆 Creator of the Week",
+                            description=f"Congratulations to **{new_cotw.display_name}** ({member.mention}) for being selected as this week's featured creator!",
+                            color=discord.Color.gold()
+                        )
+
+                        if new_cotw.bio:
+                            embed.add_field(name="About", value=new_cotw.bio[:1024], inline=False)
+
+                        if member.avatar:
+                            embed.set_thumbnail(url=member.avatar.url)
+
+                        embed.add_field(
+                            name="View Profile",
+                            value=f"[See full creator profile](https://dashboard.casual-heroes.com/questlog/guild/{guild.id}/featured-creators/)",
+                            inline=False
+                        )
+
+                        embed.set_footer(text="Auto-rotated weekly • Manually set COTW on Featured Creators page to override")
+                        embed.timestamp = discord.utils.utcnow()
+
+                        await channel.send(embed=embed)
+                        logger.info(f"[COTW Rotation] Posted announcement to channel {channel.id}")
+                except Exception as e:
+                    logger.error(f"[COTW Rotation] Failed to post announcement: {e}", exc_info=True)
+
+    async def _rotate_creator_of_month(self, session, guild: discord.Guild, config: DiscoveryConfig):
+        """Rotate Creator of the Month for a guild."""
+        from models import CreatorProfile
+        from sqlalchemy import or_
+
+        logger.info(f"[COTM Rotation] Rotating Creator of the Month for guild {guild.id} ({guild.name})")
+
+        # Calculate cooldown timestamp (2 months = 60 days)
+        cooldown_seconds = 60 * 24 * 60 * 60  # 60 days in seconds
+        cooldown_timestamp = int(time.time()) - cooldown_seconds
+
+        # Get all eligible creators for this guild
+        # Exclude: current COTM, current COTW, and anyone who was COTM in the last 2 months
+        eligible_creators = session.query(CreatorProfile).filter(
+            CreatorProfile.guild_id == guild.id,
+            CreatorProfile.is_current_cotm == False,
+            CreatorProfile.is_current_cotw == False,  # Don't pick current COTW
+            or_(
+                CreatorProfile.cotm_last_featured == None,  # Never been COTM before
+                CreatorProfile.cotm_last_featured < cooldown_timestamp  # Last COTM was 2+ months ago
+            )
+        ).all()
+
+        if not eligible_creators:
+            logger.warning(f"[COTM Rotation] No eligible creators for guild {guild.id}")
+            return
+
+        # Clear previous COTM
+        session.query(CreatorProfile).filter(
+            CreatorProfile.guild_id == guild.id,
+            CreatorProfile.is_current_cotm == True
+        ).update({'is_current_cotm': False})
+
+        # Randomly select new COTM
+        new_cotm = random.choice(eligible_creators)
+        new_cotm.is_current_cotm = True
+        new_cotm.cotm_last_featured = int(time.time())
+        session.commit()
+
+        logger.info(f"[COTM Rotation] Selected {new_cotm.display_name} ({new_cotm.discord_id}) as new COTM for guild {guild.id}")
+
+        # Post announcement to Discord if channel is configured
+        if config.cotm_channel_id:
+            channel = guild.get_channel(config.cotm_channel_id)
+            if channel:
+                try:
+                    member = guild.get_member(new_cotm.discord_id)
+                    if member:
+                        embed = discord.Embed(
+                            title="👑 Creator of the Month",
+                            description=f"Congratulations to **{new_cotm.display_name}** ({member.mention}) for being selected as this month's featured creator!",
+                            color=discord.Color.purple()
+                        )
+
+                        if new_cotm.bio:
+                            embed.add_field(name="About", value=new_cotm.bio[:1024], inline=False)
+
+                        if member.avatar:
+                            embed.set_thumbnail(url=member.avatar.url)
+
+                        embed.add_field(
+                            name="View Profile",
+                            value=f"[See full creator profile](https://dashboard.casual-heroes.com/questlog/guild/{guild.id}/featured-creators/)",
+                            inline=False
+                        )
+
+                        embed.set_footer(text="Auto-rotated monthly • Manually set COTM on Featured Creators page to override")
+                        embed.timestamp = discord.utils.utcnow()
+
+                        await channel.send(embed=embed)
+                        logger.info(f"[COTM Rotation] Posted announcement to channel {channel.id}")
+                except Exception as e:
+                    logger.error(f"[COTM Rotation] Failed to post announcement: {e}", exc_info=True)
+
+    async def _rotate_network_creator_of_week(self, session):
+        """Rotate Network Creator of the Week (cross-server discovery)."""
+        from models import CreatorProfile, DiscoveryConfig
+        from sqlalchemy import or_
+
+        logger.info(f"[Network COTW Rotation] Starting network-wide Creator of the Week rotation")
+
+        # Calculate cooldown timestamp (2 weeks = 14 days)
+        cooldown_seconds = 14 * 24 * 60 * 60  # 14 days in seconds
+        cooldown_timestamp = int(time.time()) - cooldown_seconds
+
+        # Get all eligible creators from the network (share_to_network=True)
+        # Exclude: current Network COTW, current Network COTM, and anyone who was Network COTW in the last 2 weeks
+        eligible_creators = session.query(CreatorProfile).filter(
+            CreatorProfile.share_to_network == True,
+            CreatorProfile.is_current_network_cotw == False,
+            CreatorProfile.is_current_network_cotm == False,  # Don't pick current Network COTM
+            or_(
+                CreatorProfile.network_cotw_last_featured == None,  # Never been Network COTW before
+                CreatorProfile.network_cotw_last_featured < cooldown_timestamp  # Last Network COTW was 2+ weeks ago
+            )
+        ).all()
+
+        if not eligible_creators:
+            logger.warning(f"[Network COTW Rotation] No eligible creators for network rotation")
+            return
+
+        # Clear previous Network COTW
+        session.query(CreatorProfile).filter(
+            CreatorProfile.is_current_network_cotw == True
+        ).update({'is_current_network_cotw': False})
+
+        # Randomly select new Network COTW
+        new_cotw = random.choice(eligible_creators)
+        new_cotw.is_current_network_cotw = True
+        new_cotw.network_cotw_last_featured = int(time.time())
+        session.commit()
+
+        logger.info(f"[Network COTW Rotation] Selected {new_cotw.display_name} ({new_cotw.discord_id}) from guild {new_cotw.guild_id} as new Network COTW")
+
+        # Post announcement to all opted-in guilds
+        await self._announce_network_creator(session, new_cotw, "COTW")
+
+    async def _rotate_network_creator_of_month(self, session):
+        """Rotate Network Creator of the Month (cross-server discovery)."""
+        from models import CreatorProfile, DiscoveryConfig
+        from sqlalchemy import or_
+
+        logger.info(f"[Network COTM Rotation] Starting network-wide Creator of the Month rotation")
+
+        # Calculate cooldown timestamp (2 months = 60 days)
+        cooldown_seconds = 60 * 24 * 60 * 60  # 60 days in seconds
+        cooldown_timestamp = int(time.time()) - cooldown_seconds
+
+        # Get all eligible creators from the network (share_to_network=True)
+        # Exclude: current Network COTM, current Network COTW, and anyone who was Network COTM in the last 2 months
+        eligible_creators = session.query(CreatorProfile).filter(
+            CreatorProfile.share_to_network == True,
+            CreatorProfile.is_current_network_cotm == False,
+            CreatorProfile.is_current_network_cotw == False,  # Don't pick current Network COTW
+            or_(
+                CreatorProfile.network_cotm_last_featured == None,  # Never been Network COTM before
+                CreatorProfile.network_cotm_last_featured < cooldown_timestamp  # Last Network COTM was 2+ months ago
+            )
+        ).all()
+
+        if not eligible_creators:
+            logger.warning(f"[Network COTM Rotation] No eligible creators for network rotation")
+            return
+
+        # Clear previous Network COTM
+        session.query(CreatorProfile).filter(
+            CreatorProfile.is_current_network_cotm == True
+        ).update({'is_current_network_cotm': False})
+
+        # Randomly select new Network COTM
+        new_cotm = random.choice(eligible_creators)
+        new_cotm.is_current_network_cotm = True
+        new_cotm.network_cotm_last_featured = int(time.time())
+        session.commit()
+
+        logger.info(f"[Network COTM Rotation] Selected {new_cotm.display_name} ({new_cotm.discord_id}) from guild {new_cotm.guild_id} as new Network COTM")
+
+        # Post announcement to all opted-in guilds
+        await self._announce_network_creator(session, new_cotm, "COTM")
+
+    async def _announce_network_creator(self, session, creator_profile, award_type: str):
+        """
+        Announce Network COTW/COTM to all opted-in guilds.
+
+        Args:
+            creator_profile: The CreatorProfile that was selected
+            award_type: "COTW" or "COTM"
+        """
+        from models import DiscoveryConfig
+
+        # Get all guilds that opted in to network announcements
+        configs = session.query(DiscoveryConfig).filter(
+            DiscoveryConfig.network_announcements_enabled == True,
+            DiscoveryConfig.network_announcement_channel_id != None
+        ).all()
+
+        logger.info(f"[Network {award_type} Announcement] Posting to {len(configs)} opted-in guilds")
+
+        # Prepare embed details
+        if award_type == "COTW":
+            title = "🏆 Network Creator of the Week"
+            description = f"Congratulations to **{creator_profile.display_name}** for being selected as this week's featured creator across the QuestLog network!"
+            color = discord.Color.gold()
+            footer_text = "Auto-rotated weekly • View all creators on Discovery Network"
+        else:  # COTM
+            title = "👑 Network Creator of the Month"
+            description = f"Congratulations to **{creator_profile.display_name}** for being selected as this month's featured creator across the QuestLog network!"
+            color = discord.Color.purple()
+            footer_text = "Auto-rotated monthly • View all creators on Discovery Network"
+
+        # Get the creator's home guild for avatar
+        home_guild = self.bot.get_guild(creator_profile.guild_id)
+        home_member = home_guild.get_member(creator_profile.discord_id) if home_guild else None
+
+        # Post to each opted-in guild
+        for config in configs:
+            try:
+                guild = self.bot.get_guild(config.guild_id)
+                if not guild:
+                    continue
+
+                channel = guild.get_channel(config.network_announcement_channel_id)
+                if not channel:
+                    logger.warning(f"[Network {award_type} Announcement] Channel {config.network_announcement_channel_id} not found in guild {guild.id}")
+                    continue
+
+                embed = discord.Embed(
+                    title=title,
+                    description=description,
+                    color=color
+                )
+
+                if creator_profile.bio:
+                    embed.add_field(name="About", value=creator_profile.bio[:1024], inline=False)
+
+                # Add home server info
+                if home_guild:
+                    embed.add_field(name="Home Server", value=home_guild.name, inline=True)
+
+                # Add social links if available
+                social_links = []
+                if creator_profile.twitch_handle:
+                    social_links.append(f"[Twitch](https://twitch.tv/{creator_profile.twitch_handle})")
+                if creator_profile.youtube_handle:
+                    social_links.append(f"[YouTube](https://youtube.com/@{creator_profile.youtube_handle})")
+                if creator_profile.twitter_handle:
+                    social_links.append(f"[Twitter](https://twitter.com/{creator_profile.twitter_handle})")
+                if creator_profile.tiktok_handle:
+                    social_links.append(f"[TikTok](https://tiktok.com/@{creator_profile.tiktok_handle})")
+                if creator_profile.instagram_handle:
+                    social_links.append(f"[Instagram](https://instagram.com/{creator_profile.instagram_handle})")
+                if creator_profile.bluesky_handle:
+                    social_links.append(f"[Bluesky](https://bsky.app/profile/{creator_profile.bluesky_handle})")
+
+                if social_links:
+                    embed.add_field(name="Follow", value=" • ".join(social_links), inline=False)
+
+                # Add avatar from home server
+                if home_member and home_member.avatar:
+                    embed.set_thumbnail(url=home_member.avatar.url)
+
+                embed.add_field(
+                    name="View Profile",
+                    value=f"[See full creator profile](https://dashboard.casual-heroes.com/discovery-network/featured-creators/)",
+                    inline=False
+                )
+
+                embed.set_footer(text=footer_text)
+                embed.timestamp = discord.utils.utcnow()
+
+                await channel.send(embed=embed)
+                logger.info(f"[Network {award_type} Announcement] Posted to guild {guild.id} ({guild.name}) in channel {channel.id}")
+
+            except Exception as e:
+                logger.error(f"[Network {award_type} Announcement] Failed to post to guild {config.guild_id}: {e}", exc_info=True)
 
 
 def setup(bot: commands.Bot):
