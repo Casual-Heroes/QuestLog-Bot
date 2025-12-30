@@ -1960,6 +1960,8 @@ class ActionProcessorCog(commands.Cog):
         from models import LFGGroup, LFGGame, LFGConfig, LFGMember
         from db import get_db_session
 
+        logger.info(f"🔵 BOT: Starting LFG thread creation - payload: {payload}")
+
         group_id = payload.get('group_id')
         if not group_id:
             raise ValueError("group_id is required")
@@ -1968,11 +1970,17 @@ class ActionProcessorCog(commands.Cog):
         with get_db_session() as session:
             group = session.query(LFGGroup).filter_by(id=group_id).first()
             if not group:
+                logger.error(f"❌ BOT: LFG group {group_id} not found in database")
                 raise ValueError(f"LFG group {group_id} not found")
+
+            logger.info(f"✅ BOT: Found group {group_id}: {group.thread_name}")
 
             game = session.query(LFGGame).filter_by(id=group.game_id).first()
             if not game:
+                logger.error(f"❌ BOT: Game {group.game_id} not found in database")
                 raise ValueError(f"Game {group.game_id} not found")
+
+            logger.info(f"✅ BOT: Found game {game.id}: {game.game_name}")
 
             config = session.query(LFGConfig).filter_by(guild_id=guild.id).first()
 
@@ -1982,11 +1990,17 @@ class ActionProcessorCog(commands.Cog):
             # Get channel
             channel_id = payload.get('channel_id') or (config.browser_notify_channel_id if config else None)
             if not channel_id:
+                logger.error(f"❌ BOT: No channel configured for LFG notifications")
                 raise ValueError("No channel configured for LFG notifications")
+
+            logger.info(f"🔵 BOT: Using channel_id: {channel_id}")
 
             channel = guild.get_channel(int(channel_id))
             if not channel:
+                logger.error(f"❌ BOT: Channel {channel_id} not found in guild {guild.name}")
                 raise ValueError(f"Channel {channel_id} not found")
+
+            logger.info(f"✅ BOT: Found channel: {channel.name} (#{channel.id})")
 
             # Get creator's data from database to build thread name
             creator_member = session.query(LFGMember).filter_by(
@@ -1994,21 +2008,35 @@ class ActionProcessorCog(commands.Cog):
                 is_creator=True
             ).first()
 
+            # Get creator's Discord display name (not username)
+            creator_name = "Unknown"
+            if creator_member:
+                # Try to get the actual display name from Discord member object
+                discord_member = guild.get_member(int(creator_member.user_id))
+                if discord_member:
+                    # Pycord: Use nick (server nickname) if set, otherwise try display_name
+                    # display_name in pycord returns the "display name" which is the global display name
+                    creator_name = discord_member.nick if discord_member.nick else str(discord_member.display_name)
+                else:
+                    creator_name = creator_member.display_name  # Fallback to stored name
+
             # Build thread name: "Title - Game - Creator"
-            creator_name = creator_member.display_name if creator_member else "Unknown"
             title = group.thread_name or "LFG Group"
             thread_name = f"{title} - {game.game_name} - {creator_name}"
 
             # Create thread
+            logger.info(f"🔵 BOT: Creating thread '{thread_name[:100]}' in channel {channel.name}")
             thread = await channel.create_thread(
                 name=thread_name[:100],  # Discord 100 char limit
                 type=discord.ChannelType.public_thread,
-                auto_archive_duration=1440  # 24 hours
+                auto_archive_duration=10080  # 7 days (in minutes)
             )
+            logger.info(f"✅ BOT: Thread created! ID: {thread.id}, Name: {thread.name}")
 
             # Update group with thread ID
             group.thread_id = thread.id
             session.commit()
+            logger.info(f"✅ BOT: Updated group {group_id} with thread_id {thread.id}")
 
             # Ping role and auto-invite members if ping_role_id is set
             if group.ping_role_id:
