@@ -630,6 +630,451 @@ async def mod_unjail(request):
         return web.json_response({'error': 'An internal error occurred. Please try again later.'}, status=500)
 
 
+async def announce_cotw(request):
+    """Announce Creator of the Week - delete old message and post new announcement."""
+    try:
+        data = await request.json()
+
+        guild_id = int(data.get('guild_id'))
+        user_id = int(data.get('user_id'))
+        channel_id = int(data.get('channel_id'))
+        old_message_id = data.get('old_message_id')
+
+        if not bot_instance:
+            return web.json_response({'error': 'Bot not ready'}, status=503)
+
+        guild = bot_instance.get_guild(guild_id)
+        if not guild:
+            return web.json_response({'error': 'Guild not found'}, status=404)
+
+        channel = guild.get_channel(channel_id)
+        if not channel:
+            return web.json_response({'error': 'Channel not found'}, status=404)
+
+        # Delete old announcement message if it exists
+        if old_message_id:
+            try:
+                old_message = await channel.fetch_message(int(old_message_id))
+                await old_message.delete()
+                logger.info(f"Deleted old COTW announcement message {old_message_id} in guild {guild_id}")
+            except Exception as e:
+                logger.warning(f"Failed to delete old COTW message {old_message_id}: {e}")
+
+        # Get creator profile from database
+        from db import get_db_session
+        from models import CreatorProfile, DiscoveryConfig
+
+        with get_db_session() as db:
+            profile = db.query(CreatorProfile).filter_by(
+                guild_id=guild_id,
+                discord_id=user_id
+            ).first()
+
+            if not profile:
+                return web.json_response({'error': 'Creator profile not found'}, status=404)
+
+            # Create announcement embed
+            member = guild.get_member(user_id)
+            if not member:
+                return web.json_response({'error': 'Member not found in guild'}, status=404)
+
+            embed = discord.Embed(
+                title="🏆 Creator of the Week",
+                description=f"Congratulations to {member.mention}!",
+                color=discord.Color.gold()
+            )
+            embed.set_thumbnail(url=member.display_avatar.url)
+
+            if profile.bio:
+                embed.add_field(name="About", value=profile.bio[:1024], inline=False)
+
+            # Add social links
+            social_links = []
+            if profile.twitch_handle:
+                social_links.append(f"[Twitch](https://twitch.tv/{profile.twitch_handle})")
+            if profile.youtube_handle:
+                social_links.append(f"[YouTube](https://youtube.com/@{profile.youtube_handle})")
+            elif profile.youtube_url:
+                social_links.append(f"[YouTube]({profile.youtube_url})")
+            if profile.twitter_handle:
+                social_links.append(f"[Twitter](https://twitter.com/{profile.twitter_handle})")
+            if profile.tiktok_handle:
+                social_links.append(f"[TikTok](https://tiktok.com/@{profile.tiktok_handle})")
+            if profile.instagram_handle:
+                social_links.append(f"[Instagram](https://instagram.com/{profile.instagram_handle})")
+            if profile.bluesky_handle:
+                social_links.append(f"[Bluesky](https://bsky.app/profile/{profile.bluesky_handle})")
+
+            if social_links:
+                embed.add_field(name="Links", value=" • ".join(social_links), inline=False)
+
+            embed.set_footer(text="Check out their content!")
+
+            # Post new announcement
+            new_message = await channel.send(embed=embed)
+
+            # Update database with new message ID
+            config = db.query(DiscoveryConfig).filter_by(guild_id=guild_id).first()
+            if config:
+                config.cotw_last_message_id = new_message.id
+                import time
+                config.cotw_last_posted_at = int(time.time())
+                config.cotw_last_featured_user_id = user_id
+                db.commit()
+
+            logger.info(f"Posted new COTW announcement for user {user_id} in guild {guild_id}, message {new_message.id}")
+            return web.json_response({'success': True, 'message_id': new_message.id})
+
+    except Exception as e:
+        logger.error(f"Error announcing COTW: {e}", exc_info=True)
+        return web.json_response({'error': str(e)}, status=500)
+
+
+async def announce_cotm(request):
+    """Announce Creator of the Month - delete old message and post new announcement."""
+    try:
+        data = await request.json()
+
+        guild_id = int(data.get('guild_id'))
+        user_id = int(data.get('user_id'))
+        channel_id = int(data.get('channel_id'))
+        old_message_id = data.get('old_message_id')
+
+        if not bot_instance:
+            return web.json_response({'error': 'Bot not ready'}, status=503)
+
+        guild = bot_instance.get_guild(guild_id)
+        if not guild:
+            return web.json_response({'error': 'Guild not found'}, status=404)
+
+        channel = guild.get_channel(channel_id)
+        if not channel:
+            return web.json_response({'error': 'Channel not found'}, status=404)
+
+        # Delete old announcement message if it exists
+        if old_message_id:
+            try:
+                old_message = await channel.fetch_message(int(old_message_id))
+                await old_message.delete()
+                logger.info(f"Deleted old COTM announcement message {old_message_id} in guild {guild_id}")
+            except Exception as e:
+                logger.warning(f"Failed to delete old COTM message {old_message_id}: {e}")
+
+        # Get creator profile from database
+        from db import get_db_session
+        from models import CreatorProfile, DiscoveryConfig
+
+        with get_db_session() as db:
+            profile = db.query(CreatorProfile).filter_by(
+                guild_id=guild_id,
+                discord_id=user_id
+            ).first()
+
+            if not profile:
+                return web.json_response({'error': 'Creator profile not found'}, status=404)
+
+            # Create announcement embed
+            member = guild.get_member(user_id)
+            if not member:
+                return web.json_response({'error': 'Member not found in guild'}, status=404)
+
+            embed = discord.Embed(
+                title="👑 Creator of the Month",
+                description=f"Congratulations to {member.mention}!",
+                color=discord.Color.purple()
+            )
+            embed.set_thumbnail(url=member.display_avatar.url)
+
+            if profile.bio:
+                embed.add_field(name="About", value=profile.bio[:1024], inline=False)
+
+            # Add social links
+            social_links = []
+            if profile.twitch_handle:
+                social_links.append(f"[Twitch](https://twitch.tv/{profile.twitch_handle})")
+            if profile.youtube_handle:
+                social_links.append(f"[YouTube](https://youtube.com/@{profile.youtube_handle})")
+            elif profile.youtube_url:
+                social_links.append(f"[YouTube]({profile.youtube_url})")
+            if profile.twitter_handle:
+                social_links.append(f"[Twitter](https://twitter.com/{profile.twitter_handle})")
+            if profile.tiktok_handle:
+                social_links.append(f"[TikTok](https://tiktok.com/@{profile.tiktok_handle})")
+            if profile.instagram_handle:
+                social_links.append(f"[Instagram](https://instagram.com/{profile.instagram_handle})")
+            if profile.bluesky_handle:
+                social_links.append(f"[Bluesky](https://bsky.app/profile/{profile.bluesky_handle})")
+
+            if social_links:
+                embed.add_field(name="Links", value=" • ".join(social_links), inline=False)
+
+            embed.set_footer(text="Check out their content!")
+
+            # Post new announcement
+            new_message = await channel.send(embed=embed)
+
+            # Update database with new message ID
+            config = db.query(DiscoveryConfig).filter_by(guild_id=guild_id).first()
+            if config:
+                config.cotm_last_message_id = new_message.id
+                import time
+                config.cotm_last_posted_at = int(time.time())
+                config.cotm_last_featured_user_id = user_id
+                db.commit()
+
+            logger.info(f"Posted new COTM announcement for user {user_id} in guild {guild_id}, message {new_message.id}")
+            return web.json_response({'success': True, 'message_id': new_message.id})
+
+    except Exception as e:
+        logger.error(f"Error announcing COTM: {e}", exc_info=True)
+        return web.json_response({'error': str(e)}, status=500)
+
+
+async def delete_message(request):
+    """Delete a specific message from a channel."""
+    try:
+        data = await request.json()
+
+        guild_id = int(data.get('guild_id'))
+        channel_id = int(data.get('channel_id'))
+        message_id = int(data.get('message_id'))
+
+        if not bot_instance:
+            return web.json_response({'error': 'Bot not ready'}, status=503)
+
+        guild = bot_instance.get_guild(guild_id)
+        if not guild:
+            return web.json_response({'error': 'Guild not found'}, status=404)
+
+        channel = guild.get_channel(channel_id)
+        if not channel:
+            return web.json_response({'error': 'Channel not found'}, status=404)
+
+        # Delete the message
+        try:
+            message = await channel.fetch_message(message_id)
+            await message.delete()
+            logger.info(f"Deleted message {message_id} from channel {channel_id} in guild {guild_id}")
+            return web.json_response({'success': True})
+        except Exception as e:
+            logger.warning(f"Failed to delete message {message_id}: {e}")
+            return web.json_response({'error': f'Failed to delete message: {str(e)}'}, status=500)
+
+    except Exception as e:
+        logger.error(f"Error deleting message: {e}", exc_info=True)
+        return web.json_response({'error': str(e)}, status=500)
+
+
+async def announce_network_cotw(request):
+    """Announce Network Creator of the Week to all opted-in guilds."""
+    try:
+        data = await request.json()
+        profile_id = int(data.get('profile_id'))
+
+        if not bot_instance:
+            return web.json_response({'error': 'Bot not ready'}, status=503)
+
+        # Get creator profile from database
+        from db import get_db_session
+        from models import CreatorProfile, DiscoveryConfig
+
+        with get_db_session() as db:
+            profile = db.query(CreatorProfile).filter_by(id=profile_id).first()
+
+            if not profile:
+                return web.json_response({'error': 'Creator profile not found'}, status=404)
+
+            # Get all guilds that opted in to network announcements
+            configs = db.query(DiscoveryConfig).filter(
+                DiscoveryConfig.network_announcements_enabled == True,
+                DiscoveryConfig.network_announcement_channel_id != None
+            ).all()
+
+            if not configs:
+                return web.json_response({'success': True, 'message': 'No guilds opted in for network announcements'})
+
+            # Get the creator's home guild for member object
+            home_guild = bot_instance.get_guild(profile.guild_id)
+            home_member = home_guild.get_member(profile.discord_id) if home_guild else None
+
+            posted_count = 0
+            failed_count = 0
+
+            # Post to each opted-in guild
+            for config in configs:
+                try:
+                    guild = bot_instance.get_guild(config.guild_id)
+                    if not guild:
+                        continue
+
+                    channel = guild.get_channel(config.network_announcement_channel_id)
+                    if not channel:
+                        logger.warning(f"[Network COTW] Channel {config.network_announcement_channel_id} not found in guild {guild.id}")
+                        failed_count += 1
+                        continue
+
+                    embed = discord.Embed(
+                        title="🏆 Network Creator of the Week",
+                        description=f"Congratulations to **{profile.display_name}** for being selected as this week's featured creator across the QuestLog network!",
+                        color=discord.Color.gold()
+                    )
+
+                    if home_member:
+                        embed.set_thumbnail(url=home_member.display_avatar.url)
+
+                    if profile.bio:
+                        embed.add_field(name="About", value=profile.bio[:1024], inline=False)
+
+                    # Add home server info
+                    if home_guild:
+                        embed.add_field(name="Home Server", value=home_guild.name, inline=True)
+
+                    # Add social links
+                    social_links = []
+                    if profile.twitch_handle:
+                        social_links.append(f"[Twitch](https://twitch.tv/{profile.twitch_handle})")
+                    if profile.youtube_handle:
+                        social_links.append(f"[YouTube](https://youtube.com/@{profile.youtube_handle})")
+                    elif profile.youtube_url:
+                        social_links.append(f"[YouTube]({profile.youtube_url})")
+                    if profile.twitter_handle:
+                        social_links.append(f"[Twitter](https://twitter.com/{profile.twitter_handle})")
+                    if profile.tiktok_handle:
+                        social_links.append(f"[TikTok](https://tiktok.com/@{profile.tiktok_handle})")
+                    if profile.instagram_handle:
+                        social_links.append(f"[Instagram](https://instagram.com/{profile.instagram_handle})")
+                    if profile.bluesky_handle:
+                        social_links.append(f"[Bluesky](https://bsky.app/profile/{profile.bluesky_handle})")
+
+                    if social_links:
+                        embed.add_field(name="Links", value=" • ".join(social_links), inline=False)
+
+                    embed.set_footer(text="Manually set by Discovery Approver • View all creators on Discovery Network")
+
+                    await channel.send(embed=embed)
+                    posted_count += 1
+                    logger.info(f"[Network COTW] Posted announcement in guild {guild.id}")
+
+                except Exception as e:
+                    logger.error(f"[Network COTW] Failed to post in guild {config.guild_id}: {e}")
+                    failed_count += 1
+
+            return web.json_response({
+                'success': True,
+                'posted_count': posted_count,
+                'failed_count': failed_count
+            })
+
+    except Exception as e:
+        logger.error(f"Error announcing Network COTW: {e}", exc_info=True)
+        return web.json_response({'error': str(e)}, status=500)
+
+
+async def announce_network_cotm(request):
+    """Announce Network Creator of the Month to all opted-in guilds."""
+    try:
+        data = await request.json()
+        profile_id = int(data.get('profile_id'))
+
+        if not bot_instance:
+            return web.json_response({'error': 'Bot not ready'}, status=503)
+
+        # Get creator profile from database
+        from db import get_db_session
+        from models import CreatorProfile, DiscoveryConfig
+
+        with get_db_session() as db:
+            profile = db.query(CreatorProfile).filter_by(id=profile_id).first()
+
+            if not profile:
+                return web.json_response({'error': 'Creator profile not found'}, status=404)
+
+            # Get all guilds that opted in to network announcements
+            configs = db.query(DiscoveryConfig).filter(
+                DiscoveryConfig.network_announcements_enabled == True,
+                DiscoveryConfig.network_announcement_channel_id != None
+            ).all()
+
+            if not configs:
+                return web.json_response({'success': True, 'message': 'No guilds opted in for network announcements'})
+
+            # Get the creator's home guild for member object
+            home_guild = bot_instance.get_guild(profile.guild_id)
+            home_member = home_guild.get_member(profile.discord_id) if home_guild else None
+
+            posted_count = 0
+            failed_count = 0
+
+            # Post to each opted-in guild
+            for config in configs:
+                try:
+                    guild = bot_instance.get_guild(config.guild_id)
+                    if not guild:
+                        continue
+
+                    channel = guild.get_channel(config.network_announcement_channel_id)
+                    if not channel:
+                        logger.warning(f"[Network COTM] Channel {config.network_announcement_channel_id} not found in guild {guild.id}")
+                        failed_count += 1
+                        continue
+
+                    embed = discord.Embed(
+                        title="👑 Network Creator of the Month",
+                        description=f"Congratulations to **{profile.display_name}** for being selected as this month's featured creator across the QuestLog network!",
+                        color=discord.Color.purple()
+                    )
+
+                    if home_member:
+                        embed.set_thumbnail(url=home_member.display_avatar.url)
+
+                    if profile.bio:
+                        embed.add_field(name="About", value=profile.bio[:1024], inline=False)
+
+                    # Add home server info
+                    if home_guild:
+                        embed.add_field(name="Home Server", value=home_guild.name, inline=True)
+
+                    # Add social links
+                    social_links = []
+                    if profile.twitch_handle:
+                        social_links.append(f"[Twitch](https://twitch.tv/{profile.twitch_handle})")
+                    if profile.youtube_handle:
+                        social_links.append(f"[YouTube](https://youtube.com/@{profile.youtube_handle})")
+                    elif profile.youtube_url:
+                        social_links.append(f"[YouTube]({profile.youtube_url})")
+                    if profile.twitter_handle:
+                        social_links.append(f"[Twitter](https://twitter.com/{profile.twitter_handle})")
+                    if profile.tiktok_handle:
+                        social_links.append(f"[TikTok](https://tiktok.com/@{profile.tiktok_handle})")
+                    if profile.instagram_handle:
+                        social_links.append(f"[Instagram](https://instagram.com/{profile.instagram_handle})")
+                    if profile.bluesky_handle:
+                        social_links.append(f"[Bluesky](https://bsky.app/profile/{profile.bluesky_handle})")
+
+                    if social_links:
+                        embed.add_field(name="Links", value=" • ".join(social_links), inline=False)
+
+                    embed.set_footer(text="Manually set by Discovery Approver • View all creators on Discovery Network")
+
+                    await channel.send(embed=embed)
+                    posted_count += 1
+                    logger.info(f"[Network COTM] Posted announcement in guild {guild.id}")
+
+                except Exception as e:
+                    logger.error(f"[Network COTM] Failed to post in guild {config.guild_id}: {e}")
+                    failed_count += 1
+
+            return web.json_response({
+                'success': True,
+                'posted_count': posted_count,
+                'failed_count': failed_count
+            })
+
+    except Exception as e:
+        logger.error(f"Error announcing Network COTM: {e}", exc_info=True)
+        return web.json_response({'error': str(e)}, status=500)
+
+
 def create_app():
     """Create the aiohttp web application."""
     # SECURITY: Add authentication middleware
@@ -648,6 +1093,15 @@ def create_app():
     app.router.add_post('/mod/unban', mod_unban)
     app.router.add_post('/mod/unmute', mod_unmute)
     app.router.add_post('/mod/unjail', mod_unjail)
+
+    # Creator Discovery endpoints
+    app.router.add_post('/api/announce-cotw', announce_cotw)
+    app.router.add_post('/api/announce-cotm', announce_cotm)
+    app.router.add_post('/api/delete-message', delete_message)
+
+    # Network Creator Discovery endpoints (DISCOVERY_APPROVERS only)
+    app.router.add_post('/api/announce-network-cotw', announce_network_cotw)
+    app.router.add_post('/api/announce-network-cotm', announce_network_cotm)
 
     logger.info("API server created with authentication middleware")
     return app

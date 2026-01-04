@@ -445,6 +445,7 @@ def main():
         "cogs.flair_cog",  # Flair store - let members customize their profile
         "cogs.raffles",  # Raffles integration
         "cogs.scheduled_messages",  # Scheduled message processor
+        "cogs.streaming_monitor",  # YouTube/Twitch live stream monitor & notifications
     ]
 
     loaded_count = 0
