@@ -79,6 +79,13 @@ class XPCog(commands.Cog):
                 "command_cooldown": config.command_cooldown,
                 "game_launch_cooldown": config.game_launch_cooldown,
                 "max_level": config.max_level,
+                # XP source toggles
+                "track_messages": config.track_messages,
+                "track_media": config.track_media,
+                "track_reactions": config.track_reactions,
+                "track_voice": config.track_voice,
+                "track_gaming": config.track_gaming,
+                "track_game_launch": config.track_game_launch,
             }
         # Return defaults
         return {
@@ -101,6 +108,13 @@ class XPCog(commands.Cog):
             "command_cooldown": DefaultXPSettings.COMMAND_COOLDOWN,
             "game_launch_cooldown": DefaultXPSettings.GAME_LAUNCH_COOLDOWN,
             "max_level": DefaultXPSettings.MAX_LEVEL,
+            # XP source toggles (OPT-IN: disabled by default)
+            "track_messages": False,
+            "track_media": False,
+            "track_reactions": False,
+            "track_voice": False,
+            "track_gaming": False,
+            "track_game_launch": False,
         }
 
     @staticmethod
@@ -630,7 +644,8 @@ class XPCog(commands.Cog):
 
                 # Award XP with cooldown
                 if is_media:
-                    if (now - db_member.last_media_ts) >= xp_config["media_cooldown"]:
+                    # Check if media XP tracking is enabled
+                    if xp_config["track_media"] and (now - db_member.last_media_ts) >= xp_config["media_cooldown"]:
                         xp_amount = xp_config["message_xp"] * xp_config["media_multiplier"]
                         result = XPCog.add_xp(
                             session, guild_id, message.author.id,
@@ -644,7 +659,8 @@ class XPCog(commands.Cog):
                             should_notify = True
                             level_data = (old_level, new_level, tokens, token_diff)
                 else:
-                    if (now - db_member.last_message_ts) >= xp_config["message_cooldown"]:
+                    # Check if message XP tracking is enabled
+                    if xp_config["track_messages"] and (now - db_member.last_message_ts) >= xp_config["message_cooldown"]:
                         result = XPCog.add_xp(
                             session, guild_id, message.author.id,
                             xp_config["message_xp"], message.author.display_name, "active",
@@ -714,7 +730,8 @@ class XPCog(commands.Cog):
 
                 now = int(time.time())
 
-                if (now - db_member.last_react_ts) >= xp_config["reaction_cooldown"]:
+                # Check if reaction XP tracking is enabled
+                if xp_config["track_reactions"] and (now - db_member.last_react_ts) >= xp_config["reaction_cooldown"]:
                     result = XPCog.add_xp(
                         session, guild_id, payload.member.id,
                         xp_config["reaction_xp"], payload.member.display_name, "active"
@@ -781,8 +798,8 @@ class XPCog(commands.Cog):
                 # User joined voice
                 if before.channel is None and after.channel is not None:
                     if XPCog.can_gain_xp(session, guild_id, member, after.channel):
-                        # Award XP for joining voice (with cooldown)
-                        if (now - db_member.last_voice_bonus_ts) >= xp_config["voice_interval"]:
+                        # Award XP for joining voice (with cooldown) - only if voice tracking is enabled
+                        if xp_config["track_voice"] and (now - db_member.last_voice_bonus_ts) >= xp_config["voice_interval"]:
                             result = XPCog.add_xp(
                                 session, guild_id, member.id,
                                 2, member.display_name, "active"
@@ -804,9 +821,9 @@ class XPCog(commands.Cog):
                         duration = now - db_member.last_voice_join_ts
                         db_member.voice_minutes += duration // 60
 
-                        # Award XP for time in voice
+                        # Award XP for time in voice - only if voice tracking is enabled
                         chunks = duration // xp_config["voice_interval"]
-                        if chunks > 0:
+                        if xp_config["track_voice"] and chunks > 0:
                             result = XPCog.add_xp(
                                 session, guild_id, member.id,
                                 xp_config["voice_xp"] * chunks,
@@ -952,7 +969,8 @@ class XPCog(commands.Cog):
 
                 # Started playing
                 if is_playing and not was_playing:
-                    if (now - db_member.last_game_launch_ts) >= xp_config["game_launch_cooldown"]:
+                    # Award XP for launching a game - only if game launch tracking is enabled
+                    if xp_config["track_game_launch"] and (now - db_member.last_game_launch_ts) >= xp_config["game_launch_cooldown"]:
                         result = XPCog.add_xp(
                             session, guild_id, after.id,
                             2, after.display_name, "passive"
@@ -964,13 +982,17 @@ class XPCog(commands.Cog):
                         if new_level > old_level:
                             should_notify = True
                             level_data = (old_level, new_level, tokens, token_diff)
+                    else:
+                        # Even if not awarding XP, still track gaming session start
+                        db_member.last_gaming_ts = now
 
                 # Stopped playing
                 elif not is_playing and was_playing:
                     duration = now - db_member.last_gaming_ts
                     chunks = duration // xp_config["gaming_interval"]
 
-                    if chunks > 0:
+                    # Award XP for time spent gaming - only if gaming tracking is enabled
+                    if xp_config["track_gaming"] and chunks > 0:
                         result = XPCog.add_xp(
                             session, guild_id, after.id,
                             xp_config["gaming_xp"] * chunks,
