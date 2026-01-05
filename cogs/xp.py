@@ -80,12 +80,12 @@ class XPCog(commands.Cog):
                 "game_launch_cooldown": config.game_launch_cooldown,
                 "max_level": config.max_level,
                 # XP source toggles
-                "track_messages": config.track_messages,
-                "track_media": config.track_media,
-                "track_reactions": config.track_reactions,
-                "track_voice": config.track_voice,
-                "track_gaming": config.track_gaming,
-                "track_game_launch": config.track_game_launch,
+                "track_messages": getattr(config, "track_messages", False),
+                "track_media": getattr(config, "track_media", False),
+                "track_reactions": getattr(config, "track_reactions", False),
+                "track_voice": getattr(config, "track_voice", False),
+                "track_gaming": getattr(config, "track_gaming", False),
+                "track_game_launch": getattr(config, "track_game_launch", False),
             }
         # Return defaults
         return {
@@ -250,7 +250,8 @@ class XPCog(commands.Cog):
     @staticmethod
     def add_xp(session, guild_id: int, user_id: int, amount: float,
                display_name: str = None, engagement_type: str = "active",
-               guild: discord.Guild = None, channel_id: int = None) -> tuple:
+               guild: discord.Guild = None, channel_id: int = None,
+               source: str = None) -> tuple:
         """
         Add XP to a member and calculate level/token rewards.
         Now includes XP boost event support.
@@ -261,13 +262,27 @@ class XPCog(commands.Cog):
         if amount <= 0:
             return (0, 0, 0, 0)
 
+        # Get XP config for guild
+        xp_config = XPCog.get_xp_config(session, guild_id)
+
+        source_toggle_map = {
+            "messages": "track_messages",
+            "media": "track_media",
+            "reactions": "track_reactions",
+            "voice": "track_voice",
+            "gaming": "track_gaming",
+            "game_launch": "track_game_launch",
+        }
+        if source:
+            source_key = source.lower() if isinstance(source, str) else source
+            toggle_key = source_toggle_map.get(source_key)
+            if toggle_key and not xp_config.get(toggle_key, False):
+                return (0, 0, 0, 0)
+
         # Apply XP boost events
         final_xp, boost_bonus_tokens, active_events = XPCog.calculate_xp_with_boosts(
             session, guild_id, user_id, amount, guild, channel_id
         )
-
-        # Get XP config for guild
-        xp_config = XPCog.get_xp_config(session, guild_id)
 
         # Get or create member
         db_member = session.get(GuildMember, (guild_id, user_id))
@@ -650,7 +665,8 @@ class XPCog(commands.Cog):
                         result = XPCog.add_xp(
                             session, guild_id, message.author.id,
                             xp_amount, message.author.display_name, "active",
-                            message.guild, message.channel.id
+                            message.guild, message.channel.id,
+                            source="media"
                         )
                         db_member.last_media_ts = now
                         old_level, new_level, tokens, token_diff = result
@@ -664,7 +680,8 @@ class XPCog(commands.Cog):
                         result = XPCog.add_xp(
                             session, guild_id, message.author.id,
                             xp_config["message_xp"], message.author.display_name, "active",
-                            message.guild, message.channel.id
+                            message.guild, message.channel.id,
+                            source="messages"
                         )
                         db_member.last_message_ts = now
                         old_level, new_level, tokens, token_diff = result
@@ -734,7 +751,8 @@ class XPCog(commands.Cog):
                 if xp_config["track_reactions"] and (now - db_member.last_react_ts) >= xp_config["reaction_cooldown"]:
                     result = XPCog.add_xp(
                         session, guild_id, payload.member.id,
-                        xp_config["reaction_xp"], payload.member.display_name, "active"
+                        xp_config["reaction_xp"], payload.member.display_name, "active",
+                        source="reactions"
                     )
                     db_member.last_react_ts = now
                     db_member.reaction_count += 1
@@ -802,7 +820,8 @@ class XPCog(commands.Cog):
                         if xp_config["track_voice"] and (now - db_member.last_voice_bonus_ts) >= xp_config["voice_interval"]:
                             result = XPCog.add_xp(
                                 session, guild_id, member.id,
-                                2, member.display_name, "active"
+                                2, member.display_name, "active",
+                                source="voice"
                             )
                             db_member.last_voice_bonus_ts = now
                             old_level, new_level, tokens, token_diff = result
@@ -827,7 +846,8 @@ class XPCog(commands.Cog):
                             result = XPCog.add_xp(
                                 session, guild_id, member.id,
                                 xp_config["voice_xp"] * chunks,
-                                member.display_name, "active"
+                                member.display_name, "active",
+                                source="voice"
                             )
                             old_level, new_level, tokens, token_diff = result
 
@@ -973,7 +993,8 @@ class XPCog(commands.Cog):
                     if xp_config["track_game_launch"] and (now - db_member.last_game_launch_ts) >= xp_config["game_launch_cooldown"]:
                         result = XPCog.add_xp(
                             session, guild_id, after.id,
-                            2, after.display_name, "passive"
+                            2, after.display_name, "passive",
+                            source="game_launch"
                         )
                         db_member.last_game_launch_ts = now
                         db_member.last_gaming_ts = now
@@ -996,7 +1017,8 @@ class XPCog(commands.Cog):
                         result = XPCog.add_xp(
                             session, guild_id, after.id,
                             xp_config["gaming_xp"] * chunks,
-                            after.display_name, "passive"
+                            after.display_name, "passive",
+                            source="gaming"
                         )
                         old_level, new_level, tokens, token_diff = result
 

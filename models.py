@@ -372,6 +372,14 @@ class XPConfig(Base):
     join_xp = Column(Float, default=25.0)
     xp_enabled = Column(Boolean, nullable=False, default=True, server_default='1')
 
+    # XP source toggles (opt-in)
+    track_messages = Column(Boolean, nullable=False, default=False, server_default='0')
+    track_media = Column(Boolean, nullable=False, default=False, server_default='0')
+    track_reactions = Column(Boolean, nullable=False, default=False, server_default='0')
+    track_voice = Column(Boolean, nullable=False, default=False, server_default='0')
+    track_gaming = Column(Boolean, nullable=False, default=False, server_default='0')
+    track_game_launch = Column(Boolean, nullable=False, default=False, server_default='0')
+
     # Token conversion
     tokens_per_100_xp_active = Column(Integer, default=15)
     tokens_per_100_xp_passive = Column(Integer, default=5)

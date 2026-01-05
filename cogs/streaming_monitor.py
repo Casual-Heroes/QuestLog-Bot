@@ -155,6 +155,8 @@ class StreamingMonitorCog(commands.Cog):
             creator: CreatorProfile instance
             approvals: List of ApprovedStreamer instances for this creator
         """
+        from app.services.youtube_service import YouTubeAPIError
+
         try:
             # Decrypt tokens for API use
             try:
@@ -182,7 +184,10 @@ class StreamingMonitorCog(commands.Cog):
                     return
 
             # Check if currently live
-            live_info = self.youtube_service.get_live_broadcasts(access_token)
+            live_info = self.youtube_service.get_live_broadcasts(
+                access_token,
+                channel_id=creator.youtube_channel_id
+            )
 
             was_live = creator.is_live_youtube
             is_live = live_info is not None
