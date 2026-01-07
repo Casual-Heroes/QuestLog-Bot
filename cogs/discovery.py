@@ -3739,9 +3739,18 @@ class DiscoveryCog(commands.Cog):
         """
         logger.debug("Running featured reminder task...")
 
-        with db_session_scope() as session:
-            now = int(time.time())
+        now = int(time.time())
+        schedule_intervals = {
+            "hourly": 3600,
+            "every_6_hours": 21600,
+            "daily": 86400,
+            "weekly": 604800,
+            "monthly": 2592000,
+        }
+        reminders = []
 
+        # Avoid holding a DB session across awaits to prevent cross-task session conflicts.
+        with db_session_scope() as session:
             # Get all guilds with Discovery enabled and reminders scheduled
             configs = session.query(DiscoveryConfig).filter(
                 DiscoveryConfig.enabled == True,
@@ -3750,83 +3759,93 @@ class DiscoveryCog(commands.Cog):
             ).all()
 
             for config in configs:
-                try:
-                    # Determine if reminder should be sent based on schedule
-                    should_send = False
-                    schedule = config.reminder_schedule
-                    last_sent = config.last_reminder_sent_at or 0
+                # Determine if reminder should be sent based on schedule
+                schedule = (config.reminder_schedule or "").lower()
+                last_sent = config.last_reminder_sent_at or 0
 
-                    # If never sent before, initialize timestamp without sending (prevents spam on bot restart)
-                    if last_sent == 0:
-                        config.last_reminder_sent_at = now
-                        session.commit()
-                        logger.info(f"Initialized reminder timestamp for guild {config.guild_id} without sending")
-                        continue
-
-                    if schedule == 'hourly':
-                        should_send = (now - last_sent) >= 3600  # 1 hour
-                    elif schedule == 'every_6_hours':
-                        should_send = (now - last_sent) >= 21600  # 6 hours
-                    elif schedule == 'daily':
-                        should_send = (now - last_sent) >= 86400  # 24 hours
-                    elif schedule == 'weekly':
-                        should_send = (now - last_sent) >= 604800  # 7 days
-                    elif schedule == 'monthly':
-                        should_send = (now - last_sent) >= 2592000  # 30 days
-
-                    if not should_send:
-                        continue
-
-                    # Get guild
-                    guild = self.bot.get_guild(config.guild_id)
-                    if not guild:
-                        logger.warning(f"Guild {config.guild_id} not found for reminder task")
-                        continue
-
-                    # Determine target channel (selfpromo or feature channel)
-                    target_channel = None
-                    if config.selfpromo_channel_id:
-                        target_channel = guild.get_channel(config.selfpromo_channel_id)
-                    elif config.feature_channel_id:
-                        target_channel = guild.get_channel(config.feature_channel_id)
-
-                    if not target_channel:
-                        logger.warning(f"No target channel found for reminder in guild {config.guild_id}")
-                        continue
-
-                    # Get guild settings for token_name
-                    guild_record = session.query(Guild).filter_by(guild_id=config.guild_id).first()
-                    token_name = guild_record.token_name if guild_record and guild_record.token_name else "Hero Tokens"
-
-                    # Build the embed - fully customizable by admin through "How to get Featured" field
-                    description = config.how_to_enter_response if config.how_to_enter_response else (
-                        "Want to be featured in our Creator Discovery system? Here's how!"
-                    )
-
-                    # Replace placeholders with actual values
-                    description = description.replace("{token_cost}", str(config.token_cost))
-                    description = description.replace("{token_name}", token_name)
-                    description = description.replace("{entry_cooldown}", f"{config.entry_cooldown_hours} hours" if hasattr(config, 'entry_cooldown_hours') else "24 hours")
-                    # Replace {hero_tokens} with ??? since we can't show individual balances in broadcast messages
-                    description = description.replace("{hero_tokens}", "???")
-
-                    embed = discord.Embed(
-                        title="🌟 How to Get Featured",
-                        description=description,
-                        color=discord.Color.gold()
-                    )
-                    embed.timestamp = discord.utils.utcnow()
-
-                    # Send the embed
-                    await target_channel.send(embed=embed)
-                    logger.info(f"Sent scheduled featured reminder to guild {config.guild_id} (schedule: {schedule})")
-
-                    # Update last sent timestamp
+                # If never sent before, initialize timestamp without sending (prevents spam on bot restart)
+                if last_sent == 0:
                     config.last_reminder_sent_at = now
-                    session.commit()
+                    logger.info(f"Initialized reminder timestamp for guild {config.guild_id} without sending")
+                    continue
 
-                except Exception as e:
-                    logger.error(f"Error sending scheduled reminder for guild {config.guild_id}: {e}", exc_info=True)
+                interval = schedule_intervals.get(schedule)
+                if not interval or (now - last_sent) < interval:
+                    continue
+
+                # Get guild settings for token_name
+                guild_record = session.query(Guild).filter_by(guild_id=config.guild_id).first()
+                token_name = guild_record.token_name if guild_record and guild_record.token_name else "Hero Tokens"
+
+                reminders.append({
+                    "guild_id": config.guild_id,
+                    "schedule": schedule,
+                    "selfpromo_channel_id": config.selfpromo_channel_id,
+                    "feature_channel_id": config.feature_channel_id,
+                    "how_to_enter_response": config.how_to_enter_response,
+                    "token_cost": config.token_cost,
+                    "entry_cooldown_hours": config.entry_cooldown_hours,
+                    "token_name": token_name,
+                })
+
+        for reminder in reminders:
+            try:
+                # Get guild
+                guild = self.bot.get_guild(reminder["guild_id"])
+                if not guild:
+                    logger.warning(f"Guild {reminder['guild_id']} not found for reminder task")
+                    continue
+
+                # Determine target channel (selfpromo or feature channel)
+                target_channel = None
+                if reminder["selfpromo_channel_id"]:
+                    target_channel = guild.get_channel(reminder["selfpromo_channel_id"])
+                elif reminder["feature_channel_id"]:
+                    target_channel = guild.get_channel(reminder["feature_channel_id"])
+
+                if not target_channel:
+                    logger.warning(f"No target channel found for reminder in guild {reminder['guild_id']}")
+                    continue
+
+                # Build the embed - fully customizable by admin through "How to get Featured" field
+                description = reminder["how_to_enter_response"] or (
+                    "Want to be featured in our Creator Discovery system? Here's how!"
+                )
+
+                # Replace placeholders with actual values
+                description = description.replace("{token_cost}", str(reminder["token_cost"]))
+                description = description.replace("{token_name}", reminder["token_name"])
+                description = description.replace(
+                    "{entry_cooldown}",
+                    f"{reminder['entry_cooldown_hours']} hours"
+                )
+                # Replace {hero_tokens} with ??? since we can't show individual balances in broadcast messages
+                description = description.replace("{hero_tokens}", "???")
+
+                embed = discord.Embed(
+                    title="🌟 How to Get Featured",
+                    description=description,
+                    color=discord.Color.gold()
+                )
+                embed.timestamp = discord.utils.utcnow()
+
+                # Send the embed
+                await target_channel.send(embed=embed)
+                logger.info(
+                    f"Sent scheduled featured reminder to guild {reminder['guild_id']} (schedule: {reminder['schedule']})"
+                )
+
+                # Update last sent timestamp in a fresh session
+                with db_session_scope() as session:
+                    config = session.query(DiscoveryConfig).filter_by(guild_id=reminder["guild_id"]).first()
+                    if config:
+                        config.last_reminder_sent_at = int(time.time())
+
+            except Exception as e:
+                logger.error(
+                    f"Error sending scheduled reminder for guild {reminder['guild_id']}: {e}",
+                    exc_info=True
+                )
 
     @featured_reminder_task.before_loop
     async def before_featured_reminder_task(self):

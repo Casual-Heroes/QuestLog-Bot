@@ -161,9 +161,19 @@ class ActivityTrackerCog(commands.Cog):
                             break
 
                 # Log details for debugging
-                logger.debug(f"[ActivityTracker] [guild_id:{guild.id}] Game '{game.game_name}': checked {total_checked} members, found {playing_count} playing")
+                logger.debug(
+                    f"[ActivityTracker] [guild_id:{guild.id}] Game '{game.game_name}': checked {total_checked} members, found {playing_count} playing"
+                )
+                count_changed = game.current_player_count != playing_count or game.player_count_updated_at is None
                 if matched_activities:
-                    logger.info(f"[ActivityTracker] [guild_id:{guild.id}] Matched activities for '{game.game_name}': {matched_activities}")
+                    if count_changed:
+                        logger.info(
+                            f"[ActivityTracker] [guild_id:{guild.id}] Matched activities for '{game.game_name}': {matched_activities}"
+                        )
+                    else:
+                        logger.debug(
+                            f"[ActivityTracker] [guild_id:{guild.id}] Matched activities for '{game.game_name}': {matched_activities}"
+                        )
 
                 # Update database (always update to set player_count_updated_at even if count is 0)
                 if game.current_player_count != playing_count or game.player_count_updated_at is None:
