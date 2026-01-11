@@ -446,6 +446,7 @@ def main():
         "cogs.raffles",  # Raffles integration
         "cogs.scheduled_messages",  # Scheduled message processor
         "cogs.streaming_monitor",  # YouTube/Twitch live stream monitor & notifications
+        "cogs.site_activity_tracker",  # Site activity tracker - database-driven Discord game tracking
     ]
 
     loaded_count = 0

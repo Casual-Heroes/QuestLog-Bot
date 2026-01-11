@@ -12,10 +12,11 @@ logger = logging.getLogger("api_server")
 # Store bot reference (set by bot.py on startup)
 bot_instance = None
 
-# SECURITY: Load API token from environment
+# SECURITY: Load API token from environment - REQUIRED for production
 API_TOKEN = os.getenv("DISCORD_BOT_API_TOKEN")
 if not API_TOKEN:
-    logger.warning("DISCORD_BOT_API_TOKEN not set - API will be unauthenticated!")
+    logger.critical("DISCORD_BOT_API_TOKEN is not set! Bot API will not start without authentication token.")
+    raise RuntimeError("DISCORD_BOT_API_TOKEN environment variable is required for security. Set it in .env file.")
 
 
 @web.middleware
