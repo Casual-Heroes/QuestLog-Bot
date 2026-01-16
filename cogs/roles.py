@@ -22,7 +22,7 @@ from discord.ext import commands, tasks
 
 from config import db_session_scope, logger, get_debug_guilds, FeatureLimits
 from models import (
-    Guild, GuildMember, ReactRole, LevelRole,
+    Guild, GuildModule, GuildMember, ReactRole, LevelRole,
     TempRole, RoleTemplate, RoleRequest, ModAction, ChannelTemplate
 )
 
@@ -38,6 +38,28 @@ def get_guild_tier(session, guild_id: int) -> str:
     return db_guild.subscription_tier.upper() if db_guild.subscription_tier else "FREE"
 
 
+def get_effective_tier(session, guild_id: int) -> str:
+    """
+    Get effective tier considering module subscriptions.
+    If guild has 'roles' module, treat as PREMIUM for feature limits.
+    """
+    tier = get_guild_tier(session, guild_id)
+    if tier != "FREE":
+        return tier
+
+    # Check for Roles module subscription - gives premium-level limits
+    has_roles_module = session.query(GuildModule).filter_by(
+        guild_id=guild_id,
+        module_name='roles',
+        enabled=True
+    ).first() is not None
+
+    if has_roles_module:
+        return "PREMIUM"  # Module subscribers get premium limits
+
+    return tier
+
+
 async def check_limit_and_respond(
     ctx: discord.ApplicationContext,
     session,
@@ -48,8 +70,9 @@ async def check_limit_and_respond(
     """
     Check if action is within limits. Returns (is_allowed, limit).
     If not allowed, sends upgrade message and returns False.
+    Uses effective tier which accounts for module subscriptions.
     """
-    tier = get_guild_tier(session, ctx.guild.id)
+    tier = get_effective_tier(session, ctx.guild.id)
     limit = FeatureLimits.get_limit(tier, feature)
 
     # None = unlimited

@@ -7,18 +7,27 @@ or Twitch and sends notifications to configured channels.
 
 ARCHITECTURE:
 - Runs every 3 minutes (180 seconds) to check live status
-- Only checks creators who are approved streamers in guilds
+- Only checks creators who are approved streamers in guilds with Discovery module
 - Respects minimum level requirements for notifications
 - Updates creator_profiles with live stream data
 - Sends rich embed notifications to configured channels
+- Uses database-backed notification history to survive restarts
+
+SECURITY FEATURES:
+- Module access checks (Discovery module or Complete tier required)
+- Encrypted token storage and handling
+- Exponential backoff for API failures
+- Rate limiting per creator per platform
+- Database-backed deduplication to prevent spam
+- Graceful error handling with detailed logging
 
 FEATURES:
-- Auto token refresh when expired
-- Rate limit handling
+- Auto token refresh when expired (with 5-minute buffer)
 - Per-guild notification configuration
 - Minimum level requirements
 - Optional role pings
-- Live status tracking
+- Live status tracking in database
+- Historical notification tracking (survives restarts)
 """
 
 import sys
@@ -26,7 +35,8 @@ import os
 import asyncio
 import time as time_lib
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Set, Tuple
+from collections import defaultdict
 
 import discord
 from discord.ext import commands, tasks
@@ -37,7 +47,10 @@ from models import (
     CreatorProfile,
     StreamingNotificationsConfig,
     ApprovedStreamer,
-    GuildMember
+    GuildMember,
+    Guild,
+    GuildModule,
+    StreamNotificationHistory,
 )
 
 
@@ -47,7 +60,7 @@ class StreamingMonitorCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-        # Setup Django and import YouTube service on initialization (not module import)
+        # Setup Django and import services on initialization (not module import)
         if '/srv/ch-webserver' not in sys.path:
             sys.path.insert(0, '/srv/ch-webserver')
         os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'casualsite.settings')
@@ -61,13 +74,15 @@ class StreamingMonitorCog(commands.Cog):
             pass
 
         # Now we can import Django app services
-        from app.services.youtube_service import YouTubeService
-        from app.services.twitch_service import TwitchService
+        from app.services.youtube_service import YouTubeService, YouTubeAPIError
+        from app.services.twitch_service import TwitchService, TwitchAPIError
         from app.utils.encryption import decrypt_token as dt, encrypt_token as et
 
         # Store as instance variables
         self.YouTubeService = YouTubeService
         self.TwitchService = TwitchService
+        self.YouTubeAPIError = YouTubeAPIError
+        self.TwitchAPIError = TwitchAPIError
         self.decrypt_token = dt
         self.encrypt_token = et
 
@@ -75,8 +90,21 @@ class StreamingMonitorCog(commands.Cog):
         self.twitch_service = TwitchService()
         self.check_interval = 180  # 3 minutes
 
-        # Track last notification time per creator to avoid spam
-        self.last_notification = {}  # {creator_profile_id: timestamp}
+        # Track last notification time per creator to avoid spam (in-memory cooldown)
+        # Key format: "youtube_{creator_id}" or "twitch_{creator_id}"
+        self.last_notification: Dict[str, int] = {}
+
+        # Track API failure counts for exponential backoff
+        # Key: creator_id, Value: (failure_count, last_failure_time)
+        self.api_failures: Dict[int, Tuple[int, int]] = {}
+
+        # Maximum backoff: 30 minutes (1800 seconds)
+        self.max_backoff_seconds = 1800
+        # Base backoff: 3 minutes (180 seconds - same as check interval)
+        self.base_backoff_seconds = 180
+
+        # Notification cooldown (10 minutes)
+        self.notification_cooldown_seconds = 600
 
         # Start the monitoring loop
         self.stream_monitor_loop.start()
@@ -86,6 +114,145 @@ class StreamingMonitorCog(commands.Cog):
         """Stop the loop when cog unloads."""
         self.stream_monitor_loop.cancel()
         logger.info("StreamingMonitor: Stopped stream monitoring")
+
+    def _has_discovery_access(self, db, guild_id: int) -> bool:
+        """
+        Check if guild has access to Discovery features (streaming notifications).
+
+        Args:
+            db: Database session
+            guild_id: Guild ID to check
+
+        Returns:
+            True if guild has Discovery module, Complete tier, or VIP status
+        """
+        guild = db.query(Guild).filter(Guild.guild_id == guild_id).first()
+        if not guild:
+            return False
+
+        # VIP or Complete tier always has access
+        if guild.is_vip or guild.subscription_tier == 'complete':
+            return True
+
+        # Check for Discovery module
+        has_discovery_module = db.query(GuildModule).filter_by(
+            guild_id=guild_id,
+            module_name='discovery',
+            enabled=True
+        ).first() is not None
+
+        return has_discovery_module
+
+    def _should_skip_creator(self, creator_id: int) -> bool:
+        """
+        Check if we should skip this creator due to API failures (exponential backoff).
+
+        Args:
+            creator_id: Creator profile ID
+
+        Returns:
+            True if creator should be skipped due to recent failures
+        """
+        if creator_id not in self.api_failures:
+            return False
+
+        failure_count, last_failure_time = self.api_failures[creator_id]
+        current_time = int(time_lib.time())
+
+        # Calculate backoff time: base * 2^(failures-1), capped at max
+        backoff_seconds = min(
+            self.base_backoff_seconds * (2 ** (failure_count - 1)),
+            self.max_backoff_seconds
+        )
+
+        if current_time - last_failure_time < backoff_seconds:
+            logger.debug(
+                f"StreamingMonitor: Skipping creator {creator_id} due to backoff "
+                f"({failure_count} failures, {backoff_seconds}s backoff)"
+            )
+            return True
+
+        return False
+
+    def _record_api_failure(self, creator_id: int):
+        """Record an API failure for exponential backoff."""
+        current_time = int(time_lib.time())
+        if creator_id in self.api_failures:
+            failure_count, _ = self.api_failures[creator_id]
+            self.api_failures[creator_id] = (failure_count + 1, current_time)
+        else:
+            self.api_failures[creator_id] = (1, current_time)
+
+    def _clear_api_failure(self, creator_id: int):
+        """Clear API failure record on successful call."""
+        if creator_id in self.api_failures:
+            del self.api_failures[creator_id]
+
+    def _was_notification_sent(
+        self,
+        db,
+        guild_id: int,
+        creator_id: int,
+        platform: str,
+        stream_started_at: int
+    ) -> bool:
+        """
+        Check if we already sent a notification for this stream (survives restarts).
+
+        Args:
+            db: Database session
+            guild_id: Guild to check
+            creator_id: Creator profile ID
+            platform: 'youtube' or 'twitch'
+            stream_started_at: Unix timestamp when stream started
+
+        Returns:
+            True if notification was already sent
+        """
+        existing = db.query(StreamNotificationHistory).filter(
+            StreamNotificationHistory.guild_id == guild_id,
+            StreamNotificationHistory.creator_profile_id == creator_id,
+            StreamNotificationHistory.platform == platform,
+            StreamNotificationHistory.stream_started_at == stream_started_at
+        ).first()
+
+        return existing is not None
+
+    def _record_notification_sent(
+        self,
+        db,
+        guild_id: int,
+        creator_id: int,
+        platform: str,
+        stream_started_at: int,
+        stream_title: Optional[str] = None
+    ):
+        """
+        Record that we sent a notification for this stream.
+
+        Args:
+            db: Database session
+            guild_id: Guild ID
+            creator_id: Creator profile ID
+            platform: 'youtube' or 'twitch'
+            stream_started_at: Unix timestamp when stream started
+            stream_title: Optional stream title for logging
+        """
+        try:
+            notification = StreamNotificationHistory(
+                guild_id=guild_id,
+                creator_profile_id=creator_id,
+                platform=platform,
+                stream_started_at=stream_started_at,
+                notified_at=int(time_lib.time()),
+                stream_title=stream_title[:500] if stream_title else None
+            )
+            db.add(notification)
+            db.commit()
+        except Exception as e:
+            # Unique constraint violation means we already recorded it
+            db.rollback()
+            logger.debug(f"StreamingMonitor: Notification already recorded: {e}")
 
     @tasks.loop(seconds=180)  # Check every 3 minutes
     async def stream_monitor_loop(self):
@@ -99,6 +266,8 @@ class StreamingMonitorCog(commands.Cog):
     async def before_stream_monitor(self):
         """Wait until bot is ready before starting loop."""
         await self.bot.wait_until_ready()
+        # Wait a bit more for guilds to populate
+        await asyncio.sleep(10)
         logger.info("StreamingMonitor: Bot ready, starting stream checks")
 
     async def _check_all_streams(self):
@@ -115,8 +284,13 @@ class StreamingMonitorCog(commands.Cog):
             logger.debug(f"StreamingMonitor: Checking {len(approved)} approved streamers")
 
             # Group by creator to avoid duplicate API calls
-            creators_to_check = {}
+            # Also track which guilds each creator is approved in
+            creators_to_check: Dict[int, list] = {}
             for approval in approved:
+                # Check if this guild has Discovery access
+                if not self._has_discovery_access(db, approval.guild_id):
+                    continue
+
                 creator_id = approval.creator_profile_id
                 if creator_id not in creators_to_check:
                     creators_to_check[creator_id] = []
@@ -124,6 +298,10 @@ class StreamingMonitorCog(commands.Cog):
 
             # Check each unique creator
             for creator_id, approvals in creators_to_check.items():
+                # Check exponential backoff
+                if self._should_skip_creator(creator_id):
+                    continue
+
                 creator = db.query(CreatorProfile).filter(
                     CreatorProfile.id == creator_id
                 ).first()
@@ -134,10 +312,13 @@ class StreamingMonitorCog(commands.Cog):
                 # Check YouTube status
                 if creator.youtube_channel_id and creator.youtube_refresh_token:
                     await self._check_youtube_status(db, creator, approvals)
+                    # Small delay between API calls to avoid rate limits
+                    await asyncio.sleep(0.5)
 
                 # Check Twitch status
                 if creator.twitch_user_id and creator.twitch_refresh_token:
                     await self._check_twitch_status(db, creator, approvals)
+                    await asyncio.sleep(0.5)
 
             db.commit()
 
@@ -155,21 +336,22 @@ class StreamingMonitorCog(commands.Cog):
             creator: CreatorProfile instance
             approvals: List of ApprovedStreamer instances for this creator
         """
-        from app.services.youtube_service import YouTubeAPIError
-
         try:
             # Decrypt tokens for API use
             try:
                 access_token = self.decrypt_token(creator.youtube_access_token)
                 refresh_token = self.decrypt_token(creator.youtube_refresh_token) if creator.youtube_refresh_token else None
+
+                if not access_token or not refresh_token:
+                    logger.warning(f"StreamingMonitor: Missing YouTube tokens for creator {creator.id}")
+                    return
             except Exception as e:
-                logger.error(f"StreamingMonitor: Failed to decrypt tokens for creator {creator.id}: {e}")
+                logger.error(f"StreamingMonitor: Failed to decrypt YouTube tokens for creator {creator.id}: {e}")
                 return
 
-            # Check if token needs refresh
+            # Check if token needs refresh (5 minute buffer)
             current_time = int(time_lib.time())
             if creator.youtube_token_expires and creator.youtube_token_expires < current_time + 300:
-                # Token expires in less than 5 minutes, refresh it
                 try:
                     tokens = self.youtube_service.refresh_access_token(refresh_token)
                     # Store new encrypted token
@@ -180,32 +362,45 @@ class StreamingMonitorCog(commands.Cog):
                     access_token = tokens.get('access_token')
                     logger.info(f"StreamingMonitor: Refreshed YouTube token for creator {creator.id}")
                 except Exception as e:
-                    logger.error(f"StreamingMonitor: Failed to refresh token for creator {creator.id}: {e}")
+                    logger.error(f"StreamingMonitor: Failed to refresh YouTube token for creator {creator.id}: {e}")
+                    self._record_api_failure(creator.id)
                     return
 
             # Check if currently live
-            live_info = self.youtube_service.get_live_broadcasts(
-                access_token,
-                channel_id=creator.youtube_channel_id
-            )
+            try:
+                live_info = self.youtube_service.get_live_broadcasts(
+                    access_token,
+                    channel_id=creator.youtube_channel_id
+                )
+                # Clear failure record on success
+                self._clear_api_failure(creator.id)
+            except self.YouTubeAPIError as e:
+                logger.error(f"StreamingMonitor: YouTube API error for creator {creator.id}: {e}")
+                self._record_api_failure(creator.id)
+                return
 
             was_live = creator.is_live_youtube
             is_live = live_info is not None
 
-            # Update creator status
+            # Parse stream start time
+            stream_started_at = None
             if is_live:
-                # Parse ISO 8601 timestamp to Unix timestamp
                 started_at_iso = live_info.get('started_at')
                 if started_at_iso:
-                    started_dt = datetime.fromisoformat(started_at_iso.replace('Z', '+00:00'))
-                    started_at = int(started_dt.timestamp())
+                    try:
+                        started_dt = datetime.fromisoformat(started_at_iso.replace('Z', '+00:00'))
+                        stream_started_at = int(started_dt.timestamp())
+                    except (ValueError, TypeError):
+                        stream_started_at = current_time
                 else:
-                    started_at = current_time
+                    stream_started_at = current_time
 
+            # Update creator status in database
+            if is_live:
                 creator.is_live_youtube = True
                 creator.current_stream_title = live_info.get('title')
                 creator.current_stream_game = live_info.get('game_name')
-                creator.current_stream_started_at = started_at
+                creator.current_stream_started_at = stream_started_at
                 creator.current_stream_thumbnail = live_info.get('thumbnail_url')
                 creator.current_stream_viewer_count = live_info.get('viewer_count', 0)
             else:
@@ -219,29 +414,40 @@ class StreamingMonitorCog(commands.Cog):
 
             db.commit()
 
-            # Send notifications if just went live (not already live)
-            if is_live and not was_live:
-                # Check cooldown (don't spam if we just sent notification)
-                last_notif = self.last_notification.get(creator.id, 0)
-                if current_time - last_notif < 600:  # 10 minute cooldown
-                    logger.debug(f"StreamingMonitor: Skipping notification for creator {creator.id} (cooldown)")
+            # Send notifications if just went live
+            if is_live and not was_live and stream_started_at:
+                # Check in-memory cooldown
+                cooldown_key = f"youtube_{creator.id}"
+                last_notif = self.last_notification.get(cooldown_key, 0)
+                if current_time - last_notif < self.notification_cooldown_seconds:
+                    logger.debug(f"StreamingMonitor: Skipping YouTube notification for creator {creator.id} (cooldown)")
                     return
 
-                self.last_notification[creator.id] = current_time
+                self.last_notification[cooldown_key] = current_time
 
                 # Send notification to each guild this creator is approved in
                 for approval in approvals:
-                    await self._send_live_notification(
+                    # Check database-backed deduplication (survives restarts)
+                    if self._was_notification_sent(
+                        db, approval.guild_id, creator.id, 'youtube', stream_started_at
+                    ):
+                        logger.debug(
+                            f"StreamingMonitor: Skipping YouTube notification for creator {creator.id} "
+                            f"in guild {approval.guild_id} (already sent)"
+                        )
+                        continue
+
+                    await self._send_youtube_notification(
                         db,
                         creator,
                         approval.guild_id,
-                        live_info
+                        live_info,
+                        stream_started_at
                     )
 
-        except YouTubeAPIError as e:
-            logger.error(f"StreamingMonitor: YouTube API error for creator {creator.id}: {e}")
         except Exception as e:
             logger.error(f"StreamingMonitor: Error checking YouTube status for creator {creator.id}: {e}", exc_info=True)
+            self._record_api_failure(creator.id)
 
     async def _check_twitch_status(
         self,
@@ -258,21 +464,21 @@ class StreamingMonitorCog(commands.Cog):
             approvals: List of ApprovedStreamer instances for this creator
         """
         try:
-            # Import TwitchAPIError from the service
-            from app.services.twitch_service import TwitchAPIError
-
             # Decrypt tokens for API use
             try:
                 access_token = self.decrypt_token(creator.twitch_access_token)
                 refresh_token = self.decrypt_token(creator.twitch_refresh_token) if creator.twitch_refresh_token else None
+
+                if not access_token or not refresh_token:
+                    logger.warning(f"StreamingMonitor: Missing Twitch tokens for creator {creator.id}")
+                    return
             except Exception as e:
                 logger.error(f"StreamingMonitor: Failed to decrypt Twitch tokens for creator {creator.id}: {e}")
                 return
 
-            # Check if token needs refresh
+            # Check if token needs refresh (5 minute buffer)
             current_time = int(time_lib.time())
             if creator.twitch_token_expires and creator.twitch_token_expires < current_time + 300:
-                # Token expires in less than 5 minutes, refresh it
                 try:
                     tokens = self.twitch_service.refresh_access_token(refresh_token)
                     # Store new encrypted token
@@ -284,20 +490,35 @@ class StreamingMonitorCog(commands.Cog):
                     logger.info(f"StreamingMonitor: Refreshed Twitch token for creator {creator.id}")
                 except Exception as e:
                     logger.error(f"StreamingMonitor: Failed to refresh Twitch token for creator {creator.id}: {e}")
+                    self._record_api_failure(creator.id)
                     return
 
             # Check if currently live
-            live_info = self.twitch_service.get_live_streams(access_token, creator.twitch_user_id)
+            try:
+                live_info = self.twitch_service.get_live_streams(access_token, creator.twitch_user_id)
+                # Clear failure record on success
+                self._clear_api_failure(creator.id)
+            except self.TwitchAPIError as e:
+                logger.error(f"StreamingMonitor: Twitch API error for creator {creator.id}: {e}")
+                self._record_api_failure(creator.id)
+                return
 
             was_live = creator.is_live_twitch
             is_live = live_info is not None
 
-            # Update creator status
+            # Get stream start time
+            stream_started_at = None
+            if is_live:
+                stream_started_at = live_info.get('started_at')
+                if not stream_started_at:
+                    stream_started_at = current_time
+
+            # Update creator status in database
             if is_live:
                 creator.is_live_twitch = True
                 creator.current_stream_title = live_info.get('title')
                 creator.current_stream_game = live_info.get('game_name')
-                creator.current_stream_started_at = live_info.get('started_at')
+                creator.current_stream_started_at = stream_started_at
                 creator.current_stream_thumbnail = live_info.get('thumbnail_url')
                 creator.current_stream_viewer_count = live_info.get('viewer_count', 0)
             else:
@@ -311,47 +532,58 @@ class StreamingMonitorCog(commands.Cog):
 
             db.commit()
 
-            # Send notifications if just went live (not already live)
-            if is_live and not was_live:
-                # Check cooldown (don't spam if we just sent notification)
-                # Use a separate key for Twitch to allow both platforms to notify independently
-                twitch_key = f"twitch_{creator.id}"
-                last_notif = self.last_notification.get(twitch_key, 0)
-                if current_time - last_notif < 600:  # 10 minute cooldown
+            # Send notifications if just went live
+            if is_live and not was_live and stream_started_at:
+                # Check in-memory cooldown (separate key for Twitch)
+                cooldown_key = f"twitch_{creator.id}"
+                last_notif = self.last_notification.get(cooldown_key, 0)
+                if current_time - last_notif < self.notification_cooldown_seconds:
                     logger.debug(f"StreamingMonitor: Skipping Twitch notification for creator {creator.id} (cooldown)")
                     return
 
-                self.last_notification[twitch_key] = current_time
+                self.last_notification[cooldown_key] = current_time
 
                 # Send notification to each guild this creator is approved in
                 for approval in approvals:
-                    await self._send_twitch_live_notification(
+                    # Check database-backed deduplication (survives restarts)
+                    if self._was_notification_sent(
+                        db, approval.guild_id, creator.id, 'twitch', stream_started_at
+                    ):
+                        logger.debug(
+                            f"StreamingMonitor: Skipping Twitch notification for creator {creator.id} "
+                            f"in guild {approval.guild_id} (already sent)"
+                        )
+                        continue
+
+                    await self._send_twitch_notification(
                         db,
                         creator,
                         approval.guild_id,
-                        live_info
+                        live_info,
+                        stream_started_at
                     )
 
-        except TwitchAPIError as e:
-            logger.error(f"StreamingMonitor: Twitch API error for creator {creator.id}: {e}")
         except Exception as e:
             logger.error(f"StreamingMonitor: Error checking Twitch status for creator {creator.id}: {e}", exc_info=True)
+            self._record_api_failure(creator.id)
 
-    async def _send_live_notification(
+    async def _send_youtube_notification(
         self,
         db,
         creator: CreatorProfile,
         guild_id: int,
-        live_info: Dict[str, Any]
+        live_info: Dict[str, Any],
+        stream_started_at: int
     ):
         """
-        Send live notification to a guild's configured channel.
+        Send YouTube live notification to a guild's configured channel.
 
         Args:
             db: Database session
             creator: CreatorProfile instance
             guild_id: Guild ID to send notification to
             live_info: Live stream information dict
+            stream_started_at: Unix timestamp when stream started
         """
         try:
             # Get notification config for this guild
@@ -401,7 +633,10 @@ class StreamingMonitorCog(commands.Cog):
             notification_message = notification_message.replace('{creator}', creator.display_name)
 
             # Convert hex color to discord.Color
-            embed_color_int = int(embed_color_hex.lstrip('#'), 16)
+            try:
+                embed_color_int = int(embed_color_hex.lstrip('#'), 16)
+            except ValueError:
+                embed_color_int = 0xFF0000  # Default red
 
             # Build notification embed
             embed = discord.Embed(
@@ -412,9 +647,10 @@ class StreamingMonitorCog(commands.Cog):
             )
 
             # Add stream title as a field
+            stream_title = live_info.get('title', 'Untitled Stream')
             embed.add_field(
                 name="Stream Title",
-                value=live_info.get('title', 'Untitled Stream'),
+                value=stream_title[:1024],  # Discord field value limit
                 inline=False
             )
 
@@ -422,7 +658,7 @@ class StreamingMonitorCog(commands.Cog):
             if live_info.get('game_name'):
                 embed.add_field(
                     name="Playing",
-                    value=live_info['game_name'],
+                    value=live_info['game_name'][:1024],
                     inline=True
                 )
 
@@ -442,7 +678,10 @@ class StreamingMonitorCog(commands.Cog):
             if creator.avatar_url:
                 embed.set_thumbnail(url=creator.avatar_url)
 
-            embed.set_footer(text="YouTube", icon_url="https://www.youtube.com/s/desktop/f506bd45/img/favicon_32.png")
+            embed.set_footer(
+                text="YouTube",
+                icon_url="https://www.youtube.com/s/desktop/f506bd45/img/favicon_32.png"
+            )
             embed.timestamp = datetime.utcnow()
 
             # Build message content with optional role ping
@@ -455,22 +694,28 @@ class StreamingMonitorCog(commands.Cog):
             # Send notification
             await channel.send(content=content, embed=embed)
 
+            # Record notification in database (for restart survival)
+            self._record_notification_sent(
+                db, guild_id, creator.id, 'youtube', stream_started_at, stream_title
+            )
+
             logger.info(
-                f"StreamingMonitor: Sent live notification for creator {creator.id} "
+                f"StreamingMonitor: Sent YouTube notification for creator {creator.id} "
                 f"({creator.display_name}) to guild {guild_id}"
             )
 
         except discord.Forbidden:
-            logger.error(f"StreamingMonitor: No permission to send notification in guild {guild_id}")
+            logger.error(f"StreamingMonitor: No permission to send YouTube notification in guild {guild_id}")
         except Exception as e:
-            logger.error(f"StreamingMonitor: Error sending notification to guild {guild_id}: {e}", exc_info=True)
+            logger.error(f"StreamingMonitor: Error sending YouTube notification to guild {guild_id}: {e}", exc_info=True)
 
-    async def _send_twitch_live_notification(
+    async def _send_twitch_notification(
         self,
         db,
         creator: CreatorProfile,
         guild_id: int,
-        live_info: Dict[str, Any]
+        live_info: Dict[str, Any],
+        stream_started_at: int
     ):
         """
         Send Twitch live notification to a guild's configured channel.
@@ -480,6 +725,7 @@ class StreamingMonitorCog(commands.Cog):
             creator: CreatorProfile instance
             guild_id: Guild ID to send notification to
             live_info: Live stream information dict
+            stream_started_at: Unix timestamp when stream started
         """
         try:
             # Get notification config for this guild
@@ -529,10 +775,13 @@ class StreamingMonitorCog(commands.Cog):
             notification_message = notification_message.replace('{creator}', creator.display_name)
 
             # Convert hex color to discord.Color
-            embed_color_int = int(embed_color_hex.lstrip('#'), 16)
+            try:
+                embed_color_int = int(embed_color_hex.lstrip('#'), 16)
+            except ValueError:
+                embed_color_int = 0x9147ff  # Default Twitch purple
 
             # Build notification embed with Twitch URL
-            twitch_url = f"https://twitch.tv/{creator.twitch_handle}" if creator.twitch_handle else f"https://twitch.tv"
+            twitch_url = f"https://twitch.tv/{creator.twitch_handle}" if creator.twitch_handle else "https://twitch.tv"
             embed = discord.Embed(
                 title=notification_title,
                 description=notification_message,
@@ -541,9 +790,10 @@ class StreamingMonitorCog(commands.Cog):
             )
 
             # Add stream title as a field
+            stream_title = live_info.get('title', 'Untitled Stream')
             embed.add_field(
                 name="Stream Title",
-                value=live_info.get('title', 'Untitled Stream'),
+                value=stream_title[:1024],  # Discord field value limit
                 inline=False
             )
 
@@ -551,7 +801,7 @@ class StreamingMonitorCog(commands.Cog):
             if live_info.get('game_name'):
                 embed.add_field(
                     name="Playing",
-                    value=live_info['game_name'],
+                    value=live_info['game_name'][:1024],
                     inline=True
                 )
 
@@ -587,8 +837,13 @@ class StreamingMonitorCog(commands.Cog):
             # Send notification
             await channel.send(content=content, embed=embed)
 
+            # Record notification in database (for restart survival)
+            self._record_notification_sent(
+                db, guild_id, creator.id, 'twitch', stream_started_at, stream_title
+            )
+
             logger.info(
-                f"StreamingMonitor: Sent Twitch live notification for creator {creator.id} "
+                f"StreamingMonitor: Sent Twitch notification for creator {creator.id} "
                 f"({creator.display_name}) to guild {guild_id}"
             )
 

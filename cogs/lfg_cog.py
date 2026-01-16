@@ -17,7 +17,7 @@ import sys
 sys.path.insert(0, '..')
 from db import get_db_session
 from models import (
-    LFGGame, LFGGroup, LFGMember, Guild,
+    LFGGame, LFGGroup, LFGMember, Guild, GuildModule,
     LFGAttendance, LFGMemberStats, LFGConfig, AttendanceStatus
 )
 from utils import igdb
@@ -1939,10 +1939,20 @@ class LFGCog(commands.Cog):
     # HELPER: Check premium status
     # =============================================================================
 
-    def _is_premium(self, session, guild_id: int) -> bool:
-        """Check if guild has premium/VIP status."""
+    def _has_lfg_access(self, session, guild_id: int) -> bool:
+        """Check if guild has LFG access (Complete tier, VIP, or LFG module)."""
         guild = session.query(Guild).filter_by(guild_id=guild_id).first()
-        return guild.is_premium() if guild else False
+        if not guild:
+            return False
+        if guild.is_vip or guild.subscription_tier == 'complete':
+            return True
+        # Check for LFG module subscription
+        has_lfg_module = session.query(GuildModule).filter_by(
+            guild_id=guild_id,
+            module_name='lfg',
+            enabled=True
+        ).first() is not None
+        return has_lfg_module
 
     # =============================================================================
     # ADMIN COMMANDS
@@ -2356,10 +2366,10 @@ class LFGCog(commands.Cog):
         """Mark a member's attendance for an LFG group."""
         try:
             with get_db_session() as session:
-                # Check premium
-                if not self._is_premium(session, ctx.guild.id):
+                # Check LFG access (Complete tier or LFG module)
+                if not self._has_lfg_access(session, ctx.guild.id):
                     await ctx.respond(
-                        "Attendance tracking is a **Premium** feature!\n"
+                        "Attendance tracking requires **Complete tier** or the **LFG Module**!\n"
                         "Upgrade to track reliability and identify flaky members.",
                         ephemeral=True
                     )
@@ -2472,10 +2482,10 @@ class LFGCog(commands.Cog):
 
         try:
             with get_db_session() as session:
-                # Check premium
-                if not self._is_premium(session, ctx.guild.id):
+                # Check LFG access (Complete tier or LFG module)
+                if not self._has_lfg_access(session, ctx.guild.id):
                     await ctx.respond(
-                        "Reliability stats are a **Premium** feature!\n"
+                        "Reliability stats require **Complete tier** or the **LFG Module**!\n"
                         "Upgrade to track attendance and reliability.",
                         ephemeral=True
                     )
@@ -2555,9 +2565,9 @@ class LFGCog(commands.Cog):
         """View the LFG reliability leaderboard."""
         try:
             with get_db_session() as session:
-                if not self._is_premium(session, ctx.guild.id):
+                if not self._has_lfg_access(session, ctx.guild.id):
                     await ctx.respond(
-                        "Leaderboards are a **Premium** feature!",
+                        "Leaderboards require **Complete tier** or the **LFG Module**!",
                         ephemeral=True
                     )
                     return
@@ -2622,9 +2632,9 @@ class LFGCog(commands.Cog):
         """Blacklist or unblacklist a member from LFG."""
         try:
             with get_db_session() as session:
-                if not self._is_premium(session, ctx.guild.id):
+                if not self._has_lfg_access(session, ctx.guild.id):
                     await ctx.respond(
-                        "Blacklist management is a **Premium** feature!",
+                        "Blacklist management requires **Complete tier** or the **LFG Module**!",
                         ephemeral=True
                     )
                     return
@@ -2682,9 +2692,9 @@ class LFGCog(commands.Cog):
         """Configure LFG attendance settings."""
         try:
             with get_db_session() as session:
-                if not self._is_premium(session, ctx.guild.id):
+                if not self._has_lfg_access(session, ctx.guild.id):
                     await ctx.respond(
-                        "LFG configuration is a **Premium** feature!\n"
+                        "LFG configuration requires **Complete tier** or the **LFG Module**!\n"
                         "Upgrade to customize attendance tracking.",
                         ephemeral=True
                     )
@@ -2996,17 +3006,27 @@ class GameButton(discord.ui.Button):
         """Open LFG creation view for this game."""
         try:
             with get_db_session() as session:
-                # Check guild subscription tier - FREE tier cannot create LFG groups
+                # Check guild subscription - requires Complete tier OR LFG module
                 guild_record = session.query(Guild).filter_by(guild_id=interaction.guild.id).first()
-                if guild_record and guild_record.subscription_tier == 'free' and not guild_record.is_vip:
-                    await interaction.response.send_message(
-                        "❌ **LFG Groups require Pro/Premium/VIP**\n\n"
-                        "The LFG Browser feature is available for Pro, Premium, and VIP tiers.\n"
-                        "Upgrade your server to create and manage LFG groups!\n\n"
-                        "Visit the dashboard to upgrade: https://chaoshousegg.com",
-                        ephemeral=True
-                    )
-                    return
+                if guild_record and not guild_record.is_vip:
+                    # Check for LFG module subscription
+                    has_lfg_module = session.query(GuildModule).filter_by(
+                        guild_id=interaction.guild.id,
+                        module_name='lfg',
+                        enabled=True
+                    ).first() is not None
+
+                    has_access = guild_record.subscription_tier == 'complete' or has_lfg_module
+
+                    if not has_access:
+                        await interaction.response.send_message(
+                            "❌ **LFG Groups require Complete tier or LFG Module**\n\n"
+                            "The LFG Browser feature requires a subscription.\n"
+                            "Upgrade your server to create and manage LFG groups!\n\n"
+                            "Visit the dashboard to upgrade: https://dashboard.casual-heroes.com",
+                            ephemeral=True
+                        )
+                        return
 
                 # Reload game config from DB
                 game_config = session.query(LFGGame).filter_by(id=self.game.id).first()

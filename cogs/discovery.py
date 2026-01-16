@@ -30,7 +30,7 @@ from config import (
     db_session_scope, logger, get_debug_guilds, DefaultXPSettings, FeatureLimits
 )
 from models import (
-    Guild, GuildMember, PromoPost, FeaturedPool, FeaturedCreator, DiscoveryNetwork,
+    Guild, GuildMember, GuildModule, PromoPost, FeaturedPool, FeaturedCreator, DiscoveryNetwork,
     ServerListing, PromoTier, DiscoveryConfig, XPConfig, AnnouncedGame,
     GameSearchConfig, CreatorOfTheMonth, CreatorOfTheWeek
 )
@@ -1454,10 +1454,23 @@ class DiscoveryCog(commands.Cog):
             for config in configs:
                 guild_id = config.guild_id  # Capture guild_id before it might become detached
                 try:
-                    # Check subscription tier (Pro or Premium)
+                    # Check if guild has Discovery module or Complete tier
                     guild_record = session.query(Guild).filter_by(guild_id=guild_id).first()
-                    if not guild_record or guild_record.subscription_tier not in ['pro', 'premium']:
-                        logger.warning(f"[COTW] Guild {guild_id} has COTW enabled but not Pro/Premium tier")
+                    if not guild_record:
+                        logger.warning(f"[COTW] Guild {guild_id} not found in database")
+                        continue
+
+                    # Check for Discovery module subscription or Complete tier
+                    has_discovery_module = session.query(GuildModule).filter_by(
+                        guild_id=guild_id,
+                        module_name='discovery',
+                        enabled=True
+                    ).first() is not None
+
+                    has_access = guild_record.subscription_tier == 'complete' or has_discovery_module
+
+                    if not has_access:
+                        logger.warning(f"[COTW] Guild {guild_id} has COTW enabled but no Discovery module or Complete tier")
                         continue
 
                     await self._select_and_announce_cotw(guild_id)
@@ -1491,10 +1504,23 @@ class DiscoveryCog(commands.Cog):
             for config in configs:
                 guild_id = config.guild_id  # Capture guild_id before it might become detached
                 try:
-                    # Check subscription tier (Premium only)
+                    # Check if guild has Discovery module or Complete tier
                     guild_record = session.query(Guild).filter_by(guild_id=guild_id).first()
-                    if not guild_record or guild_record.subscription_tier != 'premium':
-                        logger.warning(f"[COTM] Guild {guild_id} has COTM enabled but not Premium tier")
+                    if not guild_record:
+                        logger.warning(f"[COTM] Guild {guild_id} not found in database")
+                        continue
+
+                    # Check for Discovery module subscription or Complete tier
+                    has_discovery_module = session.query(GuildModule).filter_by(
+                        guild_id=guild_id,
+                        module_name='discovery',
+                        enabled=True
+                    ).first() is not None
+
+                    has_access = guild_record.subscription_tier == 'complete' or has_discovery_module
+
+                    if not has_access:
+                        logger.warning(f"[COTM] Guild {guild_id} has COTM enabled but no Discovery module or Complete tier")
                         continue
 
                     await self._select_and_announce_cotm(guild_id)

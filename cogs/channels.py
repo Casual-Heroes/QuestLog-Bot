@@ -18,7 +18,7 @@ import discord
 from discord.ext import commands
 
 from config import db_session_scope, logger, get_debug_guilds, FeatureLimits
-from models import Guild, ChannelTemplate, ModAction, RoleTemplate
+from models import Guild, GuildModule, ChannelTemplate, ModAction, RoleTemplate
 
 
 def get_guild_tier(session, guild_id: int) -> str:
@@ -31,9 +31,31 @@ def get_guild_tier(session, guild_id: int) -> str:
     return db_guild.subscription_tier.upper() if db_guild.subscription_tier else "FREE"
 
 
+def get_effective_tier(session, guild_id: int) -> str:
+    """
+    Get effective tier considering module subscriptions.
+    If guild has 'roles' module, treat as PREMIUM for feature limits.
+    """
+    tier = get_guild_tier(session, guild_id)
+    if tier != "FREE":
+        return tier
+
+    # Check for Roles module subscription - gives premium-level limits
+    has_roles_module = session.query(GuildModule).filter_by(
+        guild_id=guild_id,
+        module_name='roles',
+        enabled=True
+    ).first() is not None
+
+    if has_roles_module:
+        return "PREMIUM"  # Module subscribers get premium limits
+
+    return tier
+
+
 async def check_template_limit(ctx, session) -> tuple[bool, int | None]:
-    """Check if guild can create more templates."""
-    tier = get_guild_tier(session, ctx.guild.id)
+    """Check if guild can create more templates. Uses effective tier for module support."""
+    tier = get_effective_tier(session, ctx.guild.id)
     limit = FeatureLimits.get_limit(tier, "templates")
 
     if limit is None:

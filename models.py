@@ -17,6 +17,7 @@ Base = declarative_base()
 class SubscriptionTier(str, Enum):
     FREE = "free"
     COMPLETE = "complete"
+    # Note: Individual module subscriptions are tracked in guild_modules table, not here
 
 class VerificationType(str, Enum):
     NONE = "none"
@@ -2459,6 +2460,34 @@ class ApprovedStreamer(Base):
         Index("idx_approved_streamer_creator", "creator_profile_id"),
         # One approval per creator per guild
         UniqueConstraint("guild_id", "creator_profile_id", name="uq_approved_streamer"),
+    )
+
+
+class StreamNotificationHistory(Base):
+    """
+    Tracks sent streaming notifications to prevent duplicates across bot restarts.
+    Used by streaming_monitor cog to ensure we don't re-announce the same stream.
+    """
+    __tablename__ = "stream_notification_history"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    guild_id = Column(BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"), nullable=False)
+    creator_profile_id = Column(Integer, ForeignKey("creator_profiles.id", ondelete="CASCADE"), nullable=False)
+
+    # Platform and stream identifier
+    platform = Column(SQLEnum('youtube', 'twitch', name='streamplatform'), nullable=False)
+    stream_started_at = Column(BigInteger, nullable=False)  # Unix timestamp when stream started
+
+    # Notification metadata
+    notified_at = Column(BigInteger, nullable=False, default=lambda: int(time.time()))
+    stream_title = Column(String(500), nullable=True)
+
+    __table_args__ = (
+        Index("idx_stream_notif_guild", "guild_id"),
+        Index("idx_stream_notif_creator", "creator_profile_id"),
+        Index("idx_stream_notif_lookup", "creator_profile_id", "platform", "stream_started_at"),
+        # Prevent duplicate notifications for the same stream
+        UniqueConstraint("guild_id", "creator_profile_id", "platform", "stream_started_at", name="uq_stream_notification"),
     )
 
 

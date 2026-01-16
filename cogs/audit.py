@@ -28,7 +28,7 @@ from discord import SlashCommandGroup
 from datetime import datetime, timedelta
 
 from config import db_session_scope, logger, get_debug_guilds, FeatureLimits
-from models import Guild, GuildMember, AuditLog, AuditAction
+from models import Guild, GuildModule, GuildMember, AuditLog, AuditAction
 
 
 def get_guild_tier(session, guild_id: int) -> str:
@@ -41,8 +41,30 @@ def get_guild_tier(session, guild_id: int) -> str:
     return db_guild.subscription_tier.upper() if db_guild.subscription_tier else "FREE"
 
 
-def get_retention_days(tier: str) -> int:
-    """Get audit log retention days based on tier."""
+def has_moderation_access(session, guild_id: int) -> bool:
+    """Check if guild has moderation access (Complete tier, VIP, or Moderation module)."""
+    db_guild = session.get(Guild, guild_id)
+    if not db_guild:
+        return False
+    if db_guild.is_vip or db_guild.subscription_tier == 'complete':
+        return True
+    # Check for Moderation module subscription
+    has_mod_module = session.query(GuildModule).filter_by(
+        guild_id=guild_id,
+        module_name='moderation',
+        enabled=True
+    ).first() is not None
+    return has_mod_module
+
+
+def get_retention_days(session, guild_id: int) -> int:
+    """Get audit log retention days based on tier or module subscription."""
+    tier = get_guild_tier(session, guild_id)
+
+    # If they have moderation module, give them premium-level retention (30 days)
+    if tier == "FREE" and has_moderation_access(session, guild_id):
+        return 30  # Module subscribers get premium retention
+
     return FeatureLimits.get_limit(tier, "mod_log_days") or 7
 
 
@@ -255,8 +277,7 @@ class AuditCog(commands.Cog):
 
             for guild in guilds:
                 try:
-                    tier = get_guild_tier(session, guild.guild_id)
-                    retention_days = get_retention_days(tier)
+                    retention_days = get_retention_days(session, guild.guild_id)
                     cutoff_time = int(time.time()) - (retention_days * 86400)
 
                     # Delete old logs
@@ -764,7 +785,7 @@ class AuditCog(commands.Cog):
 
         with db_session_scope() as session:
             tier = get_guild_tier(session, ctx.guild.id)
-            retention_days = get_retention_days(tier)
+            retention_days = get_retention_days(session, ctx.guild.id)
             cutoff_time = int(time.time()) - (retention_days * 86400)
 
             query = session.query(AuditLog).filter(
@@ -838,7 +859,7 @@ class AuditCog(commands.Cog):
 
         with db_session_scope() as session:
             tier = get_guild_tier(session, ctx.guild.id)
-            retention_days = get_retention_days(tier)
+            retention_days = get_retention_days(session, ctx.guild.id)
 
             logs = (
                 session.query(AuditLog)
@@ -884,7 +905,7 @@ class AuditCog(commands.Cog):
         """View audit log statistics."""
         with db_session_scope() as session:
             tier = get_guild_tier(session, ctx.guild.id)
-            retention_days = get_retention_days(tier)
+            retention_days = get_retention_days(session, ctx.guild.id)
             cutoff_time = int(time.time()) - (retention_days * 86400)
 
             # Total logs
@@ -985,7 +1006,7 @@ class AuditCog(commands.Cog):
 
         with db_session_scope() as session:
             tier = get_guild_tier(session, ctx.guild.id)
-            retention_days = get_retention_days(tier)
+            retention_days = get_retention_days(session, ctx.guild.id)
             export_days = min(days or retention_days, retention_days)
             cutoff_time = int(time.time()) - (export_days * 86400)
 
@@ -1049,7 +1070,7 @@ class AuditCog(commands.Cog):
         """View all audit logs for a specific user."""
         with db_session_scope() as session:
             tier = get_guild_tier(session, ctx.guild.id)
-            retention_days = get_retention_days(tier)
+            retention_days = get_retention_days(session, ctx.guild.id)
             cutoff_time = int(time.time()) - (retention_days * 86400)
 
             # Logs where user is actor
@@ -1149,7 +1170,7 @@ class AuditCog(commands.Cog):
                 return
 
             tier = get_guild_tier(session, ctx.guild.id)
-            retention_days = get_retention_days(tier)
+            retention_days = get_retention_days(session, ctx.guild.id)
 
             changes = []
 

@@ -30,7 +30,7 @@ from config import (
     DefaultVerificationSettings, FeatureLimits
 )
 from models import (
-    Guild, GuildMember, VerificationConfig, VerificationType,
+    Guild, GuildModule, GuildMember, VerificationConfig, VerificationType,
     AuditLog, AuditAction
 )
 
@@ -43,6 +43,22 @@ def get_guild_tier(session, guild_id: int) -> str:
     if db_guild.is_vip:
         return "PRO"
     return db_guild.subscription_tier.upper() if db_guild.subscription_tier else "FREE"
+
+
+def has_moderation_access(session, guild_id: int) -> bool:
+    """Check if guild has moderation access (Complete tier, VIP, or Moderation module)."""
+    db_guild = session.get(Guild, guild_id)
+    if not db_guild:
+        return False
+    if db_guild.is_vip or db_guild.subscription_tier == 'complete':
+        return True
+    # Check for Moderation module subscription
+    has_mod_module = session.query(GuildModule).filter_by(
+        guild_id=guild_id,
+        module_name='moderation',
+        enabled=True
+    ).first() is not None
+    return has_mod_module
 
 
 def generate_captcha(length: int = 6) -> str:
@@ -636,11 +652,10 @@ class VerificationCog(commands.Cog):
                 )
 
         elif verification_type == VerificationType.MULTI_STEP:
-            # Check tier for multi-step
-            tier = get_guild_tier(session, ctx.guild.id)
-            if tier == "FREE":
+            # Check access for multi-step (Complete tier, VIP, or Moderation module)
+            if not has_moderation_access(session, ctx.guild.id):
                 await ctx.respond(
-                    "Multi-step verification requires **QuestLog Premium**.\n"
+                    "Multi-step verification requires **Complete tier** or the **Moderation Module**.\n"
                     "Please contact an admin to upgrade or use basic verification.",
                     ephemeral=True
                 )
@@ -871,10 +886,9 @@ class VerificationCog(commands.Cog):
             view = CaptchaButtonView(ctx.guild.id, captcha_length)
             embed.description += "\n\n*You will be asked to solve a captcha.*"
         elif verification_type == VerificationType.MULTI_STEP:
-            tier = get_guild_tier(session, ctx.guild.id)
-            if tier == "FREE":
+            if not has_moderation_access(session, ctx.guild.id):
                 await ctx.respond(
-                    "Multi-step verification requires QuestLog Premium.",
+                    "Multi-step verification requires **Complete tier** or the **Moderation Module**.",
                     ephemeral=True
                 )
                 return
@@ -955,12 +969,11 @@ class VerificationCog(commands.Cog):
             changes = []
 
             if type:
-                # Check tier for multi_step
+                # Check access for multi_step (Complete tier, VIP, or Moderation module)
                 if type == "multi_step":
-                    tier = get_guild_tier(session, ctx.guild.id)
-                    if tier == "FREE":
+                    if not has_moderation_access(session, ctx.guild.id):
                         await ctx.respond(
-                            "Multi-step verification requires QuestLog Premium!",
+                            "Multi-step verification requires **Complete tier** or the **Moderation Module**!",
                             ephemeral=True
                         )
                         return
@@ -1037,10 +1050,9 @@ class VerificationCog(commands.Cog):
     ):
         """Set intro channel for multi-step verification."""
         with db_session_scope() as session:
-            tier = get_guild_tier(session, ctx.guild.id)
-            if tier == "FREE":
+            if not has_moderation_access(session, ctx.guild.id):
                 await ctx.respond(
-                    "Multi-step verification requires QuestLog Premium!",
+                    "Multi-step verification requires **Complete tier** or the **Moderation Module**!",
                     ephemeral=True
                 )
                 return
