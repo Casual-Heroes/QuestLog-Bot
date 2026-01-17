@@ -88,13 +88,14 @@ async def assign_flair_role(member: discord.Member, flair_name: str):
 class NormalFlairSelect(ui.Select):
     """Dropdown selector for Normal Flairs."""
 
-    def __init__(self):
+    def __init__(self, token_name: str = "Hero Tokens"):
+        self.token_name = token_name
         # Build dropdown options
         options = []
         for flair_name, cost in NORMAL_FLAIRS.items():
             options.append(discord.SelectOption(
                 label=flair_name,
-                description=f"Cost: {cost} Hero Tokens",
+                description=f"Cost: {cost} {token_name}",
                 value=flair_name
             ))
         super().__init__(
@@ -124,7 +125,7 @@ class NormalFlairSelect(ui.Select):
                 # Check if user has enough tokens
                 if member_record.hero_tokens < cost:
                     await interaction.response.send_message(
-                        f"Sorry, you need {cost} Hero Tokens for **{flair_name}**, "
+                        f"Sorry, you need {cost} {self.token_name} for **{flair_name}**, "
                         f"but you only have {member_record.hero_tokens}.",
                         ephemeral=True
                     )
@@ -164,12 +165,13 @@ class NormalFlairSelect(ui.Select):
 class SeasonalFlairSelect(ui.Select):
     """Dropdown selector for Seasonal Flairs."""
 
-    def __init__(self):
+    def __init__(self, token_name: str = "Hero Tokens"):
+        self.token_name = token_name
         options = []
         for flair_name, cost in SEASONAL_FLAIRS.items():
             options.append(discord.SelectOption(
                 label=flair_name,
-                description=f"Cost: {cost} Hero Tokens",
+                description=f"Cost: {cost} {token_name}",
                 value=flair_name
             ))
         super().__init__(
@@ -199,7 +201,7 @@ class SeasonalFlairSelect(ui.Select):
                 # Check if user has enough tokens
                 if member_record.hero_tokens < cost:
                     await interaction.response.send_message(
-                        f"Sorry, you need {cost} Hero Tokens for **{flair_name}**, "
+                        f"Sorry, you need {cost} {self.token_name} for **{flair_name}**, "
                         f"but you only have {member_record.hero_tokens}.",
                         ephemeral=True
                     )
@@ -238,10 +240,10 @@ class SeasonalFlairSelect(ui.Select):
 class FlairView(ui.View):
     """View containing both Normal and Seasonal flair selectors."""
 
-    def __init__(self):
+    def __init__(self, token_name: str = "Hero Tokens"):
         super().__init__(timeout=300)  # 5 minute timeout
-        self.add_item(NormalFlairSelect())
-        self.add_item(SeasonalFlairSelect())
+        self.add_item(NormalFlairSelect(token_name))
+        self.add_item(SeasonalFlairSelect(token_name))
 
 
 class FlairCog(commands.Cog):
@@ -258,20 +260,25 @@ class FlairCog(commands.Cog):
 
     @flair.command(
         name="store",
-        description="View and purchase profile flairs using Hero Tokens",
+        description="View and purchase profile flairs using tokens",
     )
     async def flairstore(self, ctx: discord.ApplicationContext):
         """Display the flair store with all available flairs."""
         try:
+            # Get guild settings for token name
+            with db_session_scope() as session:
+                guild_record = session.query(Guild).filter(Guild.guild_id == ctx.guild_id).first()
+                token_name = guild_record.token_name if guild_record and guild_record.token_name else "Hero Tokens"
+
             # Build the description
             description_lines = []
             description_lines.append("**Normal Flairs:**")
             for flair_name, cost in NORMAL_FLAIRS.items():
-                description_lines.append(f"**{flair_name}** - {cost} Hero Tokens")
+                description_lines.append(f"**{flair_name}** - {cost} {token_name}")
 
             description_lines.append("\n**Seasonal Flairs:**")
             for flair_name, cost in SEASONAL_FLAIRS.items():
-                description_lines.append(f"**{flair_name}** - {cost} Hero Tokens")
+                description_lines.append(f"**{flair_name}** - {cost} {token_name}")
 
             # Create embed
             embed = Embed(
@@ -282,7 +289,7 @@ class FlairCog(commands.Cog):
             embed.set_footer(text="Select your flair from the dropdowns below.")
 
             # Create view with dropdowns
-            view = FlairView()
+            view = FlairView(token_name)
             await ctx.respond(embed=embed, view=view, ephemeral=True)
             logger.info(f"{ctx.author.display_name} opened the flair store in {ctx.guild.name}")
 
@@ -309,12 +316,16 @@ class FlairCog(commands.Cog):
                     )
                     return
 
+                # Get guild settings for token name
+                guild_record = session.query(Guild).filter(Guild.guild_id == ctx.guild_id).first()
+                token_name = guild_record.token_name if guild_record and guild_record.token_name else "Hero Tokens"
+
                 embed = Embed(
                     title="Your Current Flair",
                     description=f"**{member_record.flair}**",
                     color=discord.Color.green()
                 )
-                embed.add_field(name="Hero Tokens", value=f"{member_record.hero_tokens}")
+                embed.add_field(name=f"🪙 {token_name}", value=f"{member_record.hero_tokens}")
                 await ctx.respond(embed=embed, ephemeral=True)
 
         except Exception as e:

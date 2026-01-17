@@ -360,6 +360,7 @@ class XPCog(commands.Cog):
             # Get guild for specific channel lookup
             db_guild = session.get(Guild, guild.id)
             channel_id = db_guild.level_up_channel_id if db_guild else None
+            token_name = db_guild.token_name if db_guild and db_guild.token_name else "Hero Tokens"
 
             # Get level roles for this guild
             level_roles = (
@@ -404,7 +405,7 @@ class XPCog(commands.Cog):
 
             if token_diff > 0:
                 await level_channel.send(
-                    f"🪙 You earned **{token_diff} Hero Tokens**! Total: **{hero_tokens}**"
+                    f"🪙 You earned **{token_diff} {token_name}**! Total: **{hero_tokens}**"
                 )
 
             # Check for level role
@@ -1041,7 +1042,7 @@ class XPCog(commands.Cog):
 
     # User commands
 
-    @xp.command(name="profile", description="View your XP, level, and Hero Tokens")
+    @xp.command(name="profile", description="View your XP, level, and tokens")
     @discord.option("member", discord.Member, description="Member to view (default: yourself)", required=False)
     async def xp_profile(
         self,
@@ -1062,6 +1063,10 @@ class XPCog(commands.Cog):
                 )
                 return
 
+            # Get guild settings for token name
+            db_guild = session.get(Guild, ctx.guild.id)
+            token_name = db_guild.token_name if db_guild and db_guild.token_name else "Hero Tokens"
+
             embed = discord.Embed(
                 title=f"📊 {target.display_name}'s Profile",
                 color=discord.Color.gold()
@@ -1069,7 +1074,7 @@ class XPCog(commands.Cog):
 
             embed.add_field(name="🏆 Level", value=f"**{db_member.level}**", inline=True)
             embed.add_field(name="⭐ XP", value=f"**{db_member.xp:,.0f}**", inline=True)
-            embed.add_field(name="🪙 Hero Tokens", value=f"**{db_member.hero_tokens}**", inline=True)
+            embed.add_field(name=f"🪙 {token_name}", value=f"**{db_member.hero_tokens}**", inline=True)
 
             embed.add_field(
                 name="📈 Activity",
@@ -1172,7 +1177,7 @@ class XPCog(commands.Cog):
             ephemeral=True
         )
 
-    @xp.command(name="give-tokens", description="Give Hero Tokens to a member (Admin)")
+    @xp.command(name="give-tokens", description="Give tokens to a member (Admin)")
     @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def xp_give_tokens(
@@ -1181,7 +1186,7 @@ class XPCog(commands.Cog):
         member: discord.Member,
         amount: int
     ):
-        """Give Hero Tokens to a member."""
+        """Give tokens to a member."""
         if member.bot:
             await ctx.respond("❌ Cannot give tokens to bots.", ephemeral=True)
             return
@@ -1201,6 +1206,10 @@ class XPCog(commands.Cog):
             return
 
         with db_session_scope() as session:
+            # Get guild settings for token name
+            db_guild = session.get(Guild, ctx.guild.id)
+            token_name = db_guild.token_name if db_guild and db_guild.token_name else "Hero Tokens"
+
             db_member = session.get(GuildMember, (ctx.guild.id, member.id))
 
             if not db_member:
@@ -1226,7 +1235,7 @@ class XPCog(commands.Cog):
         )
 
         await ctx.respond(
-            f"✅ Gave **{amount} Hero Tokens** to {member.mention}. "
+            f"✅ Gave **{amount} {token_name}** to {member.mention}. "
             f"They now have **{final_tokens}** tokens.",
             ephemeral=True
         )
