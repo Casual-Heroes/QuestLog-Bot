@@ -1633,7 +1633,14 @@ class LFGGame(Base):
 
     # Game-specific options (JSON) - PREMIUM/PRO ONLY
     # Structure: {"options": [{"name": "Weapon", "choices": ["Sword", "Bow", ...]}, ...]}
+    # For role tagging: {"name": "Spec", "choices": [{"value": "Protection", "role": "tank"}, ...]}
     custom_options = Column(Text, nullable=True)
+
+    # Role detection mode for raids:
+    # - 'builtin': Use hardcoded mappings (WoW, FFXIV, Pantheon) - highest priority
+    # - 'custom': Use admin-defined role tags in custom_options - overrides generic
+    # - 'generic': Show Tank/Healer/DPS/Support/Flex dropdown - default fallback
+    role_detection_mode = Column(String(20), default='generic')
 
     # Group settings
     max_group_size = Column(Integer, default=4)
@@ -1686,6 +1693,14 @@ class LFGGroup(Base):
     max_group_size = Column(Integer, nullable=True)  # Override game's default max size for this specific group
     event_duration_hours = Column(Float, nullable=True)  # How long the event will last (in hours)
 
+    # Role composition (for any group type - dungeons, raids, etc.)
+    is_raid = Column(Boolean, default=False)  # Legacy - now use role fields directly
+    tanks_needed = Column(Integer, nullable=True)
+    healers_needed = Column(Integer, nullable=True)
+    dps_needed = Column(Integer, nullable=True)
+    support_needed = Column(Integer, nullable=True)
+    enforce_role_limits = Column(Boolean, default=True)  # If True, can't exceed role counts
+
     # Status
     is_active = Column(Boolean, default=True)
     is_full = Column(Boolean, default=False)
@@ -1713,6 +1728,10 @@ class LFGMember(Base):
     display_name = Column(String(255), nullable=True)
     rank_value = Column(Integer, nullable=True)  # e.g., Hunter Rank 150
     selections = Column(Text, nullable=True)  # JSON - their option selections
+
+    # Explicit role selection (for generic/custom role detection modes)
+    # Values: 'tank', 'healer', 'dps', 'support', 'flex', or NULL (auto-detect)
+    selected_role = Column(String(20), nullable=True)
 
     # Status
     is_creator = Column(Boolean, default=False)

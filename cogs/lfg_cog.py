@@ -21,6 +21,10 @@ from models import (
     LFGAttendance, LFGMemberStats, LFGConfig, AttendanceStatus
 )
 from utils import igdb
+from cogs.lfg_role_mappings import (
+    detect_role, get_builtin_game_type, get_role_emoji, get_role_label,
+    GENERIC_ROLE_CHOICES
+)
 
 # Don't call basicConfig() - config.py already set up logging
 logger = logging.getLogger("lfg")
@@ -292,8 +296,22 @@ class GroupManagementView(discord.ui.View):
             self.add_item(SetRankButton(self, self.game))
 
         # Add custom option selects - with user context for conditional filtering
+        # Skip Activity dropdown - Activity is set during group creation and cannot be changed afterward
         for i, option in enumerate(self.custom_options[:3]):
+            option_name = option.get("name", "").lower()
+            if option_name == "activity":
+                continue  # Activity is group-level, not member-level
             self.add_item(OptionSelect(self, option, i, user_id=user_id))
+
+        # Add generic role dropdown for raids when not using built-in detection
+        # (Built-in games like WoW/FFXIV use Class/Spec to determine role)
+        if getattr(self.group, 'is_raid', False):
+            game_name = self.game.game_name if self.game else ""
+            game_type = get_builtin_game_type(game_name)
+
+            # Only show role dropdown for non-builtin games (ESO, GW2, etc.)
+            if not game_type:
+                self.add_item(RoleSelect(self))
 
         # Join and Leave buttons
         self.add_item(JoinGroupButton(self))
@@ -315,89 +333,333 @@ class GroupManagementView(discord.ui.View):
     def build_embed(self) -> discord.Embed:
         embed = discord.Embed(
             title=f"{self.game.game_emoji or ''} {self.game.game_name} LFG",
-            description=f"Group by <@{self.group.creator_id}>",
             color=discord.Color.green()
         )
 
-        if self.group.scheduled_time:
-            embed.add_field(
-                name="Scheduled Time",
-                value=f"<t:{self.group.scheduled_time}:F>",
-                inline=True
-            )
+        # Build description with group info in a clean format
+        desc_lines = [f"**Group by** <@{self.group.creator_id}>"]
 
+        # Add description if provided
+        if self.group.description:
+            desc_lines.append(f"\n{self.group.description}")
+
+        embed.description = "\n".join(desc_lines)
+
+        # Show group's selected Activity types from creator's options
+        creator_data = self.member_data.get(self.group.creator_id) or self.member_data.get(str(self.group.creator_id)) or self.member_data.get(int(self.group.creator_id)) or {}
+        creator_options = creator_data.get("options", {})
+        activity_value = creator_options.get("Activity")
+        activity_text = None
+        is_raid = False
+        if activity_value:
+            activity_list = []
+            if isinstance(activity_value, list):
+                activity_list = [str(a) for a in activity_value]
+                activity_text = ", ".join(activity_list)
+            elif isinstance(activity_value, str):
+                if activity_value.startswith('[') and activity_value.endswith(']'):
+                    try:
+                        import json
+                        parsed = json.loads(activity_value)
+                        if isinstance(parsed, list):
+                            activity_list = [str(a) for a in parsed]
+                            activity_text = ", ".join(activity_list)
+                        else:
+                            activity_text = str(activity_value)
+                            activity_list = [activity_text]
+                    except:
+                        activity_text = str(activity_value)
+                        activity_list = [activity_text]
+                else:
+                    activity_text = str(activity_value)
+                    activity_list = [activity_text]
+            else:
+                activity_text = str(activity_value)
+                activity_list = [activity_text]
+            is_raid = any("Raid" in a for a in activity_list)
+
+        # ─────────────────────────────────────────────────────────────────────
+        # INFO ROW: Activity | Scheduled | Duration (all inline, single row)
+        # ─────────────────────────────────────────────────────────────────────
+        if activity_text:
+            embed.add_field(name="🎮 Activity", value=activity_text, inline=True)
+
+        # Scheduled Time
+        if self.group.scheduled_time:
+            scheduled_text = f"<t:{self.group.scheduled_time}:f>"
+        else:
+            scheduled_text = "Now / Flexible"
+        embed.add_field(name="📅 When", value=scheduled_text, inline=True)
+
+        # Duration
         if self.group.event_duration_hours:
-            # Format duration nicely
             duration = self.group.event_duration_hours
             if duration == int(duration):
-                duration_text = f"{int(duration)} hour{'s' if duration != 1 else ''}"
+                duration_text = f"{int(duration)}h"
             else:
-                duration_text = f"{duration} hours"
+                duration_text = f"{duration}h"
+        else:
+            duration_text = "—"
+        embed.add_field(name="⏱️ Duration", value=duration_text, inline=True)
 
+        # Check if group has role composition
+        tanks_needed = getattr(self.group, 'tanks_needed', 0) or 0
+        healers_needed = getattr(self.group, 'healers_needed', 0) or 0
+        dps_needed = getattr(self.group, 'dps_needed', 0) or 0
+        support_needed = getattr(self.group, 'support_needed', 0) or 0
+        has_role_composition = any([tanks_needed, healers_needed, dps_needed, support_needed])
+
+        # ─────────────────────────────────────────────────────────────────────
+        # ROLE COMPOSITION MODE
+        # ─────────────────────────────────────────────────────────────────────
+        if has_role_composition or getattr(self.group, 'is_raid', False) or is_raid:
+
+            # Categorize members by role
+            tanks_list = []
+            healers_list = []
+            dps_list = []
+            support_list = []
+            flex_list = []
+            unassigned_list = []
+
+            game_name = self.game.game_name if self.game else ""
+            role_detection_mode = getattr(self.game, 'role_detection_mode', 'generic') or 'generic'
+            custom_options = self.custom_options if isinstance(self.custom_options, list) else []
+
+            for uid, data in self.member_data.items():
+                options = data.get("options", {})
+                selected_role = data.get("selected_role")
+
+                # Extract display info - check standard keys first, then collect all custom options
+                spec = options.get("Specialization", [""])[0] if isinstance(options.get("Specialization"), list) else options.get("Specialization", "")
+                cls = options.get("Class", [""])[0] if isinstance(options.get("Class"), list) else options.get("Class", "")
+                job = options.get("Job", [""])[0] if isinstance(options.get("Job"), list) else options.get("Job", "")
+
+                # Build Class - Spec format for display (matching website format)
+                if cls and spec:
+                    # WoW-style: "Monk - Brewmaster"
+                    display_spec = f"{cls} - {spec}"
+                elif cls:
+                    display_spec = cls
+                elif spec:
+                    display_spec = spec
+                elif job:
+                    # FFXIV: just job name
+                    display_spec = job
+                else:
+                    display_spec = ""
+
+                # For custom games, collect all selections except Activity and Role
+                # (Role is redundant since it's shown by which column you're in)
+                if not display_spec and options:
+                    selection_parts = []
+                    for key, value in options.items():
+                        key_lower = key.lower()
+                        if key_lower == 'activity' or key_lower == 'role':
+                            continue
+                        if isinstance(value, list) and value:
+                            selection_parts.append(value[0])
+                        elif value and not isinstance(value, list):
+                            selection_parts.append(str(value))
+                    if selection_parts:
+                        display_spec = ", ".join(selection_parts)
+
+                # Shorter format for role columns
+                if display_spec:
+                    member_line = f"<@{uid}> • {display_spec}"
+                else:
+                    member_line = f"<@{uid}>"
+
+                detected_role = detect_role(
+                    game_name=game_name,
+                    role_detection_mode=role_detection_mode,
+                    member_selections=options,
+                    selected_role=selected_role,
+                    custom_options=custom_options
+                )
+
+                if detected_role == 'tank':
+                    tanks_list.append(member_line)
+                elif detected_role == 'healer':
+                    healers_list.append(member_line)
+                elif detected_role == 'dps':
+                    dps_list.append(member_line)
+                elif detected_role == 'support':
+                    support_list.append(member_line)
+                elif detected_role == 'flex':
+                    flex_list.append(member_line)
+                else:
+                    unassigned_list.append(member_line)
+
+            tank_count = len(tanks_list)
+            healer_count = len(healers_list)
+            dps_count = len(dps_list)
+            support_count = len(support_list)
+            flex_count = len(flex_list)
+
+            # ─────────────────────────────────────────────────────────────────
+            # ROLE ROW 1: Tank | Healer | DPS (always 3 columns)
+            # ─────────────────────────────────────────────────────────────────
+            tank_value = "\n".join(tanks_list[:8]) if tanks_list else "—"
+            if len(tanks_list) > 8:
+                tank_value += f"\n*+{len(tanks_list) - 8} more*"
             embed.add_field(
-                name="Event Duration",
-                value=f"⏰ {duration_text}",
+                name=f"🛡️ Tank ({tank_count}/{tanks_needed})",
+                value=tank_value,
                 inline=True
             )
 
-        if self.group.description:
-            embed.add_field(name="Description", value=self.group.description, inline=False)
+            healer_value = "\n".join(healers_list[:8]) if healers_list else "—"
+            if len(healers_list) > 8:
+                healer_value += f"\n*+{len(healers_list) - 8} more*"
+            embed.add_field(
+                name=f"💚 Healer ({healer_count}/{healers_needed})",
+                value=healer_value,
+                inline=True
+            )
 
-        # Show live player count (privacy-focused - just count, no names)
-        if hasattr(self.game, 'current_player_count') and self.game.current_player_count is not None:
-            count_text = f"{self.game.current_player_count} members currently playing"
-            if self.game.current_player_count == 0:
-                count_text = "No one currently playing"
-            elif self.game.current_player_count == 1:
-                count_text = "1 member currently playing"
+            dps_value = "\n".join(dps_list[:8]) if dps_list else "—"
+            if len(dps_list) > 8:
+                dps_value += f"\n*+{len(dps_list) - 8} more*"
+            embed.add_field(
+                name=f"⚔️ DPS ({dps_count}/{dps_needed})",
+                value=dps_value,
+                inline=True
+            )
+
+            # ─────────────────────────────────────────────────────────────────
+            # ROLE ROW 2: Support | Flex | Unassigned (if needed) - pad to 3 columns
+            # ─────────────────────────────────────────────────────────────────
+            has_support = support_list or support_needed > 0
+            has_flex = len(flex_list) > 0
+            has_unassigned = len(unassigned_list) > 0
+
+            if has_support or has_flex or has_unassigned:
+                # Support column
+                if has_support:
+                    support_value = "\n".join(support_list[:8]) if support_list else "—"
+                    if len(support_list) > 8:
+                        support_value += f"\n*+{len(support_list) - 8} more*"
+                    embed.add_field(
+                        name=f"🎵 Support ({support_count}/{support_needed})",
+                        value=support_value,
+                        inline=True
+                    )
+
+                # Flex column
+                if has_flex:
+                    flex_value = "\n".join(flex_list[:8])
+                    if len(flex_list) > 8:
+                        flex_value += f"\n*+{len(flex_list) - 8} more*"
+                    embed.add_field(
+                        name=f"🔄 Flex ({flex_count})",
+                        value=flex_value,
+                        inline=True
+                    )
+
+                # Unassigned column
+                if has_unassigned:
+                    unassigned_value = "\n".join(unassigned_list[:8])
+                    if len(unassigned_list) > 8:
+                        unassigned_value += f"\n*+{len(unassigned_list) - 8} more*"
+                    embed.add_field(
+                        name=f"❓ Unassigned ({len(unassigned_list)})",
+                        value=unassigned_value,
+                        inline=True
+                    )
+
+                # Pad with empty field to complete the row of 3
+                fields_in_row = (1 if has_support else 0) + (1 if has_flex else 0) + (1 if has_unassigned else 0)
+                if fields_in_row == 1:
+                    embed.add_field(name="\u200b", value="\u200b", inline=True)
+                    embed.add_field(name="\u200b", value="\u200b", inline=True)
+                elif fields_in_row == 2:
+                    embed.add_field(name="\u200b", value="\u200b", inline=True)
+
+            # ─────────────────────────────────────────────────────────────────
+            # FOOTER ROW: Roster summary (full width)
+            # ─────────────────────────────────────────────────────────────────
+            total_assigned = tank_count + healer_count + dps_count + support_count + flex_count
+            total_needed = tanks_needed + healers_needed + dps_needed + support_needed
+            roster_text = f"**{total_assigned}/{total_needed}** signed up"
+            if flex_count > 0:
+                roster_text += f" • {flex_count} flex"
+            if unassigned_list:
+                roster_text += f" • {len(unassigned_list)} unassigned"
+            enforce_role_limits = getattr(self.group, 'enforce_role_limits', True)
+            if enforce_role_limits is False:
+                roster_text += " • *limits off*"
+            embed.add_field(name="📊 Roster", value=roster_text, inline=False)
+
+        else:
+            # Non-raid: show regular playing now + member list
+            # Show live player count (always show, even when 0)
+            player_count = getattr(self.game, 'current_player_count', 0) or 0
+            if player_count == 0:
+                count_text = "0 members playing"
+            elif player_count == 1:
+                count_text = "1 member playing"
+            else:
+                count_text = f"{player_count} members playing"
 
             embed.add_field(
-                name="🎮 Activity",
+                name="👥 Playing Now",
                 value=count_text,
                 inline=True
             )
 
-        # Member list
-        member_count = len(self.member_data)
-        max_size = self.group.max_group_size or self.game.max_group_size  # Use group's custom size or game default
+            # Member list for non-raid
+            member_count = len(self.member_data)
+            max_size = self.group.max_group_size or self.game.max_group_size
 
-        if member_count >= max_size:
-            embed.description += "\n**Group is FULL!**"
+            if member_count >= max_size:
+                embed.description += "\n**Group is FULL!**"
 
-        if not self.member_data:
-            embed.add_field(name="Members (0)", value="No one joined yet.", inline=False)
-        else:
-            lines = []
-            for uid, data in self.member_data.items():
-                line = f"<@{uid}>"
-                if self.game.require_rank and data.get("rank"):
-                    line += f" ({self.game.rank_label}: {data['rank']})"
-                options = data.get("options", {})
-                if options:
-                    # Format options nicely - extract from lists and clean up
-                    formatted_parts = []
+            if not self.member_data:
+                embed.add_field(name="Members (0)", value="No one joined yet.", inline=False)
+            else:
+                lines = []
+                for uid, data in self.member_data.items():
+                    line = f"<@{uid}>"
+                    if self.game.require_rank and data.get("rank"):
+                        line += f" ({self.game.rank_label}: {data['rank']})"
+                    options = data.get("options", {})
+                    if options:
+                        formatted_parts = []
 
-                    # Special handling for Class + Specialization combo (show Spec - Class)
-                    if "Specialization" in options and "Class" in options:
-                        spec = options["Specialization"][0] if isinstance(options["Specialization"], list) else options["Specialization"]
-                        cls = options["Class"][0] if isinstance(options["Class"], list) else options["Class"]
-                        formatted_parts.append(f"{spec} - {cls}")
-                        # Skip these in the general loop below
-                        skip_keys = {"Specialization", "Class"}
-                    else:
-                        skip_keys = set()
+                        # Special handling for Class + Specialization combo - match website format: "Class - Spec"
+                        if "Specialization" in options and "Class" in options:
+                            spec = options["Specialization"][0] if isinstance(options["Specialization"], list) else options["Specialization"]
+                            cls = options["Class"][0] if isinstance(options["Class"], list) else options["Class"]
+                            formatted_parts.append(f"{cls} - {spec}")
+                            skip_keys = {"Specialization", "Class"}
+                        elif "Class" in options:
+                            # Just Class, no Spec
+                            cls = options["Class"][0] if isinstance(options["Class"], list) else options["Class"]
+                            formatted_parts.append(cls)
+                            skip_keys = {"Class"}
+                        elif "Job" in options:
+                            # FFXIV-style Job
+                            job = options["Job"][0] if isinstance(options["Job"], list) else options["Job"]
+                            formatted_parts.append(job)
+                            skip_keys = {"Job"}
+                        else:
+                            skip_keys = set()
 
-                    # Handle all other options
-                    for k, v in options.items():
-                        if k in skip_keys:
-                            continue
-                        # Extract from list if it's a list
-                        value = v[0] if isinstance(v, list) and len(v) > 0 else v
-                        formatted_parts.append(f"{value}")
+                        # Add remaining options (excluding Activity and Role which are redundant)
+                        for k, v in options.items():
+                            if k in skip_keys:
+                                continue
+                            if k.lower() in ('activity', 'role'):
+                                continue
+                            value = v[0] if isinstance(v, list) and len(v) > 0 else v
+                            if value:
+                                formatted_parts.append(str(value))
 
-                    if formatted_parts:
-                        line += f" - {', '.join(formatted_parts)}"
-                lines.append(line)
+                        # Use bullet format to match website: "@user • Class - Spec"
+                        if formatted_parts:
+                            line += f" • {', '.join(formatted_parts)}"
+                    lines.append(line)
             embed.add_field(
                 name=f"Members ({member_count}/{max_size})",
                 value="\n".join(lines),
@@ -495,7 +757,19 @@ class OptionSelect(discord.ui.Select):
             # Simple list of choices
             choices = raw_choices[:25] if isinstance(raw_choices, list) else []
 
-        options = [discord.SelectOption(label=c) for c in choices] if choices else [discord.SelectOption(label="No options", value="none")]
+        # Build options - handle both string and object {value, role} formats
+        if choices:
+            options = []
+            for c in choices:
+                if isinstance(c, dict) and 'value' in c:
+                    # Role-tagged choice format: {value: "Tank", role: "tank"}
+                    options.append(discord.SelectOption(label=c['value'], value=c['value']))
+                else:
+                    # Simple string format
+                    options.append(discord.SelectOption(label=str(c)))
+        else:
+            options = [discord.SelectOption(label="No options", value="none")]
+
         super().__init__(
             placeholder=f"Select {self.option_name}",
             min_values=1,
@@ -505,6 +779,37 @@ class OptionSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        selected_value = self.values[0]
+
+        # Activity can only be changed by the leader or co-leader
+        if self.option_name.lower() == "activity":
+            is_leader_or_co_leader = False
+            if interaction.user.id == self.parent_view.group.creator_id:
+                is_leader_or_co_leader = True
+            else:
+                # Check if user is a co-leader
+                try:
+                    with get_db_session() as session:
+                        from models import LFGMember
+                        member = session.query(LFGMember).filter(
+                            LFGMember.group_id == self.parent_view.group.id,
+                            LFGMember.user_id == interaction.user.id,
+                            LFGMember.is_co_leader == True,
+                            LFGMember.left_at == None
+                        ).first()
+                        if member:
+                            is_leader_or_co_leader = True
+                except:
+                    pass
+
+            if not is_leader_or_co_leader:
+                await interaction.response.send_message(
+                    "❌ Only the group leader or co-leaders can change the Activity.",
+                    ephemeral=True
+                )
+                asyncio.create_task(_auto_delete_after(interaction))
+                return
+
         # Auto-join group if user is not already in it
         if interaction.user.id not in self.parent_view.member_data:
             # Check if group is full
@@ -513,6 +818,65 @@ class OptionSelect(discord.ui.Select):
                 await interaction.response.send_message("❌ This group is full!", ephemeral=True)
                 asyncio.create_task(_auto_delete_after(interaction))
                 return
+
+            # Check role limits if group has role composition and enforce_role_limits is True
+            group = self.parent_view.group
+            tanks_needed = getattr(group, 'tanks_needed', 0) or 0
+            healers_needed = getattr(group, 'healers_needed', 0) or 0
+            dps_needed = getattr(group, 'dps_needed', 0) or 0
+            support_needed = getattr(group, 'support_needed', 0) or 0
+            has_role_composition = any([tanks_needed, healers_needed, dps_needed, support_needed])
+            enforce_role_limits = getattr(group, 'enforce_role_limits', True)
+
+            if has_role_composition and enforce_role_limits:
+                # Create temporary options dict with the new selection
+                temp_options = {self.option_name: selected_value}
+
+                # Get game name and custom options for role detection
+                game_name = self.parent_view.game.game_name if self.parent_view.game else ""
+                custom_options = self.parent_view.custom_options if isinstance(self.parent_view.custom_options, list) else []
+
+                # Detect what role this selection would give the user
+                detected_role = detect_role(
+                    game_name=game_name,
+                    role_detection_mode='generic',
+                    member_selections=temp_options,
+                    selected_role=None,
+                    custom_options=custom_options
+                )
+
+                if detected_role and detected_role != 'flex':
+                    # Count current members by role
+                    role_counts = {'tank': 0, 'healer': 0, 'dps': 0, 'support': 0}
+                    for uid, data in self.parent_view.member_data.items():
+                        m_options = data.get('options', {})
+                        m_selected_role = data.get('selected_role')
+                        m_role = detect_role(
+                            game_name=game_name,
+                            role_detection_mode='generic',
+                            member_selections=m_options,
+                            selected_role=m_selected_role,
+                            custom_options=custom_options
+                        )
+                        if m_role and m_role in role_counts:
+                            role_counts[m_role] += 1
+
+                    # Check if this role slot is full
+                    role_limits = {
+                        'tank': tanks_needed,
+                        'healer': healers_needed,
+                        'dps': dps_needed,
+                        'support': support_needed
+                    }
+
+                    if role_counts.get(detected_role, 0) >= role_limits.get(detected_role, 0):
+                        role_label = detected_role.upper() if detected_role != 'dps' else 'DPS'
+                        await interaction.response.send_message(
+                            f"❌ Cannot join as **{role_label}** - all {role_limits[detected_role]} slot(s) filled.\nTry selecting a different class/spec or wait for a spot to open.",
+                            ephemeral=True
+                        )
+                        asyncio.create_task(_auto_delete_after(interaction))
+                        return
 
             # Add to group
             self.parent_view.member_data[interaction.user.id] = {"options": {}}
@@ -599,6 +963,79 @@ class OptionSelect(discord.ui.Select):
                 asyncio.create_task(_auto_delete_after(interaction))
                 return
 
+        # Check role limits if this is an existing member changing their class/spec
+        # (New members are already checked above in the auto-join section)
+        if interaction.user.id in self.parent_view.member_data:
+            group = self.parent_view.group
+            tanks_needed = getattr(group, 'tanks_needed', 0) or 0
+            healers_needed = getattr(group, 'healers_needed', 0) or 0
+            dps_needed = getattr(group, 'dps_needed', 0) or 0
+            support_needed = getattr(group, 'support_needed', 0) or 0
+            has_role_composition = any([tanks_needed, healers_needed, dps_needed, support_needed])
+            enforce_role_limits = getattr(group, 'enforce_role_limits', True)
+
+            if has_role_composition and enforce_role_limits:
+                # Create temp options with the NEW selection to detect NEW role
+                temp_options = dict(self.parent_view.member_data[interaction.user.id].get("options", {}))
+                temp_options[self.option_name] = selected_value
+
+                game_name = self.parent_view.game.game_name if self.parent_view.game else ""
+                custom_options = self.parent_view.custom_options if isinstance(self.parent_view.custom_options, list) else []
+
+                # Detect what role the NEW selection would give
+                new_role = detect_role(
+                    game_name=game_name,
+                    role_detection_mode='generic',
+                    member_selections=temp_options,
+                    selected_role=self.parent_view.member_data[interaction.user.id].get('selected_role'),
+                    custom_options=custom_options
+                )
+
+                # Detect the user's CURRENT role
+                current_options = self.parent_view.member_data[interaction.user.id].get("options", {})
+                current_role = detect_role(
+                    game_name=game_name,
+                    role_detection_mode='generic',
+                    member_selections=current_options,
+                    selected_role=self.parent_view.member_data[interaction.user.id].get('selected_role'),
+                    custom_options=custom_options
+                )
+
+                # Only check limits if the role is actually changing
+                if new_role and new_role != 'flex' and new_role != current_role:
+                    # Count current members by role (excluding this user)
+                    role_counts = {'tank': 0, 'healer': 0, 'dps': 0, 'support': 0}
+                    for uid, data in self.parent_view.member_data.items():
+                        if uid == interaction.user.id:
+                            continue  # Skip current user
+                        m_options = data.get('options', {})
+                        m_selected_role = data.get('selected_role')
+                        m_role = detect_role(
+                            game_name=game_name,
+                            role_detection_mode='generic',
+                            member_selections=m_options,
+                            selected_role=m_selected_role,
+                            custom_options=custom_options
+                        )
+                        if m_role and m_role in role_counts:
+                            role_counts[m_role] += 1
+
+                    role_limits = {
+                        'tank': tanks_needed,
+                        'healer': healers_needed,
+                        'dps': dps_needed,
+                        'support': support_needed
+                    }
+
+                    if role_counts.get(new_role, 0) >= role_limits.get(new_role, 0):
+                        role_label = new_role.upper() if new_role != 'dps' else 'DPS'
+                        await interaction.response.send_message(
+                            f"❌ Cannot switch to **{role_label}** - all {role_limits[new_role]} slot(s) filled.\nChoose a different class/spec or wait for a spot to open.",
+                            ephemeral=True
+                        )
+                        asyncio.create_task(_auto_delete_after(interaction))
+                        return
+
         # Validation passed - save the selection
         self.parent_view.member_data[interaction.user.id]["options"][self.option_name] = selected_value
 
@@ -608,10 +1045,11 @@ class OptionSelect(discord.ui.Select):
                 import json as json_lib
                 from models import LFGMember
 
-                # Get or create member record
-                member = session.query(LFGMember).filter_by(
-                    group_id=self.parent_view.group.id,
-                    user_id=interaction.user.id
+                # Get active member record (not left)
+                member = session.query(LFGMember).filter(
+                    LFGMember.group_id == self.parent_view.group.id,
+                    LFGMember.user_id == interaction.user.id,
+                    LFGMember.left_at == None
                 ).first()
 
                 if member:
@@ -647,6 +1085,202 @@ class OptionSelect(discord.ui.Select):
                 ephemeral=True
             )
             asyncio.create_task(_auto_delete_after(interaction))
+
+
+class RoleSelect(discord.ui.Select):
+    """
+    Role selection dropdown for raids using generic role detection mode.
+    Shows Tank/Healer/DPS/Support/Flex options.
+    Only appears for raids when game is NOT a built-in game (WoW, FFXIV, Pantheon).
+    """
+    def __init__(self, view):
+        self.parent_view = view
+
+        # Build role options from GENERIC_ROLE_CHOICES
+        options = [
+            discord.SelectOption(
+                label=choice['label'],
+                value=choice['value'],
+                emoji=choice['emoji']
+            )
+            for choice in GENERIC_ROLE_CHOICES
+        ]
+
+        super().__init__(
+            placeholder="Select your role",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id=f"lfg_role_{view.group.id}"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        selected_role = self.values[0]
+
+        # Auto-join group if user is not already in it
+        if interaction.user.id not in self.parent_view.member_data:
+            # Check if group is full
+            max_size = self.parent_view.group.max_group_size or self.parent_view.game.max_group_size
+            if len(self.parent_view.member_data) >= max_size:
+                await interaction.response.send_message("❌ This group is full!", ephemeral=True)
+                asyncio.create_task(_auto_delete_after(interaction))
+                return
+
+            # Check role limits if group has role composition and enforce_role_limits is True
+            group = self.parent_view.group
+            tanks_needed = getattr(group, 'tanks_needed', 0) or 0
+            healers_needed = getattr(group, 'healers_needed', 0) or 0
+            dps_needed = getattr(group, 'dps_needed', 0) or 0
+            support_needed = getattr(group, 'support_needed', 0) or 0
+            has_role_composition = any([tanks_needed, healers_needed, dps_needed, support_needed])
+            enforce_role_limits = getattr(group, 'enforce_role_limits', True)
+
+            if has_role_composition and enforce_role_limits and selected_role and selected_role != 'flex':
+                # Count current members by role
+                role_counts = {'tank': 0, 'healer': 0, 'dps': 0, 'support': 0}
+                for uid, data in self.parent_view.member_data.items():
+                    m_role = data.get('selected_role')
+                    if m_role and m_role in role_counts:
+                        role_counts[m_role] += 1
+
+                # Check if this role slot is full
+                role_limits = {
+                    'tank': tanks_needed,
+                    'healer': healers_needed,
+                    'dps': dps_needed,
+                    'support': support_needed
+                }
+
+                if role_counts.get(selected_role, 0) >= role_limits.get(selected_role, 0):
+                    role_label = selected_role.upper() if selected_role != 'dps' else 'DPS'
+                    await interaction.response.send_message(
+                        f"❌ Cannot join as **{role_label}** - all {role_limits[selected_role]} slot(s) filled.\nTry selecting a different role or wait for a spot to open.",
+                        ephemeral=True
+                    )
+                    asyncio.create_task(_auto_delete_after(interaction))
+                    return
+
+            # Add to group
+            self.parent_view.member_data[interaction.user.id] = {"options": {}, "selected_role": selected_role}
+
+            # Add to database
+            try:
+                with get_db_session() as session:
+                    from models import LFGMember, LFGGroup, LFGConfig
+
+                    existing_member = session.query(LFGMember).filter_by(
+                        group_id=self.parent_view.group.id,
+                        user_id=interaction.user.id
+                    ).first()
+
+                    if not existing_member:
+                        new_member = LFGMember(
+                            group_id=self.parent_view.group.id,
+                            user_id=interaction.user.id,
+                            display_name=interaction.user.display_name,
+                            rank_value=None,
+                            selections=None,
+                            selected_role=selected_role,
+                            is_creator=False,
+                            is_co_leader=False
+                        )
+                        session.add(new_member)
+
+                        # Update group member count
+                        group = session.query(LFGGroup).filter_by(id=self.parent_view.group.id).first()
+                        if group:
+                            group.member_count += 1
+                            if group.member_count >= group.max_group_size:
+                                group.is_full = True
+
+                        session.commit()
+
+                    # Auto-confirm attendance if tracking is enabled
+                    config = session.query(LFGConfig).filter_by(
+                        guild_id=self.parent_view.group.guild_id
+                    ).first()
+
+                    if config and config.attendance_tracking_enabled:
+                        await _auto_confirm_attendance(session, self.parent_view.group.id, interaction.user.id)
+            except Exception as e:
+                logger.error(f"Error adding member to database with role: {e}")
+
+            # Add to thread
+            try:
+                thread = interaction.channel
+                if isinstance(thread, discord.Thread):
+                    await thread.add_user(interaction.user)
+            except Exception as e:
+                logger.error(f"Failed to add user to thread: {e}")
+        else:
+            # User already in group - check role limits before updating
+            group = self.parent_view.group
+            tanks_needed = getattr(group, 'tanks_needed', 0) or 0
+            healers_needed = getattr(group, 'healers_needed', 0) or 0
+            dps_needed = getattr(group, 'dps_needed', 0) or 0
+            support_needed = getattr(group, 'support_needed', 0) or 0
+            has_role_composition = any([tanks_needed, healers_needed, dps_needed, support_needed])
+            enforce_role_limits = getattr(group, 'enforce_role_limits', True)
+
+            # Get user's current role
+            current_role = self.parent_view.member_data[interaction.user.id].get('selected_role')
+
+            # Check role limits if changing to a different role
+            if has_role_composition and enforce_role_limits and selected_role != 'flex' and selected_role != current_role:
+                # Count current members by role (excluding this user)
+                role_counts = {'tank': 0, 'healer': 0, 'dps': 0, 'support': 0}
+                for uid, data in self.parent_view.member_data.items():
+                    if uid == interaction.user.id:
+                        continue  # Skip current user
+                    m_role = data.get('selected_role')
+                    if m_role and m_role in role_counts:
+                        role_counts[m_role] += 1
+
+                role_limits = {
+                    'tank': tanks_needed,
+                    'healer': healers_needed,
+                    'dps': dps_needed,
+                    'support': support_needed
+                }
+
+                if role_counts.get(selected_role, 0) >= role_limits.get(selected_role, 0):
+                    role_label = selected_role.upper() if selected_role != 'dps' else 'DPS'
+                    await interaction.response.send_message(
+                        f"❌ Cannot switch to **{role_label}** - all {role_limits[selected_role]} slot(s) filled.\nChoose a different role or wait for a spot to open.",
+                        ephemeral=True
+                    )
+                    asyncio.create_task(_auto_delete_after(interaction))
+                    return
+
+            # Limits check passed - update the role
+            self.parent_view.member_data[interaction.user.id]["selected_role"] = selected_role
+
+            # Update in database
+            try:
+                with get_db_session() as session:
+                    member = session.query(LFGMember).filter(
+                        LFGMember.group_id == self.parent_view.group.id,
+                        LFGMember.user_id == interaction.user.id,
+                        LFGMember.left_at == None
+                    ).first()
+
+                    if member:
+                        member.selected_role = selected_role
+                        session.commit()
+                        logger.info(f"Updated selected_role for user {interaction.user.id}: {selected_role}")
+            except Exception as e:
+                logger.error(f"Error updating selected_role in database: {e}")
+
+        # Get role label for display
+        role_label = get_role_label(selected_role)
+        role_emoji = get_role_emoji(selected_role)
+
+        await self.parent_view.update_embed()
+        await interaction.response.send_message(
+            f"{role_emoji} Role set to **{role_label}**!",
+            ephemeral=True
+        )
+        asyncio.create_task(_auto_delete_after(interaction))
 
 
 class JoinGroupButton(discord.ui.Button):
@@ -1250,7 +1884,16 @@ class CreationOptionSelect(discord.ui.Select):
             # Simple list of choices
             choices = raw_choices[:25] if isinstance(raw_choices, list) else []
 
-        options = [discord.SelectOption(label=c) for c in choices]
+        # Build options - handle both string and object {value, role} formats
+        options = []
+        for c in choices:
+            if isinstance(c, dict) and 'value' in c:
+                # Role-tagged choice format: {value: "Tank", role: "tank"}
+                options.append(discord.SelectOption(label=c['value'], value=c['value']))
+            else:
+                # Simple string format
+                options.append(discord.SelectOption(label=str(c)))
+
         max_vals = option.get("max_select", 1)
         super().__init__(
             placeholder=f"Select {self.option_name}",
@@ -1597,6 +2240,34 @@ class LFGCog(commands.Cog):
         """Cancel background tasks when cog is unloaded."""
         self.attendance_check_loop.cancel()
         self.reconnect_persistent_views.cancel()
+
+    @commands.Cog.listener()
+    async def on_thread_delete(self, thread: discord.Thread):
+        """
+        Handle when an LFG thread is deleted from Discord.
+        Mark the corresponding LFG group as inactive in the database.
+        """
+        try:
+            with get_db_session() as session:
+                # Find any LFG group that has this thread_id
+                group = session.query(LFGGroup).filter_by(
+                    thread_id=thread.id,
+                    is_active=True
+                ).first()
+
+                if not group:
+                    # Not an LFG thread or already inactive
+                    return
+
+                # Mark the group as inactive and clear the thread reference
+                group.is_active = False
+                group.thread_id = None
+                session.commit()
+
+                logger.info(f"LFG group {group.id} marked inactive - Discord thread {thread.id} was deleted")
+
+        except Exception as e:
+            logger.error(f"Error handling thread delete for LFG: {e}", exc_info=True)
 
     @tasks.loop(count=1)
     async def reconnect_persistent_views(self):
