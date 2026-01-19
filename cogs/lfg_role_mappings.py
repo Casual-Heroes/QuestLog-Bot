@@ -24,6 +24,8 @@ BUILTIN_GAMES = {
     'wow': ['world of warcraft', 'wow'],
     'ffxiv': ['final fantasy xiv', 'final fantasy 14', 'ffxiv', 'ff14'],
     'pantheon': ['pantheon', 'pantheon: rise of the fallen'],
+    'gw2': ['guild wars 2', 'gw2'],
+    'eso': ['elder scrolls online', 'eso', 'teso'],
 }
 
 
@@ -183,6 +185,37 @@ PANTHEON_ROLE_MAPPINGS = {
 
 
 # =============================================================================
+# GUILD WARS 2 - Flexible Class System
+# GW2 classes can fill any role depending on build, so role is user-selected
+# =============================================================================
+
+GW2_CLASSES = [
+    'warrior', 'guardian', 'revenant',
+    'ranger', 'thief', 'engineer',
+    'necromancer', 'elementalist', 'mesmer'
+]
+
+# GW2 doesn't have fixed role mappings - any class can be any role
+# Role is determined by user selection, not class
+GW2_ROLE_MAPPINGS = {}  # Empty - role comes from user's Role field selection
+
+
+# =============================================================================
+# ELDER SCROLLS ONLINE - Flexible Class System
+# ESO classes can fill any role depending on build, so role is user-selected
+# =============================================================================
+
+ESO_CLASSES = [
+    'dragonknight', 'sorcerer', 'nightblade', 'templar',
+    'warden', 'necromancer', 'arcanist'
+]
+
+# ESO doesn't have fixed role mappings - any class can be any role
+# Role is determined by user selection, not class
+ESO_ROLE_MAPPINGS = {}  # Empty - role comes from user's Role field selection
+
+
+# =============================================================================
 # ROLE DETECTION FUNCTIONS
 # =============================================================================
 
@@ -258,9 +291,10 @@ def detect_role(
     Detect a member's role using the priority system.
 
     Priority:
-    1. Built-in mappings (for WoW, FFXIV, Pantheon)
-    2. Custom role tags in options (if mode is 'custom')
-    3. Explicit selected_role (if mode is 'generic')
+    1. Built-in mappings (for WoW, FFXIV, Pantheon - class/spec determines role)
+    2. GW2 special case (class is flexible, user selects role separately)
+    3. Custom role tags in options (if mode is 'custom')
+    4. Explicit selected_role (if mode is 'generic')
 
     Args:
         game_name: The game name
@@ -276,6 +310,23 @@ def detect_role(
     game_type = get_builtin_game_type(game_name)
 
     if game_type:
+        # GW2 and ESO special handling - classes are flexible, role is selected separately
+        if game_type in ('gw2', 'eso'):
+            # Check for Role field selection first
+            for key in ['Role', 'role']:
+                if key in member_selections:
+                    val = member_selections[key]
+                    role_val = val[0] if isinstance(val, list) else val
+                    if role_val:
+                        role_lower = role_val.lower()
+                        if role_lower in ('tank', 'healer', 'dps', 'support', 'flex'):
+                            return role_lower
+            # For GW2/ESO, fall through to selected_role if no Role field
+            if selected_role and selected_role in ('tank', 'healer', 'dps', 'support', 'flex'):
+                return selected_role
+            return None
+
+        # WoW, FFXIV, Pantheon - class/spec determines role automatically
         # Extract spec/class from selections
         spec = None
         cls = None

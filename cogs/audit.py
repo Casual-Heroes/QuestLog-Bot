@@ -430,6 +430,37 @@ class AuditCog(commands.Cog):
         added_roles = set(after.roles) - set(before.roles)
         removed_roles = set(before.roles) - set(after.roles)
 
+        # Update cached_members when roles change (for dashboard admin role checks)
+        if added_roles or removed_roles:
+            try:
+                with db_session_scope() as session:
+                    db_guild = session.get(Guild, after.guild.id)
+                    if db_guild and db_guild.cached_members:
+                        cached_members = json.loads(db_guild.cached_members)
+                        # Find and update this member's roles in the cache
+                        member_found = False
+                        for member in cached_members:
+                            if str(member.get('id')) == str(after.id):
+                                member['roles'] = [str(role.id) for role in after.roles if role.name != "@everyone"]
+                                member['display_name'] = after.display_name
+                                member_found = True
+                                break
+                        # If member not in cache, add them
+                        if not member_found:
+                            cached_members.append({
+                                'id': str(after.id),
+                                'username': after.name,
+                                'discriminator': after.discriminator,
+                                'display_name': after.display_name,
+                                'avatar': after.avatar.url if after.avatar else None,
+                                'roles': [str(role.id) for role in after.roles if role.name != "@everyone"],
+                                'joined_at': after.joined_at.isoformat() if after.joined_at else None
+                            })
+                        db_guild.cached_members = json.dumps(cached_members)
+                        logger.debug(f"Updated cached_members for {after} in {after.guild.name} (role change)")
+            except Exception as e:
+                logger.error(f"Failed to update cached_members for role change: {e}")
+
         for role in added_roles:
             if role.is_default():
                 continue

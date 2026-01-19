@@ -436,9 +436,20 @@ class GroupManagementView(discord.ui.View):
                 job = options.get("Job", [""])[0] if isinstance(options.get("Job"), list) else options.get("Job", "")
 
                 # Build Class - Spec format for display (matching website format)
+                # Check if this is a flexible role game (GW2/ESO) where we show Class - Role
+                game_type = get_builtin_game_type(game_name)
+                role_field = options.get("Role", [""])[0] if isinstance(options.get("Role"), list) else options.get("Role", "")
+                subclass = options.get("Subclass", [""])[0] if isinstance(options.get("Subclass"), list) else options.get("Subclass", "")
+
                 if cls and spec:
                     # WoW-style: "Monk - Brewmaster"
                     display_spec = f"{cls} - {spec}"
+                elif cls and subclass and game_type == 'eso':
+                    # ESO: "Dragonknight - Sorcerer" (Class + Subclass)
+                    display_spec = f"{cls} - {subclass}"
+                elif cls and game_type in ('gw2', 'eso'):
+                    # GW2/ESO: Just show class - role is already shown in the column header
+                    display_spec = cls
                 elif cls:
                     display_spec = cls
                 elif spec:
@@ -628,11 +639,27 @@ class GroupManagementView(discord.ui.View):
                         formatted_parts = []
 
                         # Special handling for Class + Specialization combo - match website format: "Class - Spec"
+                        # Check if this is a flexible role game (GW2/ESO)
+                        game_name = self.game.game_name if self.game else ""
+                        game_type = get_builtin_game_type(game_name)
+
                         if "Specialization" in options and "Class" in options:
                             spec = options["Specialization"][0] if isinstance(options["Specialization"], list) else options["Specialization"]
                             cls = options["Class"][0] if isinstance(options["Class"], list) else options["Class"]
                             formatted_parts.append(f"{cls} - {spec}")
                             skip_keys = {"Specialization", "Class"}
+                        elif "Class" in options and "Subclass" in options and game_type == 'eso':
+                            # ESO: "Dragonknight - Sorcerer" (Class + Subclass)
+                            cls = options["Class"][0] if isinstance(options["Class"], list) else options["Class"]
+                            subclass = options["Subclass"][0] if isinstance(options["Subclass"], list) else options["Subclass"]
+                            formatted_parts.append(f"{cls} - {subclass}")
+                            skip_keys = {"Class", "Subclass"}
+                        elif "Class" in options and "Role" in options and game_type == 'gw2':
+                            # GW2: "Guardian - Tank" (Class + Role since role is user-selected)
+                            cls = options["Class"][0] if isinstance(options["Class"], list) else options["Class"]
+                            role = options["Role"][0] if isinstance(options["Role"], list) else options["Role"]
+                            formatted_parts.append(f"{cls} - {role}")
+                            skip_keys = {"Class", "Role"}
                         elif "Class" in options:
                             # Just Class, no Spec
                             cls = options["Class"][0] if isinstance(options["Class"], list) else options["Class"]
@@ -734,6 +761,7 @@ class OptionSelect(discord.ui.Select):
         # Get choices - handle both list and conditional dict
         raw_choices = option.get("choices", [])
         depends_on = option.get("depends_on")
+        exclude_same_as = option.get("exclude_same_as")
 
         # If choices is a dict (conditional dropdown), filter by parent selection
         if isinstance(raw_choices, dict) and depends_on:
@@ -756,6 +784,21 @@ class OptionSelect(discord.ui.Select):
         else:
             # Simple list of choices
             choices = raw_choices[:25] if isinstance(raw_choices, list) else []
+
+        # Handle exclude_same_as - filter out the value selected in another field
+        if exclude_same_as and user_id and user_id in view.member_data:
+            user_options = view.member_data[user_id].get("options", {})
+            exclude_value = user_options.get(exclude_same_as)
+            if exclude_value:
+                # Filter out the excluded value
+                filtered_choices = []
+                for c in choices:
+                    if isinstance(c, dict) and 'value' in c:
+                        if c['value'] != exclude_value:
+                            filtered_choices.append(c)
+                    elif str(c) != exclude_value:
+                        filtered_choices.append(c)
+                choices = filtered_choices
 
         # Build options - handle both string and object {value, role} formats
         if choices:
@@ -935,7 +978,21 @@ class OptionSelect(discord.ui.Select):
 
         selected_value = self.values[0]
         depends_on = self.option_config.get("depends_on")
+        exclude_same_as = self.option_config.get("exclude_same_as")
         raw_choices = self.option_config.get("choices", [])
+
+        # Validate exclude_same_as constraint (e.g., ESO Subclass can't be same as Class)
+        if exclude_same_as and interaction.user.id in self.parent_view.member_data:
+            user_options = self.parent_view.member_data[interaction.user.id].get("options", {})
+            excluded_value = user_options.get(exclude_same_as)
+            if excluded_value and selected_value == excluded_value:
+                await interaction.response.send_message(
+                    f"❌ **{self.option_name}** cannot be the same as **{exclude_same_as}**!\n"
+                    f"Please select a different {self.option_name}.",
+                    ephemeral=True
+                )
+                asyncio.create_task(_auto_delete_after(interaction))
+                return
 
         # Validate conditional dropdown selection
         if isinstance(raw_choices, dict) and depends_on:
@@ -1060,14 +1117,14 @@ class OptionSelect(discord.ui.Select):
         except Exception as e:
             logger.error(f"Error saving role selection to database: {e}")
 
-        # Check if any fields depend on this one
+        # Check if any fields depend on this one or exclude the same value
         has_dependents = any(
-            opt.get("depends_on") == self.option_name
+            opt.get("depends_on") == self.option_name or opt.get("exclude_same_as") == self.option_name
             for opt in self.parent_view.custom_options
         )
 
         if has_dependents:
-            # Rebuild view with updated dependent dropdowns
+            # Rebuild view with updated dependent dropdowns (including exclude_same_as)
             await self.parent_view.update_embed()
             await interaction.response.edit_message(
                 embed=self.parent_view.build_embed(),
@@ -1875,6 +1932,7 @@ class CreationOptionSelect(discord.ui.Select):
         # Get choices - handle both list and conditional dict
         raw_choices = option.get("choices", [])
         depends_on = option.get("depends_on")
+        exclude_same_as = option.get("exclude_same_as")
 
         # If choices is a dict (conditional dropdown), filter by parent selection
         if isinstance(raw_choices, dict) and depends_on:
@@ -1883,6 +1941,21 @@ class CreationOptionSelect(discord.ui.Select):
         else:
             # Simple list of choices
             choices = raw_choices[:25] if isinstance(raw_choices, list) else []
+
+        # Handle exclude_same_as - filter out the value selected in another field
+        if exclude_same_as:
+            exclude_values = view.selections.get(exclude_same_as, [])
+            exclude_value = exclude_values[0] if exclude_values else None
+            if exclude_value:
+                # Filter out the excluded value
+                filtered_choices = []
+                for c in choices:
+                    if isinstance(c, dict) and 'value' in c:
+                        if c['value'] != exclude_value:
+                            filtered_choices.append(c)
+                    elif str(c) != exclude_value:
+                        filtered_choices.append(c)
+                choices = filtered_choices
 
         # Build options - handle both string and object {value, role} formats
         options = []
@@ -1903,16 +1976,30 @@ class CreationOptionSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        # Validate exclude_same_as constraint before saving
+        exclude_same_as = self.option_config.get("exclude_same_as")
+        if exclude_same_as:
+            exclude_values = self.parent_view.selections.get(exclude_same_as, [])
+            exclude_value = exclude_values[0] if exclude_values else None
+            if exclude_value and self.values[0] == exclude_value:
+                await interaction.response.send_message(
+                    f"❌ **{self.option_name}** cannot be the same as **{exclude_same_as}**!\n"
+                    f"Please select a different {self.option_name}.",
+                    ephemeral=True
+                )
+                asyncio.create_task(_auto_delete_after(interaction))
+                return
+
         self.parent_view.selections[self.option_name] = self.values
 
-        # Check if any fields depend on this one
+        # Check if any fields depend on this one or exclude the same value
         has_dependents = any(
-            opt.get("depends_on") == self.option_name
+            opt.get("depends_on") == self.option_name or opt.get("exclude_same_as") == self.option_name
             for opt in self.parent_view.custom_options
         )
 
         if has_dependents:
-            # Rebuild view to show dependent dropdowns
+            # Rebuild view to show dependent dropdowns (including exclude_same_as)
             await interaction.response.defer()
             await self.parent_view.rebuild(interaction)
             msg = await interaction.followup.send(
