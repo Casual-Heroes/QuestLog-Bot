@@ -345,6 +345,10 @@ class ActionProcessorCog(commands.Cog):
         elif action_type == ActionType.ROLE_CREATE:
             return await self._action_role_create(guild, payload)
 
+        # RSS Feeds
+        elif action_type == ActionType.RSS_TEST_SEND:
+            return await self._action_rss_test_send(guild, payload)
+
         else:
             raise ValueError(f"Unknown action type: {action_type}")
 
@@ -2254,6 +2258,75 @@ class ActionProcessorCog(commands.Cog):
         return {
             "success": True,
             "message": f"Deleted LFG thread and sent cancellation notice"
+        }
+
+    # ═══════════════════════════════════════════════════════════════
+    # RSS FEED ACTIONS
+    # ═══════════════════════════════════════════════════════════════
+
+    async def _action_rss_test_send(self, guild: discord.Guild, payload: dict) -> dict:
+        """Send a test RSS embed to a channel."""
+        channel_id = int(payload["channel_id"])
+        embed_data = payload.get("embed", {})
+        feed_name = payload.get("feed_name", "RSS Feed")
+        ping_role_id = payload.get("ping_role_id")
+
+        # Get the channel
+        channel = guild.get_channel(channel_id)
+        if not channel:
+            raise ValueError(f"Channel {channel_id} not found in guild")
+
+        # Build role ping content if configured
+        role_ping_content = f"<@&{ping_role_id}>" if ping_role_id else None
+
+        # Build the embed
+        embed = discord.Embed(
+            title=embed_data.get("title", "Test Entry"),
+            description=embed_data.get("description", ""),
+            url=embed_data.get("url", ""),
+            color=embed_data.get("color", 0x5865F2)
+        )
+
+        # Add author if provided
+        if embed_data.get("author"):
+            embed.set_author(name=embed_data["author"][:256])
+
+        # Add thumbnail if provided
+        if embed_data.get("thumbnail"):
+            try:
+                embed.set_thumbnail(url=embed_data["thumbnail"])
+            except:
+                pass  # Invalid URL
+
+        # Add categories/tags
+        categories = embed_data.get("categories")
+        if categories:
+            embed.add_field(
+                name="Tags",
+                value=", ".join(categories[:5]),
+                inline=True
+            )
+
+        # Add published date
+        if embed_data.get("published"):
+            embed.add_field(
+                name="Published",
+                value=embed_data["published"][:100],
+                inline=True
+            )
+
+        # Add footer
+        footer_text = embed_data.get("footer", f"Test from {feed_name}")
+        if footer_text:
+            embed.set_footer(text=footer_text[:2048])
+
+        # Send the embed (with role ping if configured)
+        await channel.send(content=role_ping_content, embed=embed)
+        logger.info(f"ActionProcessor: Sent RSS test embed to {channel.name} in {guild.name}")
+
+        return {
+            "success": True,
+            "message": f"Test embed sent to #{channel.name}"
         }
 
 

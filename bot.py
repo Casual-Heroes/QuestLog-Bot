@@ -40,7 +40,6 @@ PRESENCE_MESSAGES = [
     ("playing", "/leaderboard"),
     ("watching", "your server grow"),
     ("playing", "/questlog dashboard"),
-    ("listening", "your commands"),
 ]
 
 current_presence_index = 0
@@ -431,6 +430,7 @@ def main():
         "cogs.audit",
         "cogs.xp",
         "cogs.roles",
+        "cogs.rss_feeds",
         "cogs.welcome",
         "cogs.moderation",
         "cogs.channels",

@@ -136,6 +136,9 @@ class ActionType(str, Enum):
     SYNC_ROLES = "sync_roles"
     SYNC_MEMBERS = "sync_members"
 
+    # RSS Feeds
+    RSS_TEST_SEND = "rss_test_send"
+
 
 # Guild
 
@@ -2578,4 +2581,76 @@ class CreatorTip(Base):
         Index("idx_creator_tip_from", "from_user_id"),
         Index("idx_creator_tip_guild", "guild_id"),
         Index("idx_creator_tip_date", "tipped_at"),
+    )
+
+
+class RSSFeed(Base):
+    """
+    RSS feed configuration for automated Discord posts.
+    Part of the Discovery module.
+
+    Billing:
+    - Free tier: 3 feeds max
+    - Discovery Module / Complete / Lifetime: Unlimited
+    """
+    __tablename__ = "rss_feeds"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    guild_id = Column(BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"), nullable=False)
+
+    # Feed configuration
+    name = Column(String(100), nullable=False)
+    feed_url = Column(String(500), nullable=False)
+    enabled = Column(Boolean, default=True, nullable=False)
+    channel_id = Column(BigInteger, nullable=False)
+    ping_role_id = Column(BigInteger, nullable=True)  # Optional role to ping when posting
+
+    # Polling configuration
+    poll_interval_minutes = Column(Integer, default=15, nullable=False)
+    last_polled_at = Column(BigInteger, nullable=True)
+    last_entry_id = Column(String(500), nullable=True)
+    last_entry_published = Column(BigInteger, nullable=True)
+
+    # Embed customization (JSON)
+    embed_config = Column(Text, nullable=True)
+
+    # Error tracking
+    consecutive_failures = Column(Integer, default=0, nullable=False)
+    last_error = Column(String(500), nullable=True)
+    last_error_at = Column(BigInteger, nullable=True)
+
+    # Audit
+    created_by = Column(BigInteger, nullable=True)
+    created_at = Column(BigInteger, nullable=False, default=lambda: int(time.time()))
+    updated_at = Column(BigInteger, nullable=False, default=lambda: int(time.time()))
+
+    __table_args__ = (
+        Index("idx_rss_feed_guild", "guild_id"),
+        Index("idx_rss_feed_enabled", "guild_id", "enabled"),
+        Index("idx_rss_feed_poll", "enabled", "last_polled_at"),
+    )
+
+
+class RSSFeedEntry(Base):
+    """Track posted RSS entries to prevent duplicates and display on dashboard."""
+    __tablename__ = "rss_feed_entries"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    feed_id = Column(Integer, ForeignKey("rss_feeds.id", ondelete="CASCADE"), nullable=False)
+    entry_guid = Column(String(500), nullable=False)
+    entry_link = Column(String(500), nullable=True)
+    entry_title = Column(String(500), nullable=True)
+    entry_summary = Column(Text, nullable=True)  # Article summary/description
+    entry_author = Column(String(256), nullable=True)  # Article author
+    entry_thumbnail = Column(String(500), nullable=True)  # Thumbnail URL
+    entry_categories = Column(Text, nullable=True)  # JSON array of categories/tags
+    published_at = Column(BigInteger, nullable=True)
+    posted_at = Column(BigInteger, nullable=False, default=lambda: int(time.time()))
+    message_id = Column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        Index("idx_rss_entry_feed", "feed_id"),
+        Index("idx_rss_entry_guid", "feed_id", "entry_guid"),
+        Index("idx_rss_entry_posted", "posted_at"),
+        UniqueConstraint("feed_id", "entry_guid", name="uq_rss_feed_entry_guid"),
     )
