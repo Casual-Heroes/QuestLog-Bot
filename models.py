@@ -2445,6 +2445,11 @@ class StreamingNotificationsConfig(Base):
     # Access control
     minimum_level_required = Column(Integer, default=10, nullable=False)  # Min XP level to get notifications
 
+    # Customization
+    notification_title = Column(String(256), nullable=True)  # Custom title (supports {creator} placeholder)
+    notification_message = Column(String(1024), nullable=True)  # Custom message (supports {creator} placeholder)
+    embed_color = Column(String(7), nullable=True)  # Hex color code (e.g., #FF0000)
+
     # Timestamps
     created_at = Column(BigInteger, nullable=False, default=lambda: int(time.time()))
     updated_at = Column(BigInteger, nullable=False, default=lambda: int(time.time()))
@@ -2493,20 +2498,22 @@ class StreamNotificationHistory(Base):
     guild_id = Column(BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"), nullable=False)
     creator_profile_id = Column(Integer, ForeignKey("creator_profiles.id", ondelete="CASCADE"), nullable=False)
 
-    # Platform and stream identifier
-    platform = Column(SQLEnum('youtube', 'twitch', name='streamplatform'), nullable=False)
+    # Platform and stream identifier (combined = multistreaming to both)
+    platform = Column(String(20), nullable=False)  # 'youtube', 'twitch', or 'combined'
     stream_started_at = Column(BigInteger, nullable=False)  # Unix timestamp when stream started
 
     # Notification metadata
     notified_at = Column(BigInteger, nullable=False, default=lambda: int(time.time()))
     stream_title = Column(String(500), nullable=True)
 
+    # Message tracking for edits (update embed when second platform goes live)
+    message_id = Column(BigInteger, nullable=True)  # Discord message ID for editing
+    channel_id = Column(BigInteger, nullable=True)  # Channel where message was sent
+
     __table_args__ = (
         Index("idx_stream_notif_guild", "guild_id"),
         Index("idx_stream_notif_creator", "creator_profile_id"),
         Index("idx_stream_notif_lookup", "creator_profile_id", "platform", "stream_started_at"),
-        # Prevent duplicate notifications for the same stream
-        UniqueConstraint("guild_id", "creator_profile_id", "platform", "stream_started_at", name="uq_stream_notification"),
     )
 
 
