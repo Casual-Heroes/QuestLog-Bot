@@ -2605,6 +2605,12 @@ class RSSFeed(Base):
     channel_id = Column(BigInteger, nullable=False)
     ping_role_id = Column(BigInteger, nullable=True)  # Optional role to ping when posting
 
+    # Category filtering
+    # category_filter_mode: 'none' (default), 'include', or 'exclude'
+    # category_filters: JSON array of category strings to filter on
+    category_filter_mode = Column(String(20), default='none', nullable=False)
+    category_filters = Column(Text, nullable=True)  # JSON array: ["Guild Wars 2", "News"]
+
     # Polling configuration
     poll_interval_minutes = Column(Integer, default=15, nullable=False)
     last_polled_at = Column(BigInteger, nullable=True)

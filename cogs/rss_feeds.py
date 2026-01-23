@@ -684,6 +684,46 @@ class RSSFeedsCog(commands.Cog):
         if not new_entries:
             return 0
 
+        # Apply category filtering if configured
+        filter_mode = getattr(feed, 'category_filter_mode', 'none') or 'none'
+        if filter_mode != 'none':
+            category_filters = []
+            if feed.category_filters:
+                try:
+                    category_filters = json.loads(feed.category_filters)
+                except:
+                    category_filters = []
+
+            if category_filters:
+                original_count = len(new_entries)
+                filtered_entries = []
+                # Convert filter categories to lowercase for case-insensitive matching
+                filter_set_lower = {f.lower() for f in category_filters}
+
+                for entry, guid in new_entries:
+                    # Get entry's categories (lowercase for comparison)
+                    entry_categories_lower = set()
+                    tags = entry.get('tags', [])
+                    for tag in tags:
+                        cat = tag.get('term', tag.get('label', ''))
+                        if cat:
+                            entry_categories_lower.add(cat.lower())
+
+                    # Check if entry matches filter (case-insensitive)
+                    has_match = bool(entry_categories_lower & filter_set_lower)  # Any intersection
+
+                    if filter_mode == 'include' and has_match:
+                        filtered_entries.append((entry, guid))
+                    elif filter_mode == 'exclude' and not has_match:
+                        filtered_entries.append((entry, guid))
+
+                new_entries = filtered_entries
+                logger.debug(f"RSSFeeds: Category filter ({filter_mode}) reduced entries from {original_count} to {len(new_entries)} for feed {feed.id}")
+
+                if not new_entries:
+                    logger.debug(f"RSSFeeds: All entries filtered out by category filter for feed {feed.id}")
+                    return 0
+
         # Process entries oldest-first (reverse the list)
         new_entries.reverse()
         total_new = len(new_entries)
@@ -841,6 +881,69 @@ class RSSFeedsCog(commands.Cog):
                 except Exception as e:
                     logger.error(f"RSSFeeds: Error posting entry: {e}")
                     continue
+
+            # After individual posts, also send the summary embed with dashboard link
+            if posted_count > 0:
+                try:
+                    await asyncio.sleep(1)  # Brief pause before summary
+
+                    # Build summary embed with admin's styling (same as summary-only mode)
+                    embed_color = 0x5865F2
+                    color_str = embed_config.get('color', '#5865F2')
+                    if color_str:
+                        try:
+                            embed_color = int(color_str.lstrip('#'), 16)
+                        except:
+                            pass
+
+                    # Build title with admin's emoji prefix
+                    emoji_prefix = embed_config.get('custom_emoji_prefix', '')
+                    title_prefix = embed_config.get('title_prefix', '')
+                    title_suffix = embed_config.get('title_suffix', '')
+
+                    title = f"{posted_count} New Articles from {feed.name}"
+                    if title_prefix:
+                        title = f"{title_prefix} {title}"
+                    if title_suffix:
+                        title = f"{title} {title_suffix}"
+                    if emoji_prefix:
+                        title = f"{emoji_prefix} {title}"
+                    else:
+                        title = f"📰 {title}"
+
+                    # Build description with optional custom message
+                    custom_desc = embed_config.get('custom_description', '')
+                    summary_desc = f"{custom_desc}\n\n" if custom_desc else ""
+                    summary_desc += f"**[View All Articles on Dashboard]({dashboard_url})**"
+
+                    summary_embed = discord.Embed(
+                        title=self._truncate(title, 256),
+                        description=self._truncate(summary_desc, 4096),
+                        color=embed_color
+                    )
+
+                    # Use admin's footer or default
+                    footer_text = embed_config.get('footer_text', '')
+                    if footer_text:
+                        summary_embed.set_footer(text=self._truncate(footer_text, 2048))
+                    else:
+                        summary_embed.set_footer(text="QuestLog RSS Feeds • View all on dashboard!")
+
+                    # Add custom thumbnail if configured
+                    thumbnail_mode = embed_config.get('thumbnail_mode', 'rss')
+                    if thumbnail_mode == 'custom':
+                        custom_thumb = embed_config.get('custom_thumbnail_url', '')
+                        if custom_thumb:
+                            try:
+                                summary_embed.set_thumbnail(url=custom_thumb)
+                            except:
+                                pass
+
+                    # Send without role ping (already pinged on first article)
+                    await channel.send(embed=summary_embed)
+                    logger.info(f"RSSFeeds: Sent summary after {posted_count} individual posts for feed {feed.id}")
+                except Exception as e:
+                    logger.error(f"RSSFeeds: Failed to send summary embed: {e}")
 
         return saved_count
 
