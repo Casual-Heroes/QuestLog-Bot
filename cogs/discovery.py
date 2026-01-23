@@ -31,7 +31,7 @@ from config import (
 )
 from models import (
     Guild, GuildMember, GuildModule, PromoPost, FeaturedPool, FeaturedCreator, DiscoveryNetwork,
-    ServerListing, PromoTier, DiscoveryConfig, XPConfig, AnnouncedGame,
+    ServerListing, PromoTier, DiscoveryConfig, XPConfig, AnnouncedGame, FoundGame,
     GameSearchConfig, CreatorOfTheMonth, CreatorOfTheWeek
 )
 from utils import igdb
@@ -1261,12 +1261,13 @@ class DiscoveryCog(commands.Cog):
                             games = [g for g in games if g.release_date and g.release_date <= announcement_cutoff]
                             logger.info(f"Filtered to {len(games)} games within {announcement_window} day window")
 
-                            # Add to master list (avoid duplicates across searches), track privacy
+                            # Add to master list (avoid duplicates across searches), track privacy and search config
                             for game in games:
                                 if game.id not in all_games_to_announce:
                                     all_games_to_announce[game.id] = {
                                         "game": game,
                                         "is_public": bool(search_config.show_on_website),
+                                        "search_config": search_config,  # Track which config found this game
                                     }
 
                         except Exception as e:
@@ -1282,6 +1283,7 @@ class DiscoveryCog(commands.Cog):
                     for game_id, meta in all_games_to_announce.items():
                         game = meta["game"]
                         is_public = meta["is_public"]
+                        search_config = meta.get("search_config")
 
                         # ONLY announce games with "Share on Discovery Network" enabled
                         if not is_public:
@@ -1320,6 +1322,48 @@ class DiscoveryCog(commands.Cog):
                         except Exception as e:
                             logger.error(f"Failed to record game '{game.name}' in guild {config.guild_id}: {e}")
                             continue
+
+                        # Also create FoundGame record for Found Games page and rich data
+                        try:
+                            # Check if already in found_games
+                            already_found = session.query(FoundGame).filter(
+                                FoundGame.guild_id == config.guild_id,
+                                FoundGame.igdb_id == game.id
+                            ).first()
+
+                            if not already_found:
+                                # Extract Steam URL from websites if available
+                                steam_url = None
+                                if hasattr(game, 'websites') and game.websites:
+                                    for website in game.websites:
+                                        if isinstance(website, dict) and website.get('category') == 13:  # Steam
+                                            steam_url = website.get('url')
+                                            break
+
+                                found_game = FoundGame(
+                                    guild_id=config.guild_id,
+                                    igdb_id=game.id,
+                                    igdb_slug=game.slug if hasattr(game, 'slug') else None,
+                                    game_name=game.name,
+                                    release_date=game.release_date,
+                                    summary=game.summary if hasattr(game, 'summary') else None,
+                                    genres=json.dumps(game.genres) if hasattr(game, 'genres') else None,
+                                    themes=json.dumps(game.themes) if hasattr(game, 'themes') else None,
+                                    game_modes=json.dumps(game.game_modes) if hasattr(game, 'game_modes') else None,
+                                    platforms=json.dumps(game.platforms) if hasattr(game, 'platforms') else None,
+                                    cover_url=game.cover_url,
+                                    igdb_url=f"https://www.igdb.com/games/{game.slug}" if hasattr(game, 'slug') and game.slug else None,
+                                    steam_url=steam_url,
+                                    hypes=game.hypes if hasattr(game, 'hypes') else None,
+                                    rating=game.rating if hasattr(game, 'rating') else None,
+                                    search_config_id=search_config.id if search_config else None,
+                                    search_config_name=search_config.name if search_config else None,
+                                    found_at=now
+                                )
+                                session.add(found_game)
+                                logger.info(f"Also recorded '{game.name}' in found_games for guild {config.guild_id}")
+                        except Exception as e:
+                            logger.warning(f"Failed to create FoundGame for '{game.name}': {e}")
 
                     # Send ONE summary embed for all games shared on Discovery Network
                     if games_to_announce and discovery_channel:
