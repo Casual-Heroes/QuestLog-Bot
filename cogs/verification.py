@@ -16,6 +16,7 @@ FEATURES:
 - Verification logging
 """
 
+import json
 import time
 import secrets  # SECURITY FIX: Use secrets instead of random for CAPTCHA
 import string
@@ -272,17 +273,9 @@ async def process_verification(interaction: discord.Interaction, method: str):
             )
             return
 
-        # Check account age if required
-        if config and config.require_account_age:
-            is_old_enough, age_days = check_account_age(member, config.min_account_age_days)
-            if not is_old_enough:
-                await interaction.response.send_message(
-                    f"Your account must be at least **{config.min_account_age_days}** days old. "
-                    f"Your account is only **{age_days}** days old.\n\n"
-                    f"Please try again later or contact a moderator.",
-                    ephemeral=True
-                )
-                return
+        # NOTE: We do NOT check account age here anymore.
+        # Young accounts are quarantined and NEED to click the button to prove they're human.
+        # The button click IS their verification - blocking them would make verification impossible.
 
         # Get or create member record
         db_member = session.get(GuildMember, (guild.id, member.id))
@@ -325,6 +318,17 @@ async def process_verification(interaction: discord.Interaction, method: str):
         quarantine_role_id = db_guild.quarantine_role_id
         verified_message = config.verified_message if config else None
 
+        # Get saved roles for persistence (returning members)
+        saved_role_ids = []
+        if db_guild.role_persistence_enabled and db_member.saved_roles:
+            try:
+                saved_role_ids = json.loads(db_member.saved_roles)
+                # Clear saved roles now that we're restoring them
+                db_member.saved_roles = None
+                db_member.left_at = None
+            except (json.JSONDecodeError, TypeError):
+                saved_role_ids = []
+
     # Assign verified role
     if verified_role_id:
         verified_role = guild.get_role(verified_role_id)
@@ -343,6 +347,25 @@ async def process_verification(interaction: discord.Interaction, method: str):
             except discord.Forbidden:
                 pass
 
+    # Restore saved roles for returning members (role persistence)
+    if saved_role_ids:
+        roles_to_add = []
+        for role_id in saved_role_ids:
+            role = guild.get_role(role_id)
+            if role and not role.managed and role.id != guild.id:
+                # Don't restore roles that are higher than bot's top role
+                if role < guild.me.top_role:
+                    roles_to_add.append(role)
+
+        if roles_to_add:
+            try:
+                await member.add_roles(*roles_to_add, reason="Role persistence - restored on rejoin after verification")
+                logger.info(f"[ROLE PERSIST] Restored {len(roles_to_add)} roles for {member} after verification in {guild.name}")
+            except discord.Forbidden:
+                logger.warning(f"[ROLE PERSIST] Cannot restore roles for {member} in {guild.name} - missing permissions")
+            except Exception as e:
+                logger.error(f"[ROLE PERSIST] Error restoring roles: {e}")
+
     # Send success message
     success_msg = verified_message or "You've been verified! Welcome to the server."
     try:
@@ -357,6 +380,15 @@ async def process_verification(interaction: discord.Interaction, method: str):
         )
 
     logger.info(f"Verified {member} in {guild.name} via {method}")
+
+    # Send welcome message now that verification is complete
+    try:
+        bot = interaction.client
+        welcome_cog = bot.get_cog("WelcomeCog")
+        if welcome_cog:
+            await welcome_cog.send_welcome_message(member)
+    except Exception as e:
+        logger.error(f"Failed to send post-verification welcome message: {e}")
 
 
 # ==================== COG ====================
@@ -431,12 +463,16 @@ class VerificationCog(commands.Cog):
                     cutoff_time = int(time.time()) - timeout_seconds
 
                     # Find unverified members past timeout
+                    # IMPORTANT: Only kick members who were EXPLICITLY quarantined (is_quarantined=True)
+                    # This prevents kicking existing members who joined before verification was enabled
                     unverified = (
                         session.query(GuildMember)
                         .filter(
                             GuildMember.guild_id == config.guild_id,
                             GuildMember.is_verified == False,
-                            GuildMember.first_seen < cutoff_time
+                            GuildMember.is_quarantined == True,  # Must be explicitly quarantined
+                            GuildMember.quarantined_at != None,  # Must have quarantine timestamp
+                            GuildMember.quarantined_at < cutoff_time  # Check quarantine time, not first_seen
                         )
                         .all()
                     )
@@ -445,10 +481,11 @@ class VerificationCog(commands.Cog):
                         member = guild.get_member(db_member.user_id)
                         if member:
                             try:
+                                hours_quarantined = (int(time.time()) - db_member.quarantined_at) // 3600
                                 await member.kick(
-                                    reason=f"Verification timeout ({config.verification_timeout_hours}h)"
+                                    reason=f"Verification timeout - quarantined for {hours_quarantined}h (limit: {config.verification_timeout_hours}h)"
                                 )
-                                logger.info(f"Kicked {member} from {guild.name} for verification timeout")
+                                logger.info(f"Kicked {member} from {guild.name} for verification timeout (quarantined {hours_quarantined}h)")
 
                                 # Log the action
                                 audit = AuditLog(
@@ -501,7 +538,10 @@ class VerificationCog(commands.Cog):
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         """Handle new member join - apply quarantine and start verification."""
+        logger.info(f"[VERIFY] on_member_join triggered for {member} in {member.guild.name}")
+
         if member.bot:
+            logger.debug(f"[VERIFY] Skipping bot: {member}")
             return
         # Ensure bot is ready to resolve channels/roles
         await self.bot.wait_until_ready()
@@ -510,11 +550,17 @@ class VerificationCog(commands.Cog):
             db_guild = session.get(Guild, member.guild.id)
             config = session.get(VerificationConfig, member.guild.id)
 
+            logger.info(f"[VERIFY] Guild {member.guild.name}: db_guild exists: {db_guild is not None}, verification_enabled: {db_guild.verification_enabled if db_guild else 'N/A'}")
+
             if not db_guild or not db_guild.verification_enabled:
+                logger.info(f"[VERIFY] Skipping - verification not enabled for {member.guild.name}")
                 return
 
             if not config:
+                logger.info(f"[VERIFY] Skipping - no VerificationConfig for {member.guild.name}")
                 return
+
+            logger.info(f"[VERIFY] Config found: type={config.verification_type}, require_age={config.require_account_age}, min_days={config.min_account_age_days}")
 
             # Create member record
             db_member = session.get(GuildMember, (member.guild.id, member.id))
@@ -532,46 +578,144 @@ class VerificationCog(commands.Cog):
                 )
                 session.add(db_member)
             else:
-                # Reset multi-step progress when rejoining
+                # Reset verification state when rejoining
+                logger.info(f"[VERIFY] Existing member rejoined: {member}, current is_verified={db_member.is_verified}, is_quarantined={db_member.is_quarantined}")
                 db_member.verification_method = None
+                # IMPORTANT: Reset verification status so they go through verification again
+                db_member.is_verified = False
+                db_member.is_quarantined = False
+                db_member.quarantined_at = None
+                db_member.quarantine_reason = None
+                logger.info(f"[VERIFY] Reset verification state for rejoining member {member}")
 
-            # Check account age for auto-verification
-            if config.verification_type == VerificationType.ACCOUNT_AGE:
-                if config.require_account_age:
-                    is_old_enough, age_days = check_account_age(member, config.min_account_age_days)
-                    if is_old_enough:
-                        # Auto-verify
-                        db_member.is_verified = True
-                        db_member.verified_at = int(time.time())
-                        db_member.verification_method = "account_age"
+            # Check account age - applies to ALL verification types when require_account_age is enabled
+            # OR always for ACCOUNT_AGE type
+            account_too_new = False
+            age_days = 0
+            min_days = config.min_account_age_days or 0
 
-                        # Assign verified role
-                        if db_guild.verified_role_id:
-                            verified_role = member.guild.get_role(db_guild.verified_role_id)
-                            if verified_role:
-                                try:
-                                    await member.add_roles(verified_role, reason="Auto-verified (account age)")
-                                except discord.Forbidden:
-                                    pass
+            should_check_age = (
+                config.verification_type == VerificationType.ACCOUNT_AGE or
+                config.require_account_age
+            )
 
-                        logger.info(f"Auto-verified {member} in {member.guild.name} (account age: {age_days} days)")
-                        return
-                    else:
-                        # Quarantine new account
+            if should_check_age and min_days > 0:
+                is_old_enough, age_days = check_account_age(member, min_days)
+                logger.info(f"[VERIFY] Account age check for {member}: {age_days} days, required: {min_days}, old_enough: {is_old_enough}")
+
+                if is_old_enough:
+                    # Account meets age requirement - AUTO-VERIFY for ALL types
+                    # No quarantine needed, just welcome them
+                    db_member.is_verified = True
+                    db_member.verified_at = int(time.time())
+                    db_member.verification_method = "account_age"
+                    db_member.is_quarantined = False
+
+                    # Assign verified role
+                    verified_role_id = db_guild.verified_role_id
+                    if verified_role_id:
+                        verified_role = member.guild.get_role(verified_role_id)
+                        if verified_role:
+                            try:
+                                await member.add_roles(verified_role, reason="Auto-verified (account age)")
+                                logger.info(f"[VERIFY] Assigned verified role to {member} in {member.guild.name}")
+                            except discord.Forbidden:
+                                logger.warning(f"[VERIFY] Cannot assign verified role in {member.guild.name} - missing permissions")
+
+                    # Restore saved roles for returning members (role persistence)
+                    if db_guild.role_persistence_enabled and db_member.saved_roles:
+                        try:
+                            saved_role_ids = json.loads(db_member.saved_roles)
+                            # Clear saved roles now that we're restoring them
+                            db_member.saved_roles = None
+                            db_member.left_at = None
+
+                            roles_to_add = []
+                            for role_id in saved_role_ids:
+                                role = member.guild.get_role(role_id)
+                                if role and not role.managed and role.id != member.guild.id:
+                                    if role < member.guild.me.top_role:
+                                        roles_to_add.append(role)
+
+                            if roles_to_add:
+                                await member.add_roles(*roles_to_add, reason="Role persistence - restored on auto-verify rejoin")
+                                logger.info(f"[ROLE PERSIST] Restored {len(roles_to_add)} roles for {member} on auto-verify in {member.guild.name}")
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                        except discord.Forbidden:
+                            logger.warning(f"[ROLE PERSIST] Cannot restore roles for {member} in {member.guild.name} - missing permissions")
+                        except Exception as e:
+                            logger.error(f"[ROLE PERSIST] Error restoring roles on auto-verify: {e}")
+
+                    logger.info(f"[VERIFY] Auto-verified {member} in {member.guild.name} (account age: {age_days} days >= required: {min_days})")
+
+                    # Commit and send welcome
+                    session.commit()
+                    try:
+                        welcome_cog = self.bot.get_cog("WelcomeCog")
+                        if welcome_cog:
+                            await welcome_cog.send_welcome_message(member)
+                            logger.info(f"[VERIFY] Sent welcome message for auto-verified {member}")
+                        else:
+                            logger.warning(f"[VERIFY] WelcomeCog not found - cannot send welcome for {member}")
+                    except Exception as e:
+                        logger.error(f"[VERIFY] Failed to send welcome message for auto-verified user {member}: {e}", exc_info=True)
+
+                    return  # Done - no quarantine needed
+                else:
+                    # Account TOO NEW - must verify manually (click button to prove human)
+                    account_too_new = True
+                    db_member.is_verified = False  # Reset verification status
+                    db_member.is_quarantined = True
+                    db_member.quarantined_at = int(time.time())
+                    db_member.quarantine_reason = f"Account too new ({age_days} days, required: {min_days})"
+                    logger.info(f"[VERIFY] Account {member} is too new ({age_days} days < {min_days}), requiring manual verification via button")
+
+            # Apply quarantine for ALL verification types (not just ACCOUNT_AGE)
+            # This ensures timeout tracking works for Button, Captcha, etc.
+            try:
+                logger.info(f"[VERIFY] >>> Entering quarantine check section for {member}")
+                logger.info(f"[VERIFY] Checking quarantine: is_verified={db_member.is_verified}, type={config.verification_type}")
+
+                # Commit DB changes before role operations
+                session.commit()
+                logger.info(f"[VERIFY] DB session committed for {member}")
+
+                if not db_member.is_verified and config.verification_type != VerificationType.NONE:
+                    logger.info(f"[VERIFY] Applying quarantine for {member} in {member.guild.name} (type: {config.verification_type.value})")
+
+                    # Mark as quarantined if not already
+                    if not db_member.is_quarantined:
                         db_member.is_quarantined = True
                         db_member.quarantined_at = int(time.time())
-                        db_member.quarantine_reason = f"Account too new ({age_days} days)"
+                        db_member.quarantine_reason = f"Pending {config.verification_type.value} verification"
+                        session.commit()
+                        logger.info(f"[VERIFY] Set quarantine flag for {member}")
 
-            # Apply quarantine role
-            if db_guild.quarantine_role_id and not db_member.is_verified:
-                quarantine_role = member.guild.get_role(db_guild.quarantine_role_id)
-                if quarantine_role:
-                    try:
-                        await member.add_roles(quarantine_role, reason="Pending verification")
-                    except discord.Forbidden:
-                        logger.warning(f"Cannot add quarantine role in {member.guild.name}")
-                    except Exception as role_err:
-                        logger.error(f"Error adding quarantine role in {member.guild.name}: {role_err}")
+                    # Apply quarantine role
+                    quarantine_role_id = db_guild.quarantine_role_id
+                    logger.info(f"[VERIFY] Quarantine role ID from DB: {quarantine_role_id}")
+
+                    if quarantine_role_id:
+                        quarantine_role = member.guild.get_role(quarantine_role_id)
+                        logger.info(f"[VERIFY] Quarantine role object: {quarantine_role}")
+
+                        if quarantine_role:
+                            try:
+                                await member.add_roles(quarantine_role, reason="Pending verification")
+                                logger.info(f"[VERIFY] Successfully assigned quarantine role to {member} in {member.guild.name}")
+                            except discord.Forbidden:
+                                logger.warning(f"[VERIFY] Cannot add quarantine role in {member.guild.name} - missing permissions")
+                            except Exception as role_err:
+                                logger.error(f"[VERIFY] Error adding quarantine role in {member.guild.name}: {role_err}")
+                        else:
+                            logger.warning(f"[VERIFY] Quarantine role {quarantine_role_id} not found in guild {member.guild.name}")
+                    else:
+                        logger.warning(f"[VERIFY] No quarantine role configured for {member.guild.name}")
+                else:
+                    logger.info(f"[VERIFY] Skipping quarantine - is_verified={db_member.is_verified} or type={config.verification_type}")
+            except Exception as quarantine_err:
+                logger.error(f"[VERIFY] EXCEPTION in quarantine section for {member}: {quarantine_err}", exc_info=True)
 
             verification_channel_id = db_guild.verification_channel_id
             instructions = config.verification_instructions
@@ -736,6 +880,17 @@ class VerificationCog(commands.Cog):
             verified_role_id = db_guild.verified_role_id
             quarantine_role_id = db_guild.quarantine_role_id
 
+            # Get saved roles for persistence (returning members)
+            saved_role_ids = []
+            if db_guild.role_persistence_enabled and db_member.saved_roles:
+                try:
+                    saved_role_ids = json.loads(db_member.saved_roles)
+                    # Clear saved roles now that we're restoring them
+                    db_member.saved_roles = None
+                    db_member.left_at = None
+                except (json.JSONDecodeError, TypeError):
+                    saved_role_ids = []
+
         # Update roles
         if verified_role_id:
             verified_role = ctx.guild.get_role(verified_role_id)
@@ -752,6 +907,24 @@ class VerificationCog(commands.Cog):
                     await member.remove_roles(quarantine_role, reason="Manually verified")
                 except discord.Forbidden:
                     pass
+
+        # Restore saved roles for returning members (role persistence)
+        if saved_role_ids:
+            roles_to_add = []
+            for role_id in saved_role_ids:
+                role = ctx.guild.get_role(role_id)
+                if role and not role.managed and role.id != ctx.guild.id:
+                    if role < ctx.guild.me.top_role:
+                        roles_to_add.append(role)
+
+            if roles_to_add:
+                try:
+                    await member.add_roles(*roles_to_add, reason="Role persistence - restored on manual verification")
+                    logger.info(f"[ROLE PERSIST] Restored {len(roles_to_add)} roles for {member} on manual verify in {ctx.guild.name}")
+                except discord.Forbidden:
+                    logger.warning(f"[ROLE PERSIST] Cannot restore roles for {member} in {ctx.guild.name}")
+                except Exception as e:
+                    logger.error(f"[ROLE PERSIST] Error restoring roles on manual verify: {e}")
 
         await ctx.respond(
             f"✅ **{member.mention}** has been manually verified." +
@@ -1070,6 +1243,188 @@ class VerificationCog(commands.Cog):
             f"Intro required: **{'Yes' if required else 'No'}**",
             ephemeral=True
         )
+
+    @verify.command(name="lockdown", description="Auto-configure channel permissions for quarantine role (Admin)")
+    @discord.default_permissions(administrator=True)
+    @commands.has_permissions(administrator=True)
+    @discord.option("verification_channel", discord.TextChannel, description="Channel where unverified users can see the verify button")
+    async def verify_lockdown(
+        self,
+        ctx: discord.ApplicationContext,
+        verification_channel: discord.TextChannel
+    ):
+        """
+        Automatically set up channel permissions for verification:
+        - Quarantine role: DENY view on all channels/categories
+        - Quarantine role: ALLOW view on verification channel only
+        """
+        await ctx.defer(ephemeral=True)
+
+        with db_session_scope() as session:
+            db_guild = session.get(Guild, ctx.guild.id)
+            if not db_guild or not db_guild.quarantine_role_id:
+                await ctx.followup.send(
+                    "Please set a **Quarantine Role** in the verification settings first!",
+                    ephemeral=True
+                )
+                return
+
+            quarantine_role_id = db_guild.quarantine_role_id
+
+        quarantine_role = ctx.guild.get_role(quarantine_role_id)
+        if not quarantine_role:
+            await ctx.followup.send(
+                "Quarantine role not found. Please check your verification settings.",
+                ephemeral=True
+            )
+            return
+
+        updated_categories = 0
+        updated_channels = 0
+        errors = []
+
+        # Update all categories
+        for category in ctx.guild.categories:
+            try:
+                # Deny view for quarantine role on all categories
+                await category.set_permissions(
+                    quarantine_role,
+                    view_channel=False,
+                    reason="Verification lockdown - hide from unverified"
+                )
+                updated_categories += 1
+                await asyncio.sleep(0.5)  # Rate limit protection
+            except discord.Forbidden:
+                errors.append(f"Category: {category.name} (no permission)")
+            except Exception as e:
+                errors.append(f"Category: {category.name} ({str(e)[:30]})")
+
+        # Update ALL channels (including those in categories)
+        # This handles channels that have been un-synced from their category permissions
+        for channel in ctx.guild.channels:
+            # Skip categories (already handled above) and the verification channel
+            if isinstance(channel, discord.CategoryChannel):
+                continue
+            if channel.id == verification_channel.id:
+                continue
+
+            try:
+                await channel.set_permissions(
+                    quarantine_role,
+                    view_channel=False,
+                    reason="Verification lockdown - hide from unverified"
+                )
+                updated_channels += 1
+                await asyncio.sleep(0.5)  # Rate limit protection
+            except discord.Forbidden:
+                errors.append(f"Channel: {channel.name} (no permission)")
+            except Exception as e:
+                errors.append(f"Channel: {channel.name} ({str(e)[:30]})")
+
+        # Allow view on verification channel
+        try:
+            await verification_channel.set_permissions(
+                quarantine_role,
+                view_channel=True,
+                read_message_history=True,
+                send_messages=False,  # They can only click the button, not chat
+                reason="Verification lockdown - allow unverified to see verify button"
+            )
+        except discord.Forbidden:
+            errors.append(f"Verification channel: {verification_channel.name} (no permission)")
+
+        # Build response
+        result = (
+            f"**Lockdown Complete!**\n\n"
+            f"✅ Updated **{updated_categories}** categories\n"
+            f"✅ Updated **{updated_channels}** standalone channels\n"
+            f"✅ Allowed access to {verification_channel.mention}\n\n"
+            f"Unverified members with the `{quarantine_role.name}` role can now only see the verification channel."
+        )
+
+        if errors:
+            result += f"\n\n⚠️ **{len(errors)} errors:**\n" + "\n".join(errors[:10])
+            if len(errors) > 10:
+                result += f"\n...and {len(errors) - 10} more"
+
+        await ctx.followup.send(result, ephemeral=True)
+        logger.info(f"Verification lockdown completed in {ctx.guild.name}: {updated_categories} categories, {updated_channels} channels")
+
+    @verify.command(name="debug", description="Show verification debug info (Admin)")
+    @discord.default_permissions(administrator=True)
+    @commands.has_permissions(administrator=True)
+    async def verify_debug(self, ctx: discord.ApplicationContext):
+        """Show all verification-related database values for debugging."""
+        await ctx.defer(ephemeral=True)
+
+        with db_session_scope() as session:
+            db_guild = session.get(Guild, ctx.guild.id)
+            config = session.get(VerificationConfig, ctx.guild.id)
+
+            lines = ["**🔍 Verification Debug Info**\n"]
+
+            # Guild table values
+            lines.append("**Guild Table:**")
+            if db_guild:
+                lines.append(f"• `verification_enabled`: **{db_guild.verification_enabled}**")
+                lines.append(f"• `verification_channel_id`: {db_guild.verification_channel_id or 'Not set'}")
+                lines.append(f"• `verified_role_id`: {db_guild.verified_role_id or 'Not set'}")
+                lines.append(f"• `quarantine_role_id`: {db_guild.quarantine_role_id or 'Not set'}")
+
+                # Check if roles exist
+                if db_guild.verified_role_id:
+                    role = ctx.guild.get_role(db_guild.verified_role_id)
+                    lines.append(f"  → Verified role exists: {role.name if role else '❌ NOT FOUND'}")
+                if db_guild.quarantine_role_id:
+                    role = ctx.guild.get_role(db_guild.quarantine_role_id)
+                    lines.append(f"  → Quarantine role exists: {role.name if role else '❌ NOT FOUND'}")
+            else:
+                lines.append("❌ No Guild record found in database!")
+
+            lines.append("")
+
+            # VerificationConfig table values
+            lines.append("**VerificationConfig Table:**")
+            if config:
+                lines.append(f"• `verification_type`: **{config.verification_type.value}**")
+                lines.append(f"• `require_account_age`: {config.require_account_age}")
+                lines.append(f"• `min_account_age_days`: {config.min_account_age_days}")
+                lines.append(f"• `button_text`: {config.button_text}")
+                lines.append(f"• `verification_timeout_hours`: {config.verification_timeout_hours}")
+                lines.append(f"• `kick_on_timeout`: {config.kick_on_timeout}")
+            else:
+                lines.append("❌ No VerificationConfig record found!")
+
+            lines.append("")
+
+            # Summary diagnosis
+            lines.append("**🩺 Diagnosis:**")
+            issues = []
+
+            if not db_guild:
+                issues.append("No guild record - save verification settings on the web dashboard")
+            elif not db_guild.verification_enabled:
+                issues.append("**verification_enabled is FALSE** - set verification type to anything other than 'None' and save")
+
+            if not config:
+                issues.append("No VerificationConfig - save verification settings on the web dashboard")
+            elif config.verification_type == VerificationType.NONE:
+                issues.append("verification_type is NONE - change to Button, Captcha, etc.")
+
+            if db_guild and not db_guild.quarantine_role_id:
+                issues.append("No quarantine role set - select one in the web dashboard")
+
+            if db_guild and not db_guild.verification_channel_id:
+                issues.append("No verification channel set - run `/verify setup #channel` or set in dashboard")
+
+            if issues:
+                for issue in issues:
+                    lines.append(f"⚠️ {issue}")
+            else:
+                lines.append("✅ Configuration looks correct!")
+                lines.append("\nIf verification still isn't working, check the bot logs for `[VERIFY]` entries.")
+
+        await ctx.followup.send("\n".join(lines), ephemeral=True)
 
 
 def setup(bot: commands.Bot):

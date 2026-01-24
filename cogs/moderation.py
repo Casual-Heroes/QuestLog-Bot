@@ -14,6 +14,7 @@ Features:
 import re
 import time
 import json
+import asyncio
 from datetime import datetime, timezone, timedelta
 
 import discord
@@ -1073,10 +1074,11 @@ class ModerationCog(commands.Cog):
                             reason="Jail system setup"
                         )
                     else:
-                        # Jail role cannot view any other channel
+                        # Jail role cannot view or send in any other channel
                         await channel.set_permissions(
                             jail_role,
                             view_channel=False,
+                            send_messages=False,
                             reason="Jail system setup - deny access"
                         )
                     permissions_set += 1
@@ -1116,6 +1118,116 @@ class ModerationCog(commands.Cog):
             )
 
         await ctx.edit(content=None, embed=embed)
+
+    @mod.command(name="jail-lockdown", description="Re-apply jail permissions to all channels (use after adding new channels)")
+    @discord.default_permissions(administrator=True)
+    @commands.has_permissions(administrator=True)
+    async def mod_jail_lockdown(self, ctx: discord.ApplicationContext):
+        """
+        Re-apply jail permissions to all channels.
+        Use this after adding new channels or if jail permissions aren't working.
+        - Jail role: DENY view_channel and send_messages on all channels/categories
+        - Jail role: ALLOW view_channel, send_messages, read_message_history on jail channel only
+        """
+        await ctx.defer(ephemeral=True)
+
+        with db_session_scope() as session:
+            db_guild = session.get(Guild, ctx.guild.id)
+            if not db_guild or not db_guild.jail_role_id:
+                await ctx.followup.send(
+                    "Jail role not configured. Use `/mod setup-jail` first!",
+                    ephemeral=True
+                )
+                return
+            jail_role_id = db_guild.jail_role_id
+            jail_channel_id = db_guild.jail_channel_id
+
+        jail_role = ctx.guild.get_role(jail_role_id)
+        if not jail_role:
+            await ctx.followup.send(
+                "Jail role not found. Please reconfigure with `/mod setup-jail`.",
+                ephemeral=True
+            )
+            return
+
+        jail_channel = ctx.guild.get_channel(jail_channel_id) if jail_channel_id else None
+
+        updated_categories = 0
+        updated_channels = 0
+        errors = []
+
+        # Update all categories
+        for category in ctx.guild.categories:
+            try:
+                await category.set_permissions(
+                    jail_role,
+                    view_channel=False,
+                    send_messages=False,
+                    reason="Jail lockdown - deny access to jailed users"
+                )
+                updated_categories += 1
+                await asyncio.sleep(0.5)  # Rate limit protection
+            except discord.Forbidden:
+                errors.append(f"Category: {category.name} (no permission)")
+            except Exception as e:
+                errors.append(f"Category: {category.name} ({str(e)[:30]})")
+
+        # Update ALL channels (including those in categories)
+        for channel in ctx.guild.channels:
+            # Skip categories (already handled above)
+            if isinstance(channel, discord.CategoryChannel):
+                continue
+            # Skip jail channel (will be configured separately)
+            if jail_channel and channel.id == jail_channel.id:
+                continue
+
+            try:
+                await channel.set_permissions(
+                    jail_role,
+                    view_channel=False,
+                    send_messages=False,
+                    reason="Jail lockdown - deny access to jailed users"
+                )
+                updated_channels += 1
+                await asyncio.sleep(0.5)  # Rate limit protection
+            except discord.Forbidden:
+                errors.append(f"Channel: {channel.name} (no permission)")
+            except Exception as e:
+                errors.append(f"Channel: {channel.name} ({str(e)[:30]})")
+
+        # Configure jail channel if set
+        if jail_channel:
+            try:
+                await jail_channel.set_permissions(
+                    jail_role,
+                    view_channel=True,
+                    read_message_history=True,
+                    send_messages=True,
+                    reason="Jail lockdown - allow jailed users to see and speak in jail channel"
+                )
+            except discord.Forbidden:
+                errors.append(f"Jail channel: {jail_channel.name} (no permission)")
+
+        # Build response
+        result = (
+            f"**Jail Lockdown Complete!**\n\n"
+            f"✅ Updated **{updated_categories}** categories\n"
+            f"✅ Updated **{updated_channels}** channels\n"
+        )
+        if jail_channel:
+            result += f"✅ Allowed access to {jail_channel.mention}\n\n"
+        else:
+            result += f"⚠️ No jail channel configured - jailed users have no channel to speak in!\n\n"
+
+        result += f"Jailed members with the `{jail_role.name}` role can now **only** see the jail channel."
+
+        if errors:
+            result += f"\n\n⚠️ **{len(errors)} errors:**\n" + "\n".join(errors[:10])
+            if len(errors) > 10:
+                result += f"\n...and {len(errors) - 10} more"
+
+        await ctx.followup.send(result, ephemeral=True)
+        logger.info(f"Jail lockdown completed in {ctx.guild.name}: {updated_categories} categories, {updated_channels} channels")
 
     # Auto-mod configuration
 

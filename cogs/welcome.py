@@ -11,6 +11,7 @@ Features:
 - Auto-role on join
 """
 
+import json
 import time
 from datetime import datetime, timezone
 
@@ -79,7 +80,7 @@ class WelcomeCog(commands.Cog):
     welcome = discord.SlashCommandGroup(
         name="welcome",
         description="Welcome message configuration",
-        
+
     )
 
     def get_welcome_config(self, session, guild_id: int) -> WelcomeConfig:
@@ -91,14 +92,11 @@ class WelcomeCog(commands.Cog):
             session.flush()
         return config
 
-    # Event listeners
-
-    @commands.Cog.listener()
-    async def on_member_join(self, member: discord.Member):
-        """Send welcome message when a member joins."""
-        if member.bot:
-            return
-
+    async def send_welcome_message(self, member: discord.Member):
+        """
+        Send welcome message to a member.
+        Called externally after verification completes.
+        """
         guild = member.guild
 
         with db_session_scope() as session:
@@ -121,7 +119,123 @@ class WelcomeCog(commands.Cog):
             dm_enabled = config.dm_enabled
             dm_message = config.dm_message
             auto_role_id = config.auto_role_id
+            verified_role_id = db_guild.verified_role_id
             welcome_channel_id = db_guild.welcome_channel_id
+
+        # Send channel welcome message
+        if channel_enabled and welcome_channel_id:
+            welcome_channel = guild.get_channel(welcome_channel_id)
+            try:
+                formatted_message = format_message(channel_message, member)
+
+                async def send_payload(dest_channel):
+                    if embed_enabled:
+                        embed = discord.Embed(
+                            title=format_message(embed_title, member) if embed_title else None,
+                            description=formatted_message,
+                            color=discord.Color(embed_color),
+                            timestamp=datetime.now(timezone.utc)
+                        )
+                        if embed_thumbnail:
+                            embed.set_thumbnail(url=member.display_avatar.url)
+                        if embed_footer:
+                            embed.set_footer(text=format_message(embed_footer, member))
+                        await dest_channel.send(embed=embed)
+                    else:
+                        await dest_channel.send(formatted_message)
+
+                if isinstance(welcome_channel, discord.TextChannel):
+                    await send_payload(welcome_channel)
+                elif isinstance(welcome_channel, discord.ForumChannel):
+                    thread = await welcome_channel.create_thread(
+                        name=f"Welcome **{member.display_name or member.name}**",
+                        content=None
+                    )
+                    await send_payload(thread)
+
+            except discord.Forbidden:
+                logger.warning(f"Cannot send welcome message in {guild.name} - missing permissions")
+            except Exception as e:
+                logger.error(f"Error sending welcome message: {e}")
+
+        # Send DM welcome message
+        if dm_enabled and dm_message:
+            try:
+                formatted_dm = format_message(dm_message, member)
+                embed = discord.Embed(
+                    description=formatted_dm,
+                    color=discord.Color.blurple()
+                )
+                embed.set_author(name=guild.name, icon_url=guild.icon.url if guild.icon else None)
+                await member.send(embed=embed)
+            except discord.Forbidden:
+                pass
+            except Exception as e:
+                logger.warning(f"Failed to DM welcome to {member}: {e}")
+
+        # Assign auto-role (only if different from verified role, since that's already assigned)
+        if auto_role_id and auto_role_id != verified_role_id:
+            auto_role = guild.get_role(auto_role_id)
+            if auto_role:
+                try:
+                    await member.add_roles(auto_role, reason="Auto-role (post-verification)")
+                except discord.Forbidden:
+                    logger.warning(f"Cannot assign auto-role in {guild.name}")
+
+        logger.info(f"Sent welcome message for {member} in {guild.name} (post-verification)")
+
+    # Event listeners
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        """Send welcome message when a member joins."""
+        if member.bot:
+            return
+
+        guild = member.guild
+
+        with db_session_scope() as session:
+            db_guild = session.get(Guild, guild.id)
+            if not db_guild:
+                return
+
+            config = self.get_welcome_config(session, guild.id)
+            if not config.enabled:
+                return
+
+            # If verification is enabled, don't send welcome until verified
+            # Welcome will be sent from verification.py after successful verification
+            if db_guild.verification_enabled:
+                logger.debug(f"Skipping welcome for {member} - verification required")
+                return
+
+            # Store config values before session closes
+            channel_enabled = config.channel_message_enabled
+            channel_message = config.channel_message
+            embed_enabled = config.channel_embed_enabled
+            embed_title = config.channel_embed_title
+            embed_color = config.channel_embed_color
+            embed_thumbnail = config.channel_embed_thumbnail
+            embed_footer = config.channel_embed_footer
+            dm_enabled = config.dm_enabled
+            dm_message = config.dm_message
+            auto_role_id = config.auto_role_id
+            welcome_channel_id = db_guild.welcome_channel_id
+
+            # Check for role persistence (for returning members)
+            role_persistence_enabled = db_guild.role_persistence_enabled
+            saved_role_ids = []
+            if role_persistence_enabled:
+                db_member = session.get(GuildMember, (guild.id, member.id))
+                if db_member and db_member.saved_roles:
+                    try:
+                        saved_role_ids = json.loads(db_member.saved_roles)
+                        # Clear saved roles now that we're restoring them
+                        db_member.saved_roles = None
+                        db_member.left_at = None
+                        session.commit()
+                    except (json.JSONDecodeError, TypeError):
+                        saved_role_ids = []
 
         # Send channel welcome message (text or forum)
         if channel_enabled and welcome_channel_id:
@@ -185,9 +299,28 @@ class WelcomeCog(commands.Cog):
                 except discord.Forbidden:
                     logger.warning(f"Cannot assign auto-role in {guild.name}")
 
+        # Restore saved roles for returning members (role persistence)
+        if saved_role_ids:
+            roles_to_add = []
+            for role_id in saved_role_ids:
+                role = guild.get_role(role_id)
+                if role and not role.managed and role.id != guild.id:
+                    # Don't restore roles that are higher than bot's top role
+                    if role < guild.me.top_role:
+                        roles_to_add.append(role)
+
+            if roles_to_add:
+                try:
+                    await member.add_roles(*roles_to_add, reason="Role persistence - restored on rejoin")
+                    logger.info(f"[ROLE PERSIST] Restored {len(roles_to_add)} roles for {member} rejoining {guild.name}")
+                except discord.Forbidden:
+                    logger.warning(f"[ROLE PERSIST] Cannot restore roles for {member} in {guild.name} - missing permissions")
+                except Exception as e:
+                    logger.error(f"[ROLE PERSIST] Error restoring roles: {e}")
+
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
-        """Send goodbye message when a member leaves."""
+        """Save roles and send goodbye message when a member leaves."""
         if member.bot:
             return
 
@@ -197,6 +330,24 @@ class WelcomeCog(commands.Cog):
             db_guild = session.get(Guild, guild.id)
             if not db_guild:
                 return
+
+            # Save roles for persistence (if enabled)
+            if db_guild.role_persistence_enabled:
+                # Get member's roles (excluding @everyone and managed/bot roles)
+                role_ids = [
+                    role.id for role in member.roles
+                    if role.id != guild.id  # Exclude @everyone
+                    and not role.managed  # Exclude bot-managed roles
+                    and not role.is_bot_managed()  # Exclude bot integration roles
+                ]
+
+                if role_ids:
+                    db_member = session.get(GuildMember, (guild.id, member.id))
+                    if db_member:
+                        db_member.saved_roles = json.dumps(role_ids)
+                        db_member.left_at = int(time.time())
+                        session.commit()
+                        logger.info(f"[ROLE PERSIST] Saved {len(role_ids)} roles for {member} leaving {guild.name}")
 
             config = self.get_welcome_config(session, guild.id)
             if not config.enabled or not config.goodbye_enabled:
