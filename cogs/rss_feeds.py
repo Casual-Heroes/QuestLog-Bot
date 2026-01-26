@@ -58,6 +58,44 @@ RSS_FETCH_TIMEOUT = 30  # seconds
 RSS_MAX_SIZE = 5 * 1024 * 1024  # 5MB max feed size
 RSS_MAX_REDIRECTS = 5
 
+# Allowed URL schemes for RSS entry links (prevents XSS via javascript:, data:, etc.)
+ALLOWED_LINK_SCHEMES = {'http', 'https'}
+
+
+def _sanitize_entry_link(url: str) -> str:
+    """
+    Sanitize an RSS entry link to prevent XSS attacks.
+
+    Only allows http:// and https:// URLs. Returns empty string for
+    dangerous schemes like javascript:, data:, vbscript:, file:, etc.
+
+    Args:
+        url: The URL from an RSS entry
+
+    Returns:
+        The URL if safe, or empty string if dangerous/invalid
+    """
+    if not url:
+        return ''
+
+    url = url.strip()
+    if not url:
+        return ''
+
+    # Parse URL to check scheme
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return ''
+
+    # Only allow http and https schemes
+    if parsed.scheme.lower() not in ALLOWED_LINK_SCHEMES:
+        logger.warning(f"RSSFeeds: Blocked unsafe link scheme '{parsed.scheme}' in entry: {url[:100]}")
+        return ''
+
+    return url
+
 
 def _validate_rss_url_for_fetch(url: str) -> Tuple[bool, Optional[str]]:
     """
@@ -162,16 +200,11 @@ def _secure_fetch_rss_sync(url: str, timeout: int = RSS_FETCH_TIMEOUT, max_size:
         logger.warning(f"RSSFeeds: URL validation failed for {url}: {error}")
         return None, error
 
-    # If requests is not available, fall back to feedparser (less secure but functional)
+    # Require requests library for secure RSS fetching (SSRF protection)
+    # Do NOT fall back to feedparser.parse(url) as it bypasses security checks
     if requests is None:
-        logger.debug(f"RSSFeeds: Using feedparser fallback (requests not available) for {url}")
-        try:
-            parsed = feedparser.parse(url)
-            if parsed.bozo and not parsed.entries:
-                return None, str(parsed.get('bozo_exception', 'Parse error'))
-            return parsed, None
-        except Exception as e:
-            return None, str(e)
+        logger.error("RSSFeeds: requests library not available - RSS fetching disabled for security")
+        return None, 'RSS fetching requires the requests library for SSRF protection'
 
     try:
         current_url = url
@@ -739,7 +772,7 @@ class RSSFeedsCog(commands.Cog):
                 entry_record = RSSFeedEntry(
                     feed_id=feed.id,
                     entry_guid=guid,
-                    entry_link=self._truncate(entry.get('link', ''), 500),
+                    entry_link=self._truncate(_sanitize_entry_link(entry.get('link', '')), 500),
                     entry_title=self._truncate(entry.get('title', ''), 500),
                     entry_summary=entry_data['summary'],
                     entry_author=entry_data['author'],

@@ -947,6 +947,7 @@ class GameSearchConfig(Base):
     # Filters (JSON arrays)
     genres = Column(Text, nullable=True)  # JSON array of genre names
     themes = Column(Text, nullable=True)  # JSON array of theme names
+    keywords = Column(Text, nullable=True)  # JSON array of IGDB keywords (Souls-like, Metroidvania, etc.)
     game_modes = Column(Text, nullable=True)  # JSON array of mode names
     platforms = Column(Text, nullable=True)  # JSON array of platform names
 
@@ -989,6 +990,7 @@ class FoundGame(Base):
     summary = Column(Text, nullable=True)  # Game description
     genres = Column(Text, nullable=True)  # JSON array
     themes = Column(Text, nullable=True)  # JSON array
+    keywords = Column(Text, nullable=True)  # JSON array (Souls-like, Metroidvania, etc.)
     game_modes = Column(Text, nullable=True)  # JSON array
     platforms = Column(Text, nullable=True)  # JSON array
 

@@ -1233,13 +1233,14 @@ class DiscoveryCog(commands.Cog):
                             # Parse filters
                             genres = json.loads(search_config.genres) if search_config.genres else None
                             themes = json.loads(search_config.themes) if search_config.themes else None
+                            keywords = json.loads(search_config.keywords) if search_config.keywords else None
                             modes = json.loads(search_config.game_modes) if search_config.game_modes else None
                             platforms = json.loads(search_config.platforms) if search_config.platforms else None
                             announcement_window = search_config.days_ahead or 30
                             min_hype = search_config.min_hype
                             min_rating = search_config.min_rating
 
-                            logger.info(f"Search '{search_config.name}' filters - Genres: {genres}, Themes: {themes}, Modes: {modes}, Platforms: {platforms}")
+                            logger.info(f"Search '{search_config.name}' filters - Genres: {genres}, Themes: {themes}, Keywords: {keywords}, Modes: {modes}, Platforms: {platforms}")
 
                             # Fetch games from IGDB
                             games = await igdb.search_upcoming_games(
@@ -1247,6 +1248,7 @@ class DiscoveryCog(commands.Cog):
                                 days_behind=0,
                                 genres=genres,
                                 themes=themes,
+                                keywords=keywords,
                                 game_modes=modes,
                                 platforms=platforms,
                                 min_hype=min_hype,
@@ -3687,6 +3689,7 @@ class DiscoveryCog(commands.Cog):
                     # Parse filters
                     genres = json.loads(search_config.genres) if search_config.genres else None
                     themes = json.loads(search_config.themes) if search_config.themes else None
+                    keywords = json.loads(search_config.keywords) if search_config.keywords else None
                     modes = json.loads(search_config.game_modes) if search_config.game_modes else None
                     platforms = json.loads(search_config.platforms) if search_config.platforms else None
                     announcement_window = search_config.days_ahead or 30
@@ -3699,6 +3702,7 @@ class DiscoveryCog(commands.Cog):
                         days_behind=0,
                         genres=genres,
                         themes=themes,
+                        keywords=keywords,
                         game_modes=modes,
                         platforms=platforms,
                         min_hype=min_hype,
@@ -3706,9 +3710,27 @@ class DiscoveryCog(commands.Cog):
                         limit=100
                     )
 
+                    logger.info(f"Manual check: Running search '{search_config.name}' for guild {ctx.guild.id}")
+                    logger.info(f"IGDB returned {len(games)} games before filtering")
+
                     # Filter to announcement window
                     announcement_cutoff = now + (announcement_window * 24 * 60 * 60)
+                    import datetime
+                    logger.info(f"Announcement window: {announcement_window} days, cutoff: {datetime.datetime.fromtimestamp(announcement_cutoff)}")
+
+                    # Log games that get filtered out
+                    for g in games:
+                        if g.release_date:
+                            release_dt = datetime.datetime.fromtimestamp(g.release_date)
+                            if g.release_date > announcement_cutoff:
+                                logger.info(f"  FILTERED OUT: '{g.name}' releases {release_dt} (beyond {announcement_window}-day window)")
+                            else:
+                                logger.info(f"  KEEPING: '{g.name}' releases {release_dt}")
+                        else:
+                            logger.info(f"  FILTERED OUT: '{g.name}' has no release date")
+
                     games = [g for g in games if g.release_date and g.release_date <= announcement_cutoff]
+                    logger.info(f"Search '{search_config.name}' found {len(games)} games within {announcement_window}-day window")
 
                     # Add to master list, track privacy
                     for game in games:

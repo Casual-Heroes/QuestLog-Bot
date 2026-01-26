@@ -1127,6 +1127,66 @@ class ActionProcessorCog(commands.Cog):
             if not discovery_channel:
                 raise ValueError("No game discovery channel configured")
 
+            # =====================================================================
+            # REFRESH RELEASE DATES FOR TBD GAMES
+            # Check games with placeholder dates (Dec 30/31, quarter-ends) and
+            # update if IGDB now has a real release date
+            # =====================================================================
+            import datetime
+            import calendar
+
+            def is_placeholder_date(timestamp):
+                """Check if a release date is a TBD placeholder.
+
+                IGDB uses last-day-of-month as placeholders:
+                - Dec 30/31 = year only known
+                - Last day of any month = month/quarter only known (Jan 31, Feb 28, Mar 31, etc.)
+                """
+                if not timestamp:
+                    return True
+                dt = datetime.datetime.fromtimestamp(timestamp)
+                year, month, day = dt.year, dt.month, dt.day
+                # Dec 30/31 = year only known
+                if month == 12 and day >= 30:
+                    return True
+                # Check if this is the last day of the month (IGDB placeholder)
+                last_day_of_month = calendar.monthrange(year, month)[1]
+                if day == last_day_of_month:
+                    return True
+                return False
+
+            # Find games with placeholder dates for this guild
+            tbd_games = session.query(FoundGame).filter(
+                FoundGame.guild_id == guild.id,
+                FoundGame.release_date.isnot(None)
+            ).all()
+
+            # Filter to only those with placeholder dates
+            games_to_refresh = [g for g in tbd_games if is_placeholder_date(g.release_date)]
+
+            if games_to_refresh:
+                logger.info(f"Checking {len(games_to_refresh)} games with TBD dates for updates")
+                igdb_ids = [g.igdb_id for g in games_to_refresh]
+
+                # Fetch updated release dates from IGDB
+                updated_dates = await igdb.get_release_dates_bulk(igdb_ids)
+
+                # Update games that now have real dates
+                updates_made = 0
+                for game in games_to_refresh:
+                    if game.igdb_id in updated_dates:
+                        new_date = updated_dates[game.igdb_id]
+                        if new_date and not is_placeholder_date(new_date):
+                            old_dt = datetime.datetime.fromtimestamp(game.release_date).strftime('%Y-%m-%d')
+                            new_dt = datetime.datetime.fromtimestamp(new_date).strftime('%Y-%m-%d')
+                            logger.info(f"Updating '{game.game_name}' release date: {old_dt} -> {new_dt}")
+                            game.release_date = new_date
+                            updates_made += 1
+
+                if updates_made:
+                    session.commit()
+                    logger.info(f"Updated release dates for {updates_made} games")
+
             # Get all enabled search configurations
             search_configs = (
                 session.query(GameSearchConfig)
@@ -1145,31 +1205,94 @@ class ActionProcessorCog(commands.Cog):
                 try:
                     logger.info(f"Manual check: Running search '{search_config.name}' for guild {guild.id}")
 
+                    # Debug: Log raw database values
+                    logger.info(f"RAW DB values - genres: {search_config.genres!r}, themes: {search_config.themes!r}, keywords: {search_config.keywords!r}")
+
                     # Parse filters
                     genres = json.loads(search_config.genres) if search_config.genres else None
                     themes = json.loads(search_config.themes) if search_config.themes else None
+                    keywords = json.loads(search_config.keywords) if search_config.keywords else None
                     modes = json.loads(search_config.game_modes) if search_config.game_modes else None
                     platforms = json.loads(search_config.platforms) if search_config.platforms else None
                     announcement_window = search_config.days_ahead or 30
                     min_hype = search_config.min_hype
                     min_rating = search_config.min_rating
 
-                    # Fetch games from IGDB
-                    games = await igdb.search_upcoming_games(
-                        days_ahead=365,  # Search wide window
+                    # Debug: Log parsed filters
+                    logger.info(f"Search '{search_config.name}' filters - genres: {genres}, themes: {themes}, keywords: {keywords}, modes: {modes}, platforms: {platforms}")
+
+                    # Calculate announcement cutoff
+                    announcement_cutoff = now + (announcement_window * 24 * 60 * 60)
+                    cutoff_dt = datetime.datetime.fromtimestamp(announcement_cutoff)
+                    logger.info(f"Announcement window: {announcement_window} days, cutoff: {cutoff_dt}")
+
+                    # Fetch games in two queries to capture both:
+                    # 1. Games releasing within the announcement window
+                    # 2. TBD games (Dec 30/31 placeholder dates)
+
+                    # Query 1: Games releasing within announcement window
+                    # Use high limit (500) because OR logic across genres/themes/keywords can match many games
+                    games_in_window = await igdb.search_upcoming_games(
+                        days_ahead=announcement_window,  # Use the actual window, not 365
                         days_behind=0,
                         genres=genres,
                         themes=themes,
+                        keywords=keywords,
                         game_modes=modes,
                         platforms=platforms,
                         min_hype=min_hype,
                         min_rating=min_rating,
-                        limit=100
+                        limit=500  # High limit for OR logic - can match many games
+                    )
+                    logger.info(f"IGDB returned {len(games_in_window)} games within {announcement_window}-day window")
+
+                    # Query 2: TBD games (Dec 30/31 of current/next year)
+                    # These have placeholder dates far in the future
+                    current_year = datetime.datetime.now().year
+                    games_tbd = await igdb.search_upcoming_games(
+                        days_ahead=365,  # Search full year for TBD placeholders
+                        days_behind=0,
+                        genres=genres,
+                        themes=themes,
+                        keywords=keywords,
+                        game_modes=modes,
+                        platforms=platforms,
+                        min_hype=min_hype,
+                        min_rating=min_rating,
+                        limit=500  # High limit for TBD games too
                     )
 
-                    # Filter to announcement window for this search
-                    announcement_cutoff = now + (announcement_window * 24 * 60 * 60)
-                    games = [g for g in games if g.release_date and g.release_date <= announcement_cutoff]
+                    # Filter TBD query to only include placeholder dates (Dec 30/31)
+                    def is_tbd_placeholder(release_timestamp):
+                        """Check if release date is a TBD placeholder (Dec 30/31 of any year)"""
+                        if not release_timestamp:
+                            return True  # No date = TBD
+                        dt = datetime.datetime.fromtimestamp(release_timestamp)
+                        return dt.month == 12 and dt.day >= 30
+
+                    tbd_games = [g for g in games_tbd if is_tbd_placeholder(g.release_date)]
+                    logger.info(f"IGDB returned {len(tbd_games)} TBD games (Dec 30/31 placeholders)")
+
+                    # Combine results, avoiding duplicates
+                    seen_ids = set()
+                    games = []
+                    for game in games_in_window + tbd_games:
+                        if game.id not in seen_ids:
+                            seen_ids.add(game.id)
+                            games.append(game)
+
+                    logger.info(f"Combined: {len(games)} unique games")
+
+                    # Log each game
+                    for g in games:
+                        if g.release_date:
+                            release_dt = datetime.datetime.fromtimestamp(g.release_date)
+                            if is_tbd_placeholder(g.release_date):
+                                logger.info(f"  TBD: '{g.name}' - placeholder date {release_dt}")
+                            else:
+                                logger.info(f"  '{g.name}' releases {release_dt}")
+                        else:
+                            logger.info(f"  TBD: '{g.name}' - no release date")
 
                     # Add to master list (avoid duplicates across searches), track privacy
                     for game in games:
@@ -1180,7 +1303,7 @@ class ActionProcessorCog(commands.Cog):
                                 "search_config": search_config
                             }
 
-                    logger.info(f"Search '{search_config.name}' found {len(games)} games")
+                    logger.info(f"Search '{search_config.name}' found {len(games)} games after filtering")
 
                 except Exception as e:
                     logger.error(f"Error running search '{search_config.name}': {e}")
