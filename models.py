@@ -187,6 +187,8 @@ class Guild(Base):
     audit_event_config = Column(Text, nullable=True)  # JSON map of event toggles
     mod_enabled = Column(Boolean, nullable=False, default=False, server_default='0')
     discovery_enabled = Column(Boolean, default=False)
+    role_persistence_enabled = Column(Boolean, default=False)  # Restore roles when members rejoin
+    role_persistence_excluded = Column(Text, nullable=True)  # JSON array of role IDs to NEVER restore (admin roles, etc.)
 
     # Cached Discord Resources (JSON text - synced by bot to reduce API calls)
     cached_channels = Column(Text, nullable=True)  # JSON array of channel objects
@@ -215,6 +217,10 @@ class Guild(Base):
     # Moderation Channels
     jail_channel_id = Column(BigInteger, nullable=True)  # Where jailed users go for review
     mod_log_channel_id = Column(BigInteger, nullable=True)  # Mod action log channel
+
+    # Channel Creation Notifications
+    channel_notify_channel_id = Column(BigInteger, nullable=True)  # Where to send new channel alerts
+    temp_voice_category_ids = Column(Text, nullable=True)  # JSON array of category IDs to ignore (Mee6 temp VCs)
 
     # Bot lifecycle tracking
     bot_present = Column(Boolean, default=True)  # Is bot currently in this guild?
@@ -336,6 +342,10 @@ class GuildMember(Base):
     quarantine_reason = Column(String(500), nullable=True)
     quarantined_roles = Column(Text, nullable=True)  # JSON array of role IDs to restore on unjail
     warn_count = Column(Integer, default=0)
+
+    # Role persistence (for rejoining members)
+    saved_roles = Column(Text, nullable=True)  # JSON array of role IDs saved when member left
+    left_at = Column(BigInteger, nullable=True)  # When member left the guild
 
     # Timestamps
     first_seen = Column(BigInteger, default=lambda: int(time.time()))
@@ -534,6 +544,9 @@ class VerificationConfig(Base):
     # Account age
     require_account_age = Column(Boolean, default=True)
     min_account_age_days = Column(Integer, default=7)
+    # If True: accounts meeting age requirement bypass verification (auto-verify + welcome)
+    # If False: accounts meeting age requirement just get welcomed, must still verify manually
+    auto_verify_on_age = Column(Boolean, default=True)
 
     # Button
     button_text = Column(String(100), default="I agree to the rules")
@@ -1308,7 +1321,7 @@ class WelcomeConfig(Base):
 
     # Channel welcome message
     channel_message_enabled = Column(Boolean, default=True)
-    channel_message = Column(Text, default="Welcome to **{server}**, {user}! You are member #{member_count}.")
+    channel_message = Column(Text, default="Welcome to **{server}**, {user}! You are member #{join_number}.")
     channel_embed_enabled = Column(Boolean, default=True)
     channel_embed_title = Column(String(255), default="Welcome!")
     channel_embed_color = Column(Integer, default=0x5865F2)  # Discord blurple
@@ -1326,6 +1339,10 @@ class WelcomeConfig(Base):
 
     # Auto-role on join (separate from verified role)
     auto_role_id = Column(BigInteger, nullable=True)
+
+    # Join counter - tracks total number of welcomed members (for {join_number})
+    # This increments each time a welcome is sent, giving accurate "You are member #X" counts
+    total_joins = Column(Integer, default=0)
 
     # Timestamps
     updated_at = Column(BigInteger, default=lambda: int(time.time()))

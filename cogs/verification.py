@@ -21,10 +21,12 @@ import time
 import secrets  # SECURITY FIX: Use secrets instead of random for CAPTCHA
 import string
 import asyncio
+import io
 import discord
 from discord.ext import commands, tasks
 from discord import SlashCommandGroup
 from discord.ui import View, Button, Modal, InputText
+from captcha.image import ImageCaptcha
 
 from config import (
     db_session_scope, logger, get_debug_guilds,
@@ -71,6 +73,36 @@ def generate_captcha(length: int = 6) -> str:
     return "".join(secrets.choice(chars) for _ in range(length))
 
 
+def generate_captcha_image(code: str) -> io.BytesIO:
+    """
+    Generate a distorted captcha image that's hard for bots to OCR.
+
+    Args:
+        code: The captcha code to render
+
+    Returns:
+        BytesIO buffer containing the PNG image
+    """
+    # Create image captcha generator with custom settings
+    # width=280, height=90 is good for Discord embeds
+    image_captcha = ImageCaptcha(width=280, height=90)
+
+    # Generate the image
+    image = image_captcha.generate_image(code)
+
+    # Save to BytesIO buffer
+    buffer = io.BytesIO()
+    image.save(buffer, format='PNG')
+    buffer.seek(0)
+
+    return buffer
+
+
+# Server-side captcha storage with expiry
+# Format: {(guild_id, user_id): {'code': str, 'expires': float}}
+_pending_captchas: dict = {}
+
+
 def check_account_age(user: discord.User, min_days: int) -> tuple[bool, int]:
     """
     Check if account is old enough.
@@ -106,36 +138,59 @@ class VerifyButtonView(View):
 
 
 class CaptchaModal(Modal):
-    """Modal for captcha input."""
+    """Modal for captcha input - code is stored server-side, NOT in modal."""
 
-    def __init__(self, captcha_code: str, guild_id: int):
+    def __init__(self, guild_id: int, captcha_length: int = 6):
         super().__init__(title="Verification Captcha")
-        self.captcha_code = captcha_code
         self.guild_id = guild_id
 
         self.captcha_input = InputText(
-            label=f"Enter the code: {captcha_code}",
+            label="Enter the code shown in the image above",
             placeholder="Type the code exactly as shown",
-            min_length=len(captcha_code),
-            max_length=len(captcha_code),
+            min_length=captcha_length,
+            max_length=captcha_length,
         )
         self.add_item(self.captcha_input)
 
     async def callback(self, interaction: discord.Interaction):
-        """Handle captcha submission."""
+        """Handle captcha submission - verify against server-side stored code."""
         user_input = self.captcha_input.value.upper().strip()
 
-        if user_input == self.captcha_code:
+        # Look up the stored captcha code
+        key = (self.guild_id, interaction.user.id)
+        stored = _pending_captchas.get(key)
+
+        if not stored:
+            await interaction.response.send_message(
+                "Your captcha has expired. Please click the button again to get a new one.",
+                ephemeral=True
+            )
+            return
+
+        # Check if expired (5 minute timeout)
+        if time.time() > stored['expires']:
+            # Clean up expired entry
+            _pending_captchas.pop(key, None)
+            await interaction.response.send_message(
+                "Your captcha has expired. Please click the button again to get a new one.",
+                ephemeral=True
+            )
+            return
+
+        if user_input == stored['code']:
+            # Clean up used captcha
+            _pending_captchas.pop(key, None)
             await process_verification(interaction, "captcha")
         else:
+            # Don't remove on failure - let them retry with same image
             await interaction.response.send_message(
-                "Incorrect code. Please try again with `/verify me`.",
+                "Incorrect code. Check the image and try again, or click the button for a new captcha.",
                 ephemeral=True
             )
 
 
 class CaptchaButtonView(View):
-    """Button to start captcha verification."""
+    """Button to start captcha verification with image-based challenge."""
 
     def __init__(self, guild_id: int, captcha_length: int = 6):
         super().__init__(timeout=None)
@@ -151,10 +206,82 @@ class CaptchaButtonView(View):
         button.callback = self.captcha_callback
         self.add_item(button)
 
+        # Add a secondary button to submit the answer
+        submit_button = Button(
+            label="Submit Answer",
+            style=discord.ButtonStyle.success,
+            custom_id=f"captcha_submit_{guild_id}",
+            emoji="✅"
+        )
+        submit_button.callback = self.submit_callback
+        self.add_item(submit_button)
+
     async def captcha_callback(self, interaction: discord.Interaction):
-        """Show captcha modal."""
+        """Generate and send captcha image, store code server-side."""
+        # Generate captcha code and image
         captcha_code = generate_captcha(self.captcha_length)
-        modal = CaptchaModal(captcha_code, self.guild_id)
+        image_buffer = generate_captcha_image(captcha_code)
+
+        # Store code server-side with 5-minute expiry
+        key = (self.guild_id, interaction.user.id)
+        _pending_captchas[key] = {
+            'code': captcha_code,
+            'expires': time.time() + 300  # 5 minutes
+        }
+
+        # Clean up old expired entries periodically (every 10th request)
+        if len(_pending_captchas) % 10 == 0:
+            current_time = time.time()
+            expired_keys = [k for k, v in _pending_captchas.items() if current_time > v['expires']]
+            for k in expired_keys:
+                _pending_captchas.pop(k, None)
+
+        # Create embed with instructions
+        embed = discord.Embed(
+            title="🔐 Captcha Verification",
+            description=(
+                "**Enter the code shown in the image below.**\n\n"
+                "• The code is case-insensitive\n"
+                "• You have 5 minutes to complete this\n"
+                "• Click **Submit Answer** when ready"
+            ),
+            color=discord.Color.blue()
+        )
+        embed.set_footer(text="If you can't read the code, click 'Start Verification' for a new one")
+
+        # Send image as attachment
+        file = discord.File(image_buffer, filename="captcha.png")
+        embed.set_image(url="attachment://captcha.png")
+
+        await interaction.response.send_message(
+            embed=embed,
+            file=file,
+            ephemeral=True
+        )
+
+    async def submit_callback(self, interaction: discord.Interaction):
+        """Show modal to submit captcha answer."""
+        # Check if user has a pending captcha
+        key = (self.guild_id, interaction.user.id)
+        stored = _pending_captchas.get(key)
+
+        if not stored:
+            await interaction.response.send_message(
+                "You don't have an active captcha. Click **Start Verification** first to get one.",
+                ephemeral=True
+            )
+            return
+
+        if time.time() > stored['expires']:
+            _pending_captchas.pop(key, None)
+            await interaction.response.send_message(
+                "Your captcha has expired. Click **Start Verification** for a new one.",
+                ephemeral=True
+            )
+            return
+
+        # Show modal (code length from stored captcha)
+        modal = CaptchaModal(self.guild_id, len(stored['code']))
         await interaction.response.send_modal(modal)
 
 
@@ -320,6 +447,8 @@ async def process_verification(interaction: discord.Interaction, method: str):
 
         # Get saved roles for persistence (returning members)
         saved_role_ids = []
+        excluded_role_ids = set()
+
         if db_guild.role_persistence_enabled and db_member.saved_roles:
             try:
                 saved_role_ids = json.loads(db_member.saved_roles)
@@ -328,6 +457,18 @@ async def process_verification(interaction: discord.Interaction, method: str):
                 db_member.left_at = None
             except (json.JSONDecodeError, TypeError):
                 saved_role_ids = []
+
+            # Build exclusion set
+            if quarantine_role_id:
+                excluded_role_ids.add(quarantine_role_id)
+
+            # Add admin-configured excluded roles
+            excluded_roles_json = getattr(db_guild, 'role_persistence_excluded', None)
+            if excluded_roles_json:
+                try:
+                    excluded_role_ids.update(json.loads(excluded_roles_json))
+                except (json.JSONDecodeError, TypeError):
+                    pass
 
     # Assign verified role
     if verified_role_id:
@@ -349,13 +490,47 @@ async def process_verification(interaction: discord.Interaction, method: str):
 
     # Restore saved roles for returning members (role persistence)
     if saved_role_ids:
+        # Dangerous permissions that should NEVER be auto-restored
+        DANGEROUS_PERMISSIONS = (
+            # Admin-level
+            'administrator',
+            'manage_guild',
+            'manage_roles',
+            'manage_channels',
+            'ban_members',
+            'kick_members',
+            'manage_webhooks',
+            'manage_expressions',
+            'mention_everyone',
+            # Mod-level
+            'moderate_members',
+            'mute_members',
+            'deafen_members',
+            'move_members',
+            'manage_nicknames',
+            'manage_events',
+            'view_audit_log',
+            'view_guild_insights',
+        )
+
         roles_to_add = []
         for role_id in saved_role_ids:
+            # Skip excluded roles
+            if role_id in excluded_role_ids:
+                continue
+
             role = guild.get_role(role_id)
-            if role and not role.managed and role.id != guild.id:
-                # Don't restore roles that are higher than bot's top role
-                if role < guild.me.top_role:
-                    roles_to_add.append(role)
+            if not role or role.managed or role.id == guild.id:
+                continue
+
+            # Skip roles with dangerous permissions
+            if any(getattr(role.permissions, perm, False) for perm in DANGEROUS_PERMISSIONS):
+                logger.warning(f"[ROLE PERSIST] Skipping dangerous role '{role.name}' for {member} after verification")
+                continue
+
+            # Don't restore roles higher than bot's top role
+            if role < guild.me.top_role:
+                roles_to_add.append(role)
 
         if roles_to_add:
             try:
@@ -562,7 +737,7 @@ class VerificationCog(commands.Cog):
 
             logger.info(f"[VERIFY] Config found: type={config.verification_type}, require_age={config.require_account_age}, min_days={config.min_account_age_days}")
 
-            # Create member record
+            # Create or get member record
             db_member = session.get(GuildMember, (member.guild.id, member.id))
             if not db_member:
                 logger.warning(
@@ -578,15 +753,147 @@ class VerificationCog(commands.Cog):
                 )
                 session.add(db_member)
             else:
-                # Reset verification state when rejoining
-                logger.info(f"[VERIFY] Existing member rejoined: {member}, current is_verified={db_member.is_verified}, is_quarantined={db_member.is_quarantined}")
+                # RETURNING MEMBER - Check if they were previously verified or have saved roles
+                logger.info(f"[VERIFY] Existing member rejoined: {member}, was_verified={db_member.is_verified}, has_saved_roles={bool(getattr(db_member, 'saved_roles', None))}")
+
+                # Check if role persistence is enabled and they have saved roles
+                role_persistence_enabled = getattr(db_guild, 'role_persistence_enabled', False)
+                saved_roles = getattr(db_member, 'saved_roles', None)
+                was_verified = db_member.is_verified
+
+                # If they have saved roles, they were a legitimate member before - restore and skip verification
+                # This covers both:
+                # 1. Members who verified (is_verified=True)
+                # 2. Members who met account age and never needed to verify (is_verified=False but had roles)
+                if role_persistence_enabled and saved_roles:
+                    # RETURNING MEMBER WITH SAVED ROLES - Skip verification, restore roles, welcome them
+                    # They had roles before = they were a legitimate member, NEVER quarantine them
+                    logger.info(f"[VERIFY] Returning member {member} has saved roles - restoring and skipping verification")
+
+                    # Get roles to exclude from restoration
+                    quarantine_role_id = db_guild.quarantine_role_id
+                    excluded_role_ids = set()
+
+                    # Add quarantine role to exclusion
+                    if quarantine_role_id:
+                        excluded_role_ids.add(quarantine_role_id)
+
+                    # Add admin-configured excluded roles
+                    excluded_roles_json = getattr(db_guild, 'role_persistence_excluded', None)
+                    if excluded_roles_json:
+                        try:
+                            excluded_role_ids.update(json.loads(excluded_roles_json))
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
+                    # Dangerous permissions that should NEVER be auto-restored
+                    # These could allow a kicked admin/mod to regain control
+                    DANGEROUS_PERMISSIONS = (
+                        # Admin-level
+                        'administrator',
+                        'manage_guild',
+                        'manage_roles',
+                        'manage_channels',
+                        'ban_members',
+                        'kick_members',
+                        'manage_webhooks',
+                        'manage_expressions',  # Emojis/stickers
+                        'mention_everyone',
+                        # Mod-level
+                        'moderate_members',  # Timeout
+                        'mute_members',  # Voice mute
+                        'deafen_members',  # Voice deafen
+                        'move_members',  # Move between voice channels
+                        'manage_nicknames',
+                        'manage_events',
+                        'view_audit_log',
+                        'view_guild_insights',
+                    )
+
+                    try:
+                        saved_role_ids = json.loads(saved_roles)
+                        roles_to_add = []
+                        skipped_dangerous = []
+
+                        for role_id in saved_role_ids:
+                            # Skip excluded roles (quarantine, admin-configured)
+                            if role_id in excluded_role_ids:
+                                logger.info(f"[ROLE PERSIST] Skipping excluded role {role_id} for {member}")
+                                continue
+
+                            role = member.guild.get_role(role_id)
+                            if not role or role.managed or role.id == member.guild.id:
+                                continue
+
+                            # Skip roles with dangerous permissions
+                            if any(getattr(role.permissions, perm, False) for perm in DANGEROUS_PERMISSIONS):
+                                skipped_dangerous.append(role.name)
+                                logger.warning(f"[ROLE PERSIST] Skipping dangerous role '{role.name}' for {member} (has elevated permissions)")
+                                continue
+
+                            # Don't restore roles higher than bot's top role
+                            if role < member.guild.me.top_role:
+                                roles_to_add.append(role)
+
+                        if roles_to_add:
+                            await member.add_roles(*roles_to_add, reason="Role persistence - returning member")
+                            logger.info(f"[ROLE PERSIST] Restored {len(roles_to_add)} roles for returning member {member}")
+
+                        if skipped_dangerous:
+                            logger.info(f"[ROLE PERSIST] Skipped {len(skipped_dangerous)} dangerous roles for {member}: {skipped_dangerous}")
+
+                    except (json.JSONDecodeError, TypeError) as e:
+                        logger.error(f"[ROLE PERSIST] Error parsing saved roles for {member}: {e}")
+                    except discord.Forbidden:
+                        logger.warning(f"[ROLE PERSIST] Cannot restore roles for {member} - missing permissions")
+                    except Exception as e:
+                        logger.error(f"[ROLE PERSIST] Error restoring roles for returning member: {e}")
+
+                    # ALWAYS clear saved roles and skip verification for returning members with saved roles
+                    # Even if role restoration failed, they were a member before - don't quarantine them
+                    db_member.saved_roles = None
+                    db_member.left_at = None
+                    db_member.is_quarantined = False
+                    session.commit()
+
+                    # Send welcome message (in separate try block so it doesn't affect the return)
+                    try:
+                        welcome_cog = self.bot.get_cog("WelcomeCog")
+                        if welcome_cog:
+                            await welcome_cog.send_welcome_message(member)
+                            logger.info(f"[VERIFY] Sent welcome message for returning member {member}")
+                    except Exception as e:
+                        logger.error(f"[VERIFY] Failed to send welcome for returning member: {e}")
+
+                    return  # Done - returning member with saved roles, NEVER quarantine
+
+                # RETURNING VERIFIED MEMBER (no saved roles but was verified before)
+                # They should NEVER get quarantine role - just welcome them back
+                if was_verified:
+                    logger.info(f"[VERIFY] Returning verified member {member} (no saved roles) - skipping quarantine, just welcoming")
+                    db_member.is_quarantined = False
+                    db_member.quarantined_at = None
+                    db_member.quarantine_reason = None
+                    session.commit()
+
+                    # Send welcome message
+                    try:
+                        welcome_cog = self.bot.get_cog("WelcomeCog")
+                        if welcome_cog:
+                            await welcome_cog.send_welcome_message(member)
+                            logger.info(f"[VERIFY] Sent welcome message for returning verified member {member} (no saved roles)")
+                    except Exception as e:
+                        logger.error(f"[VERIFY] Failed to send welcome for returning verified member: {e}")
+
+                    return  # Done - returning verified member, no verification needed
+
+                # Not a returning verified member OR role persistence failed - reset state
+                logger.info(f"[VERIFY] Resetting verification state for rejoining member {member}")
                 db_member.verification_method = None
-                # IMPORTANT: Reset verification status so they go through verification again
                 db_member.is_verified = False
                 db_member.is_quarantined = False
                 db_member.quarantined_at = None
                 db_member.quarantine_reason = None
-                logger.info(f"[VERIFY] Reset verification state for rejoining member {member}")
 
             # Check account age - applies to ALL verification types when require_account_age is enabled
             # OR always for ACCOUNT_AGE type
@@ -604,72 +911,41 @@ class VerificationCog(commands.Cog):
                 logger.info(f"[VERIFY] Account age check for {member}: {age_days} days, required: {min_days}, old_enough: {is_old_enough}")
 
                 if is_old_enough:
-                    # Account meets age requirement - AUTO-VERIFY for ALL types
-                    # No quarantine needed, just welcome them
-                    db_member.is_verified = True
-                    db_member.verified_at = int(time.time())
-                    db_member.verification_method = "account_age"
+                    # ACCOUNT OLD ENOUGH - No verification needed!
+                    # Just welcome them and give them the auto-join role (NOT the verified role)
+                    # They are trusted based on account age alone
+                    logger.info(f"[VERIFY] Account {member} is old enough ({age_days} days >= {min_days}), skipping verification - just welcoming")
+
+                    # Mark as not needing verification (but NOT as "verified" - that's for people who went through verification)
+                    db_member.is_verified = False  # They didn't verify, they just met age requirement
                     db_member.is_quarantined = False
+                    db_member.verification_method = None
 
-                    # Assign verified role
-                    verified_role_id = db_guild.verified_role_id
-                    if verified_role_id:
-                        verified_role = member.guild.get_role(verified_role_id)
-                        if verified_role:
-                            try:
-                                await member.add_roles(verified_role, reason="Auto-verified (account age)")
-                                logger.info(f"[VERIFY] Assigned verified role to {member} in {member.guild.name}")
-                            except discord.Forbidden:
-                                logger.warning(f"[VERIFY] Cannot assign verified role in {member.guild.name} - missing permissions")
-
-                    # Restore saved roles for returning members (role persistence)
-                    if db_guild.role_persistence_enabled and db_member.saved_roles:
-                        try:
-                            saved_role_ids = json.loads(db_member.saved_roles)
-                            # Clear saved roles now that we're restoring them
-                            db_member.saved_roles = None
-                            db_member.left_at = None
-
-                            roles_to_add = []
-                            for role_id in saved_role_ids:
-                                role = member.guild.get_role(role_id)
-                                if role and not role.managed and role.id != member.guild.id:
-                                    if role < member.guild.me.top_role:
-                                        roles_to_add.append(role)
-
-                            if roles_to_add:
-                                await member.add_roles(*roles_to_add, reason="Role persistence - restored on auto-verify rejoin")
-                                logger.info(f"[ROLE PERSIST] Restored {len(roles_to_add)} roles for {member} on auto-verify in {member.guild.name}")
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-                        except discord.Forbidden:
-                            logger.warning(f"[ROLE PERSIST] Cannot restore roles for {member} in {member.guild.name} - missing permissions")
-                        except Exception as e:
-                            logger.error(f"[ROLE PERSIST] Error restoring roles on auto-verify: {e}")
-
-                    logger.info(f"[VERIFY] Auto-verified {member} in {member.guild.name} (account age: {age_days} days >= required: {min_days})")
-
-                    # Commit and send welcome
+                    # Commit DB changes
                     session.commit()
+
+                    # Send welcome message (WelcomeCog handles the auto-join role from welcome settings)
                     try:
                         welcome_cog = self.bot.get_cog("WelcomeCog")
                         if welcome_cog:
                             await welcome_cog.send_welcome_message(member)
-                            logger.info(f"[VERIFY] Sent welcome message for auto-verified {member}")
+                            logger.info(f"[VERIFY] Sent welcome message for {member} (account age met, no verification needed)")
                         else:
                             logger.warning(f"[VERIFY] WelcomeCog not found - cannot send welcome for {member}")
                     except Exception as e:
-                        logger.error(f"[VERIFY] Failed to send welcome message for auto-verified user {member}: {e}", exc_info=True)
+                        logger.error(f"[VERIFY] Failed to send welcome message for {member}: {e}", exc_info=True)
 
-                    return  # Done - no quarantine needed
+                    return  # Done - no quarantine, no verification needed
+
                 else:
-                    # Account TOO NEW - must verify manually (click button to prove human)
+                    # ACCOUNT TOO NEW - Must verify first, THEN get welcomed
+                    # Quarantine them until they complete verification (button/captcha/etc)
                     account_too_new = True
-                    db_member.is_verified = False  # Reset verification status
+                    db_member.is_verified = False
                     db_member.is_quarantined = True
                     db_member.quarantined_at = int(time.time())
                     db_member.quarantine_reason = f"Account too new ({age_days} days, required: {min_days})"
-                    logger.info(f"[VERIFY] Account {member} is too new ({age_days} days < {min_days}), requiring manual verification via button")
+                    logger.info(f"[VERIFY] Account {member} is too new ({age_days} days < {min_days}), requiring verification before welcome")
 
             # Apply quarantine for ALL verification types (not just ACCOUNT_AGE)
             # This ensures timeout tracking works for Button, Captcha, etc.
@@ -776,9 +1052,53 @@ class VerificationCog(commands.Cog):
             await process_verification(ctx.interaction, "button")
 
         elif verification_type == VerificationType.CAPTCHA:
-            captcha_code = generate_captcha(config.captcha_length if config else 6)
-            modal = CaptchaModal(captcha_code, ctx.guild.id)
-            await ctx.send_modal(modal)
+            # Generate image-based captcha (bot-resistant)
+            captcha_length = config.captcha_length if config else 6
+            captcha_code = generate_captcha(captcha_length)
+            image_buffer = generate_captcha_image(captcha_code)
+
+            # Store code server-side with 5-minute expiry
+            key = (ctx.guild.id, ctx.author.id)
+            _pending_captchas[key] = {
+                'code': captcha_code,
+                'expires': time.time() + 300  # 5 minutes
+            }
+
+            # Create embed with instructions
+            embed = discord.Embed(
+                title="🔐 Captcha Verification",
+                description=(
+                    "**Enter the code shown in the image below.**\n\n"
+                    "• The code is case-insensitive\n"
+                    "• You have 5 minutes to complete this\n"
+                    "• Use the button below to submit your answer"
+                ),
+                color=discord.Color.blue()
+            )
+            embed.set_footer(text="If you can't read the code, run /verify me again for a new one")
+
+            # Create a view with submit button
+            class SubmitCaptchaView(View):
+                def __init__(self, guild_id: int, length: int):
+                    super().__init__(timeout=300)
+                    self.guild_id = guild_id
+                    self.length = length
+
+                @discord.ui.button(label="Submit Answer", style=discord.ButtonStyle.success, emoji="✅")
+                async def submit_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+                    modal = CaptchaModal(self.guild_id, self.length)
+                    await interaction.response.send_modal(modal)
+
+            # Send image as attachment
+            file = discord.File(image_buffer, filename="captcha.png")
+            embed.set_image(url="attachment://captcha.png")
+
+            await ctx.respond(
+                embed=embed,
+                file=file,
+                view=SubmitCaptchaView(ctx.guild.id, captcha_length),
+                ephemeral=True
+            )
 
         elif verification_type == VerificationType.ACCOUNT_AGE:
             # Check account age

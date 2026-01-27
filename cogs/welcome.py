@@ -29,8 +29,10 @@ WELCOME_VARIABLES = {
     "{discriminator}": "User's discriminator (if any)",
     "{user_id}": "User's ID",
     "{server}": "Server name",
-    "{member_count}": "Total member count",
-    "{member_count_ord}": "Member count with ordinal (1st, 2nd, etc.)",
+    "{member_count}": "Current total member count",
+    "{member_count_ord}": "Current member count with ordinal (1st, 2nd, etc.)",
+    "{join_number}": "This member's join number (increments per welcome)",
+    "{join_number_ord}": "Join number with ordinal (1st, 2nd, etc.)",
     "{created_at}": "When the account was created",
     "{avatar_url}": "User's avatar URL",
 }
@@ -45,10 +47,29 @@ def ordinal(n: int) -> str:
     return f"{n}{suffix}"
 
 
-def format_message(template: str, member: discord.Member) -> str:
-    """Format a message template with member/guild variables."""
+def format_message(template: str, member: discord.Member, join_number: int = None) -> str:
+    """Format a message template with member/guild variables.
+
+    Args:
+        template: The message template with {variables}
+        member: The Discord member object
+        join_number: The member's unique join number (from total_joins counter).
+                     If None, falls back to current member count.
+    """
     guild = member.guild
-    member_count = guild.member_count or len(guild.members)
+    # Count non-bot members for a more meaningful count
+    # Use the live guild.members list which is updated on member_join
+    # guild.member_count can be cached/stale for rapid joins
+    try:
+        # Count all members (including bots) - use live members list
+        member_count = len(guild.members)
+    except Exception:
+        # Fallback to cached count
+        member_count = guild.member_count or 0
+
+    # If join_number not provided, fall back to member_count
+    if join_number is None:
+        join_number = member_count
 
     display_name = member.display_name or member.name
     replacements = {
@@ -59,6 +80,8 @@ def format_message(template: str, member: discord.Member) -> str:
         "{server}": guild.name,
         "{member_count}": str(member_count),
         "{member_count_ord}": ordinal(member_count),
+        "{join_number}": str(join_number),
+        "{join_number_ord}": ordinal(join_number),
         "{created_at}": f"<t:{int(member.created_at.timestamp())}:R>",
         "{avatar_url}": member.display_avatar.url,
     }
@@ -108,6 +131,13 @@ class WelcomeCog(commands.Cog):
             if not config.enabled:
                 return
 
+            # Increment total_joins counter and get the join number
+            # This ensures each welcomed member gets a unique, incrementing number
+            current_joins = config.total_joins or 0
+            config.total_joins = current_joins + 1
+            join_number = config.total_joins
+            session.commit()
+
             # Store config values before session closes
             channel_enabled = config.channel_message_enabled
             channel_message = config.channel_message
@@ -126,12 +156,12 @@ class WelcomeCog(commands.Cog):
         if channel_enabled and welcome_channel_id:
             welcome_channel = guild.get_channel(welcome_channel_id)
             try:
-                formatted_message = format_message(channel_message, member)
+                formatted_message = format_message(channel_message, member, join_number)
 
                 async def send_payload(dest_channel):
                     if embed_enabled:
                         embed = discord.Embed(
-                            title=format_message(embed_title, member) if embed_title else None,
+                            title=format_message(embed_title, member, join_number) if embed_title else None,
                             description=formatted_message,
                             color=discord.Color(embed_color),
                             timestamp=datetime.now(timezone.utc)
@@ -139,7 +169,7 @@ class WelcomeCog(commands.Cog):
                         if embed_thumbnail:
                             embed.set_thumbnail(url=member.display_avatar.url)
                         if embed_footer:
-                            embed.set_footer(text=format_message(embed_footer, member))
+                            embed.set_footer(text=format_message(embed_footer, member, join_number))
                         await dest_channel.send(embed=embed)
                     else:
                         await dest_channel.send(formatted_message)
@@ -161,7 +191,7 @@ class WelcomeCog(commands.Cog):
         # Send DM welcome message
         if dm_enabled and dm_message:
             try:
-                formatted_dm = format_message(dm_message, member)
+                formatted_dm = format_message(dm_message, member, join_number)
                 embed = discord.Embed(
                     description=formatted_dm,
                     color=discord.Color.blurple()
@@ -209,6 +239,13 @@ class WelcomeCog(commands.Cog):
                 logger.debug(f"Skipping welcome for {member} - verification required")
                 return
 
+            # Increment total_joins counter and get the join number
+            # This ensures each welcomed member gets a unique, incrementing number
+            current_joins = config.total_joins or 0
+            config.total_joins = current_joins + 1
+            join_number = config.total_joins
+            session.commit()
+
             # Store config values before session closes
             channel_enabled = config.channel_message_enabled
             channel_message = config.channel_message
@@ -241,12 +278,12 @@ class WelcomeCog(commands.Cog):
         if channel_enabled and welcome_channel_id:
             welcome_channel = guild.get_channel(welcome_channel_id)
             try:
-                formatted_message = format_message(channel_message, member)
+                formatted_message = format_message(channel_message, member, join_number)
 
                 async def send_payload(dest_channel):
                     if embed_enabled:
                         embed = discord.Embed(
-                            title=format_message(embed_title, member) if embed_title else None,
+                            title=format_message(embed_title, member, join_number) if embed_title else None,
                             description=formatted_message,
                             color=discord.Color(embed_color),
                             timestamp=datetime.now(timezone.utc)
@@ -254,7 +291,7 @@ class WelcomeCog(commands.Cog):
                         if embed_thumbnail:
                             embed.set_thumbnail(url=member.display_avatar.url)
                         if embed_footer:
-                            embed.set_footer(text=format_message(embed_footer, member))
+                            embed.set_footer(text=format_message(embed_footer, member, join_number))
                         await dest_channel.send(embed=embed)
                     else:
                         await dest_channel.send(formatted_message)
@@ -278,7 +315,7 @@ class WelcomeCog(commands.Cog):
         # Send DM welcome message
         if dm_enabled and dm_message:
             try:
-                formatted_dm = format_message(dm_message, member)
+                formatted_dm = format_message(dm_message, member, join_number)
                 embed = discord.Embed(
                     description=formatted_dm,
                     color=discord.Color.blurple()
@@ -333,13 +370,63 @@ class WelcomeCog(commands.Cog):
 
             # Save roles for persistence (if enabled)
             if db_guild.role_persistence_enabled:
-                # Get member's roles (excluding @everyone and managed/bot roles)
-                role_ids = [
-                    role.id for role in member.roles
-                    if role.id != guild.id  # Exclude @everyone
-                    and not role.managed  # Exclude bot-managed roles
-                    and not role.is_bot_managed()  # Exclude bot integration roles
-                ]
+                # Get the quarantine role ID to exclude it from saved roles
+                quarantine_role_id = db_guild.quarantine_role_id
+
+                # Build exclusion set
+                excluded_role_ids = set()
+                if quarantine_role_id:
+                    excluded_role_ids.add(quarantine_role_id)
+
+                # Add admin-configured excluded roles
+                excluded_roles_json = getattr(db_guild, 'role_persistence_excluded', None)
+                if excluded_roles_json:
+                    try:
+                        excluded_role_ids.update(json.loads(excluded_roles_json))
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                # Dangerous permissions - NEVER save roles with these
+                # This prevents kicked admins/mods from regaining access on rejoin
+                DANGEROUS_PERMISSIONS = (
+                    # Admin-level
+                    'administrator',
+                    'manage_guild',
+                    'manage_roles',
+                    'manage_channels',
+                    'ban_members',
+                    'kick_members',
+                    'manage_webhooks',
+                    'manage_expressions',
+                    'mention_everyone',
+                    # Mod-level
+                    'moderate_members',  # Timeout
+                    'mute_members',  # Voice mute
+                    'deafen_members',  # Voice deafen
+                    'move_members',  # Move between voice channels
+                    'manage_nicknames',
+                    'manage_events',
+                    'view_audit_log',
+                    'view_guild_insights',
+                )
+
+                # Get member's roles (excluding dangerous ones)
+                role_ids = []
+                for role in member.roles:
+                    # Skip @everyone
+                    if role.id == guild.id:
+                        continue
+                    # Skip managed/bot roles
+                    if role.managed or role.is_bot_managed():
+                        continue
+                    # Skip excluded roles (quarantine, admin-configured)
+                    if role.id in excluded_role_ids:
+                        continue
+                    # Skip roles with dangerous permissions
+                    if any(getattr(role.permissions, perm, False) for perm in DANGEROUS_PERMISSIONS):
+                        logger.info(f"[ROLE PERSIST] Not saving dangerous role '{role.name}' for {member}")
+                        continue
+                    role_ids.append(role.id)
 
                 if role_ids:
                     db_member = session.get(GuildMember, (guild.id, member.id))

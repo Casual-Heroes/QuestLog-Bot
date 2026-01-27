@@ -83,6 +83,9 @@ class ChannelsCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        # Batching for mass channel creation (templates, server setup)
+        # {guild_id: {'channels': [], 'task': asyncio.Task, 'first_time': float}}
+        self._pending_channel_notifications: dict = {}
 
     channels = discord.SlashCommandGroup(
         name="channels",
@@ -528,50 +531,369 @@ class ChannelsCog(commands.Cog):
 
         await ctx.respond(embed=embed, ephemeral=True)
 
-    # New channel announcement listener
+    # New channel announcement listener with batching support
 
-    @commands.Cog.listener()
-    async def on_guild_channel_create(self, channel: discord.abc.GuildChannel):
-        """Announce new channel creation."""
-        if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
+    async def _send_channel_notification(self, guild_id: int):
+        """Send batched channel creation notification after delay."""
+        await asyncio.sleep(3)  # Wait 3 seconds for more channels
+
+        pending = self._pending_channel_notifications.pop(guild_id, None)
+        if not pending or not pending['channels']:
             return
 
-        guild_id = channel.guild.id
+        channels = pending['channels']
+        guild = self.bot.get_guild(guild_id)
+        if not guild:
+            return
 
         with db_session_scope() as session:
             db_guild = session.get(Guild, guild_id)
             if not db_guild:
                 return
-            # Prefer audit log channel if audit logging is enabled; fallback to welcome channel
-            announce_channel_id = db_guild.log_channel_id if db_guild.audit_logging_enabled else db_guild.welcome_channel_id
 
-        if not announce_channel_id:
+            # Get notification channel - prefer dedicated channel, fallback to log channel
+            notify_channel_id = db_guild.channel_notify_channel_id or db_guild.log_channel_id
+            if not notify_channel_id:
+                return
+
+            # Get temp voice categories to exclude
+            temp_categories = set()
+            if db_guild.temp_voice_category_ids:
+                try:
+                    temp_categories = set(json.loads(db_guild.temp_voice_category_ids))
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+        notify_channel = guild.get_channel(notify_channel_id)
+        if not notify_channel or not isinstance(notify_channel, discord.TextChannel):
             return
 
-        announce_channel = channel.guild.get_channel(announce_channel_id)
-        if not announce_channel or not isinstance(announce_channel, discord.TextChannel):
+        # Filter out channels in temp voice categories
+        filtered_channels = []
+        for ch_data in channels:
+            ch = guild.get_channel(ch_data['id'])
+            if not ch:
+                continue
+            # Skip if in a temp voice category
+            if ch.category and ch.category.id in temp_categories:
+                continue
+            filtered_channels.append(ch_data)
+
+        if not filtered_channels:
             return
 
-        channel_type = "text channel" if isinstance(channel, discord.TextChannel) else "voice channel"
-        category_text = f" in **{channel.category.name}**" if channel.category else ""
+        # Build embed based on number of channels
+        if len(filtered_channels) == 1:
+            # Single channel - detailed embed
+            ch_data = filtered_channels[0]
+            ch = guild.get_channel(ch_data['id'])
+            if not ch:
+                return
 
-        embed = discord.Embed(
-            title="🆕 New Channel Created",
-            description=f"A new {channel_type} has been created{category_text}!",
-            color=discord.Color.green()
-        )
+            type_emoji = {
+                'text': '💬',
+                'voice': '🔊',
+                'forum': '📋',
+                'stage': '🎭',
+                'category': '📁',
+                'news': '📢',
+            }.get(ch_data['type'], '❓')
 
-        embed.add_field(name="Channel", value=channel.mention, inline=True)
+            embed = discord.Embed(
+                title=f"{type_emoji} New Channel Created",
+                description=f"A new {ch_data['type']} channel has been created!",
+                color=discord.Color.green(),
+                timestamp=discord.utils.utcnow()
+            )
 
-        if isinstance(channel, discord.TextChannel) and channel.topic:
-            embed.add_field(name="Topic", value=channel.topic[:100], inline=False)
+            # Channel mention (categories can't be mentioned)
+            if isinstance(ch, discord.CategoryChannel):
+                embed.add_field(name="Category", value=f"📁 **{ch.name}**", inline=True)
+            else:
+                embed.add_field(name="Channel", value=ch.mention, inline=True)
 
-        embed.set_footer(text="Check it out!")
+            if ch.category:
+                embed.add_field(name="In Category", value=ch.category.name, inline=True)
+
+            if ch_data.get('creator'):
+                embed.add_field(name="Created By", value=ch_data['creator'], inline=True)
+
+            if isinstance(ch, discord.TextChannel) and ch.topic:
+                embed.add_field(name="Topic", value=ch.topic[:100], inline=False)
+
+            embed.set_footer(text="Check it out!")
+
+        else:
+            # Multiple channels - grouped by category
+            embed = discord.Embed(
+                title=f"🆕 {len(filtered_channels)} New Channels Created",
+                description="Multiple channels were created at once!",
+                color=discord.Color.green(),
+                timestamp=discord.utils.utcnow()
+            )
+
+            # Group by category
+            by_category: dict = {}  # {category_name: [channels]}
+            for ch_data in filtered_channels:
+                ch = guild.get_channel(ch_data['id'])
+                if not ch:
+                    continue
+
+                cat_name = ch.category.name if ch.category else "No Category"
+                if cat_name not in by_category:
+                    by_category[cat_name] = []
+
+                type_emoji = {
+                    'text': '💬',
+                    'voice': '🔊',
+                    'forum': '📋',
+                    'stage': '🎭',
+                    'category': '📁',
+                    'news': '📢',
+                }.get(ch_data['type'], '❓')
+
+                # Format channel line
+                if isinstance(ch, discord.CategoryChannel):
+                    by_category[cat_name].append(f"{type_emoji} **{ch.name}** (category)")
+                else:
+                    by_category[cat_name].append(f"{type_emoji} {ch.mention}")
+
+            # Add fields for each category (max 25 fields)
+            for cat_name, channel_list in list(by_category.items())[:10]:
+                # Truncate if too many channels
+                display_list = channel_list[:15]
+                if len(channel_list) > 15:
+                    display_list.append(f"*...and {len(channel_list) - 15} more*")
+
+                embed.add_field(
+                    name=f"📁 {cat_name}",
+                    value="\n".join(display_list) or "None",
+                    inline=False
+                )
+
+            # Show who created them if it was one person
+            creators = set(ch_data.get('creator') for ch_data in filtered_channels if ch_data.get('creator'))
+            if len(creators) == 1:
+                embed.set_footer(text=f"Created by {list(creators)[0]}")
+            else:
+                embed.set_footer(text="Mass channel creation detected")
 
         try:
-            await announce_channel.send(embed=embed)
+            await notify_channel.send(embed=embed)
         except discord.Forbidden:
+            logger.warning(f"Cannot send channel notification to {notify_channel_id} in {guild.name}")
+
+    @commands.Cog.listener()
+    async def on_guild_channel_create(self, channel: discord.abc.GuildChannel):
+        """Announce new channel creation with batching for mass creation."""
+        guild = channel.guild
+        guild_id = guild.id
+
+        # Determine channel type
+        if isinstance(channel, discord.TextChannel):
+            if channel.is_news():
+                ch_type = 'news'
+            else:
+                ch_type = 'text'
+        elif isinstance(channel, discord.VoiceChannel):
+            ch_type = 'voice'
+        elif isinstance(channel, discord.ForumChannel):
+            ch_type = 'forum'
+        elif isinstance(channel, discord.StageChannel):
+            ch_type = 'stage'
+        elif isinstance(channel, discord.CategoryChannel):
+            ch_type = 'category'
+        else:
+            return  # Unknown type
+
+        # Try to get creator from audit log
+        creator = None
+        try:
+            await asyncio.sleep(0.5)  # Small delay for audit log to populate
+            async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.channel_create):
+                if entry.target and entry.target.id == channel.id:
+                    creator = str(entry.user)
+                    break
+        except (discord.Forbidden, discord.HTTPException):
             pass
+
+        ch_data = {
+            'id': channel.id,
+            'name': channel.name,
+            'type': ch_type,
+            'creator': creator,
+            'category_id': channel.category.id if channel.category else None,
+        }
+
+        # Add to pending batch
+        if guild_id not in self._pending_channel_notifications:
+            self._pending_channel_notifications[guild_id] = {
+                'channels': [],
+                'task': None,
+                'first_time': time.time(),
+            }
+
+        self._pending_channel_notifications[guild_id]['channels'].append(ch_data)
+
+        # Cancel existing task and start new one (extends the wait window)
+        existing_task = self._pending_channel_notifications[guild_id].get('task')
+        if existing_task and not existing_task.done():
+            existing_task.cancel()
+
+        # Start new delayed task
+        self._pending_channel_notifications[guild_id]['task'] = asyncio.create_task(
+            self._send_channel_notification(guild_id)
+        )
+
+    # Channel notification configuration
+
+    @channels.command(name="notify-config", description="Configure new channel notifications")
+    @discord.default_permissions(administrator=True)
+    @commands.has_permissions(administrator=True)
+    @discord.option("notify_channel", discord.TextChannel, description="Channel to send notifications to", required=False)
+    @discord.option("disable", bool, description="Disable channel notifications entirely", required=False)
+    async def notify_config(
+        self, ctx: discord.ApplicationContext,
+        notify_channel: discord.TextChannel = None,
+        disable: bool = False
+    ):
+        """Configure where new channel creation notifications are sent."""
+        with db_session_scope() as session:
+            db_guild = session.get(Guild, ctx.guild.id)
+            if not db_guild:
+                await ctx.respond("Guild not found in database.", ephemeral=True)
+                return
+
+            if disable:
+                db_guild.channel_notify_channel_id = None
+                session.commit()
+                await ctx.respond("✅ Channel creation notifications disabled.", ephemeral=True)
+                return
+
+            if notify_channel:
+                db_guild.channel_notify_channel_id = notify_channel.id
+                session.commit()
+                await ctx.respond(
+                    f"✅ Channel creation notifications will be sent to {notify_channel.mention}\n\n"
+                    f"*Note: This is separate from audit logs. Use `/channels notify-exclude` to ignore temp voice categories.*",
+                    ephemeral=True
+                )
+                return
+
+            # Show current config
+            current_channel = ctx.guild.get_channel(db_guild.channel_notify_channel_id) if db_guild.channel_notify_channel_id else None
+            fallback_channel = ctx.guild.get_channel(db_guild.log_channel_id) if db_guild.log_channel_id else None
+
+            # Get excluded categories
+            excluded_cats = []
+            if db_guild.temp_voice_category_ids:
+                try:
+                    cat_ids = json.loads(db_guild.temp_voice_category_ids)
+                    for cat_id in cat_ids:
+                        cat = ctx.guild.get_channel(cat_id)
+                        if cat:
+                            excluded_cats.append(cat.name)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            embed = discord.Embed(
+                title="🔔 Channel Notification Settings",
+                color=discord.Color.blue()
+            )
+
+            if current_channel:
+                embed.add_field(name="Notification Channel", value=current_channel.mention, inline=True)
+            elif fallback_channel:
+                embed.add_field(name="Notification Channel", value=f"{fallback_channel.mention} (using log channel)", inline=True)
+            else:
+                embed.add_field(name="Notification Channel", value="Not configured", inline=True)
+
+            embed.add_field(
+                name="Excluded Categories",
+                value="\n".join(f"• {cat}" for cat in excluded_cats) if excluded_cats else "None (all channels notified)",
+                inline=False
+            )
+
+            embed.set_footer(text="Use /channels notify-config #channel to set • /channels notify-exclude to ignore categories")
+
+            await ctx.respond(embed=embed, ephemeral=True)
+
+    @channels.command(name="notify-exclude", description="Exclude categories from notifications (e.g., temp voice)")
+    @discord.default_permissions(administrator=True)
+    @commands.has_permissions(administrator=True)
+    @discord.option("category", discord.CategoryChannel, description="Category to exclude (e.g., Mee6 temp voice)", required=False)
+    @discord.option("remove", discord.CategoryChannel, description="Remove a category from exclusion list", required=False)
+    @discord.option("clear_all", bool, description="Clear all excluded categories", required=False)
+    async def notify_exclude(
+        self, ctx: discord.ApplicationContext,
+        category: discord.CategoryChannel = None,
+        remove: discord.CategoryChannel = None,
+        clear_all: bool = False
+    ):
+        """Exclude categories from channel creation notifications (like Mee6 temp voice channels)."""
+        with db_session_scope() as session:
+            db_guild = session.get(Guild, ctx.guild.id)
+            if not db_guild:
+                await ctx.respond("Guild not found in database.", ephemeral=True)
+                return
+
+            # Load current exclusions
+            excluded_ids = set()
+            if db_guild.temp_voice_category_ids:
+                try:
+                    excluded_ids = set(json.loads(db_guild.temp_voice_category_ids))
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            if clear_all:
+                db_guild.temp_voice_category_ids = None
+                session.commit()
+                await ctx.respond("✅ Cleared all excluded categories. All channel creations will be notified.", ephemeral=True)
+                return
+
+            if remove:
+                excluded_ids.discard(remove.id)
+                db_guild.temp_voice_category_ids = json.dumps(list(excluded_ids)) if excluded_ids else None
+                session.commit()
+                await ctx.respond(f"✅ Removed **{remove.name}** from exclusion list.", ephemeral=True)
+                return
+
+            if category:
+                excluded_ids.add(category.id)
+                db_guild.temp_voice_category_ids = json.dumps(list(excluded_ids))
+                session.commit()
+                await ctx.respond(
+                    f"✅ Added **{category.name}** to exclusion list.\n"
+                    f"Channels created in this category will NOT trigger notifications.",
+                    ephemeral=True
+                )
+                return
+
+            # Show current exclusions
+            excluded_cats = []
+            for cat_id in excluded_ids:
+                cat = ctx.guild.get_channel(cat_id)
+                if cat:
+                    excluded_cats.append(f"• {cat.name} ({len(cat.channels)} channels)")
+                else:
+                    excluded_cats.append(f"• Unknown category ({cat_id})")
+
+            embed = discord.Embed(
+                title="🔇 Excluded Categories",
+                description="Channels created in these categories won't trigger notifications.\n"
+                            "Useful for temp voice channels (Mee6, etc.)",
+                color=discord.Color.orange()
+            )
+
+            embed.add_field(
+                name="Currently Excluded",
+                value="\n".join(excluded_cats) if excluded_cats else "None - all channels are notified",
+                inline=False
+            )
+
+            embed.set_footer(text="Use /channels notify-exclude category:#category to add")
+
+            await ctx.respond(embed=embed, ephemeral=True)
 
     # Lock/unlock commands
 
