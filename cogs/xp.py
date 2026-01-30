@@ -499,12 +499,20 @@ class XPCog(commands.Cog):
     @commands.Cog.listener()
     async def on_ready(self):
         """Initialize invite cache for all guilds."""
+        guilds_to_cache = []
         for guild in self.bot.guilds:
             with db_session_scope() as session:
                 db_guild = session.get(Guild, guild.id)
                 if db_guild and db_guild.xp_enabled:
-                    await self.update_invite_cache_for_guild(guild)
-        logger.info("XP Cog ready - invite cache initialized")
+                    guilds_to_cache.append(guild)
+
+        # Stagger invite cache updates to avoid rate limiting
+        for i, guild in enumerate(guilds_to_cache):
+            if i > 0:
+                await asyncio.sleep(2)  # 2 second delay between guilds
+            await self.update_invite_cache_for_guild(guild)
+
+        logger.info(f"XP Cog ready - invite cache initialized for {len(guilds_to_cache)} guilds")
 
     @commands.Cog.listener()
     async def on_invite_create(self, invite: discord.Invite):

@@ -560,8 +560,10 @@ class ChannelsCog(commands.Cog):
             temp_categories = set()
             if db_guild.temp_voice_category_ids:
                 try:
-                    temp_categories = set(json.loads(db_guild.temp_voice_category_ids))
-                except (json.JSONDecodeError, TypeError):
+                    # Convert to integers - website may store as strings
+                    raw_ids = json.loads(db_guild.temp_voice_category_ids)
+                    temp_categories = set(int(cat_id) for cat_id in raw_ids)
+                except (json.JSONDecodeError, TypeError, ValueError):
                     pass
 
         notify_channel = guild.get_channel(notify_channel_id)
@@ -784,16 +786,16 @@ class ChannelsCog(commands.Cog):
             current_channel = ctx.guild.get_channel(db_guild.channel_notify_channel_id) if db_guild.channel_notify_channel_id else None
             fallback_channel = ctx.guild.get_channel(db_guild.log_channel_id) if db_guild.log_channel_id else None
 
-            # Get excluded categories
+            # Get excluded categories - convert to integers (website may store as strings)
             excluded_cats = []
             if db_guild.temp_voice_category_ids:
                 try:
                     cat_ids = json.loads(db_guild.temp_voice_category_ids)
                     for cat_id in cat_ids:
-                        cat = ctx.guild.get_channel(cat_id)
+                        cat = ctx.guild.get_channel(int(cat_id))
                         if cat:
                             excluded_cats.append(cat.name)
-                except (json.JSONDecodeError, TypeError):
+                except (json.JSONDecodeError, TypeError, ValueError):
                     pass
 
             embed = discord.Embed(
@@ -837,12 +839,13 @@ class ChannelsCog(commands.Cog):
                 await ctx.respond("Guild not found in database.", ephemeral=True)
                 return
 
-            # Load current exclusions
+            # Load current exclusions - convert to integers (website may store as strings)
             excluded_ids = set()
             if db_guild.temp_voice_category_ids:
                 try:
-                    excluded_ids = set(json.loads(db_guild.temp_voice_category_ids))
-                except (json.JSONDecodeError, TypeError):
+                    raw_ids = json.loads(db_guild.temp_voice_category_ids)
+                    excluded_ids = set(int(cat_id) for cat_id in raw_ids)
+                except (json.JSONDecodeError, TypeError, ValueError):
                     pass
 
             if clear_all:

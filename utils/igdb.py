@@ -142,10 +142,10 @@ async def search_games(query: str, limit: int = 10) -> List[IGDBGame]:
             }
 
             # IGDB uses a custom query language
+            # NOTE: Removed category = 0 filter - many games don't have this field set in IGDB
             body = f'''
                 search "{query}";
                 fields name, slug, cover.image_id, platforms.abbreviation, summary, first_release_date;
-                where category = 0;
                 limit {limit};
             '''
 
@@ -272,6 +272,87 @@ async def get_game_by_id(game_id: int) -> Optional[IGDBGame]:
 
     except Exception as e:
         logger.error(f"Error getting game from IGDB: {e}")
+        return None
+
+
+async def get_game_full_details(game_id: int) -> Optional[IGDBGame]:
+    """Get full game details including genres, themes, keywords from IGDB."""
+    token = await get_twitch_token()
+    if not token:
+        return None
+
+    await _rate_limit()
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                "Client-ID": TWITCH_CLIENT_ID,
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json"
+            }
+
+            body = f'''
+                fields name, slug, cover.image_id, platforms.name, summary,
+                       first_release_date, genres.name, themes.name, keywords.name,
+                       game_modes.name, rating, hypes, url;
+                where id = {game_id};
+            '''
+
+            async with session.post(
+                f"{IGDB_API_URL}/games",
+                headers=headers,
+                data=body
+            ) as response:
+                if response.status != 200:
+                    logger.error(f"IGDB full details lookup failed: {response.status}")
+                    return None
+
+                data = await response.json()
+                if not data:
+                    return None
+
+                game_data = data[0]
+
+                # Build cover URL
+                cover_url = None
+                if "cover" in game_data and game_data["cover"]:
+                    image_id = game_data["cover"].get("image_id")
+                    if image_id:
+                        cover_url = f"https://images.igdb.com/igdb/image/upload/t_cover_big/{image_id}.jpg"
+
+                # Extract lists
+                platforms_list = [p.get("name") for p in game_data.get("platforms", []) if p.get("name")]
+                genres_list = [g.get("name") for g in game_data.get("genres", []) if g.get("name")]
+                themes_list = [t.get("name") for t in game_data.get("themes", []) if t.get("name")]
+                keywords_list = [k.get("name") for k in game_data.get("keywords", []) if k.get("name")]
+                modes_list = [m.get("name") for m in game_data.get("game_modes", []) if m.get("name")]
+
+                # Extract release date
+                release_date = game_data.get("first_release_date")
+                release_year = None
+                if release_date:
+                    import datetime
+                    release_year = datetime.datetime.fromtimestamp(release_date).year
+
+                return IGDBGame(
+                    id=game_data["id"],
+                    name=game_data["name"],
+                    slug=game_data.get("slug", ""),
+                    cover_url=cover_url,
+                    platforms=platforms_list,
+                    summary=game_data.get("summary"),
+                    release_year=release_year,
+                    release_date=release_date,
+                    genres=genres_list,
+                    themes=themes_list,
+                    keywords=keywords_list,
+                    game_modes=modes_list,
+                    rating=game_data.get("rating"),
+                    hypes=game_data.get("hypes"),
+                )
+
+    except Exception as e:
+        logger.error(f"Error getting full game details from IGDB: {e}")
         return None
 
 
@@ -742,33 +823,41 @@ async def search_upcoming_games(
         if min_rating is not None and min_rating > 0:
             required_clauses.append(f"rating >= {min_rating}")
 
-        # Build final WHERE clause with TIERED filter logic:
-        # 1. Required clauses (date range, hype, rating) - always AND
-        # 2. Primary filters (genres, themes) - AND between them if both exist
-        # 3. Secondary filters (keywords, modes, platforms) - ONLY used if NO primary filters
+        # Build final WHERE clause combining ALL user-selected filters:
+        # - Required clauses (date range, hype, rating) - always AND
+        # - Primary filters (genres, themes) - AND between them if both exist
+        # - Keywords - AND with primary filters if user explicitly selected keywords
+        # - Other secondary filters (modes, platforms) - AND with everything else
         #
-        # This prevents excluding games like Nioh 3 that match genres/themes but have no keywords
+        # User intent: If they select specific filters, they want ALL of them applied.
+        # A game must match genres AND themes AND keywords when all are specified.
         #
         # Examples:
-        # - User selects: RPG, Adventure (genres) + Action, Fantasy (themes) + soulslike (keyword)
-        #   Query: (genres) AND (themes)  -- keywords ignored because primary filters exist
-        #   Result: 63 games including Nioh 3 (which has no keywords)
+        # - User selects: RPG (genre) + Action (theme) + soulslike (keyword)
+        #   Query: (genres) AND (themes) AND (keywords)
+        #   Result: Only games matching ALL criteria
         #
-        # - User selects: soulslike, metroidvania (keywords only)
-        #   Query: (keywords)  -- used because no primary filters
-        #   Result: Games tagged with those keywords
+        # - User selects: soulslike (keyword only)
+        #   Query: (keywords)
+        #   Result: Games tagged with soulslike keyword
 
+        all_filter_clauses = []
+
+        # Add primary filters (genres, themes)
         if primary_filter_clauses:
-            # Primary filters exist - use AND between genres/themes, ignore secondary filters
-            # This gives focused results without excluding games missing optional tags
-            primary_combined = " & ".join(primary_filter_clauses)
-            required_clauses.append(f"({primary_combined})")
-            logger.info(f"Using PRIMARY filters (genres/themes): {primary_combined}")
-        elif secondary_filter_clauses:
-            # No primary filters - fall back to secondary filters with OR between them
-            secondary_combined = " | ".join(secondary_filter_clauses)
-            required_clauses.append(f"({secondary_combined})")
-            logger.info(f"Using SECONDARY filters (keywords/modes/platforms): {secondary_combined}")
+            all_filter_clauses.extend(primary_filter_clauses)
+            logger.info(f"Adding PRIMARY filters (genres/themes): {primary_filter_clauses}")
+
+        # Add secondary filters (keywords, modes, platforms) - these are also AND conditions
+        if secondary_filter_clauses:
+            all_filter_clauses.extend(secondary_filter_clauses)
+            logger.info(f"Adding SECONDARY filters (keywords/modes/platforms): {secondary_filter_clauses}")
+
+        # Combine all filter clauses with AND
+        if all_filter_clauses:
+            all_filters_combined = " & ".join(all_filter_clauses)
+            required_clauses.append(f"({all_filters_combined})")
+            logger.info(f"Final combined filters: {all_filters_combined}")
 
         where_clause = " & ".join(required_clauses)
 
@@ -894,7 +983,17 @@ async def search_upcoming_games(
                         for website in game_data["websites"]:
                             category = website.get("category")
                             url = website.get("url")
-                            if category and url:
+                            if url:
+                                # If category not provided by API, infer from URL
+                                if not category:
+                                    if 'store.steampowered.com' in url:
+                                        category = 13
+                                    elif 'store.epicgames.com' in url or 'epicgames.com' in url:
+                                        category = 16
+                                    elif 'gog.com' in url:
+                                        category = 17
+                                    elif 'discord.gg' in url or 'discord.com' in url:
+                                        category = 18
                                 websites_list.append({"category": category, "url": url})
 
                     game = IGDBGame(

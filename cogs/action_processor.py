@@ -1344,8 +1344,14 @@ class ActionProcessorCog(commands.Cog):
                     steam_url = None
                     if hasattr(game, 'websites') and game.websites:
                         for website in game.websites:
+                            # First try category field (if available)
                             if website.get('category') == 13:  # Steam
                                 steam_url = website.get('url')
+                                break
+                            # Fallback: parse URL to detect Steam store links
+                            url = website.get('url', '')
+                            if 'store.steampowered.com' in url:
+                                steam_url = url
                                 break
 
                     # If IGDB doesn't provide Steam URL, lookup via Steam API
@@ -1361,6 +1367,7 @@ class ActionProcessorCog(commands.Cog):
                         summary=game.summary if hasattr(game, 'summary') else None,
                         genres=json.dumps(game.genres) if hasattr(game, 'genres') else None,
                         themes=json.dumps(game.themes) if hasattr(game, 'themes') else None,
+                        keywords=json.dumps(game.keywords) if hasattr(game, 'keywords') and game.keywords else None,
                         game_modes=json.dumps(game.game_modes) if hasattr(game, 'game_modes') else None,
                         platforms=json.dumps(game.platforms) if hasattr(game, 'platforms') else None,
                         cover_url=game.cover_url,
@@ -1499,16 +1506,8 @@ class ActionProcessorCog(commands.Cog):
                             inline=False
                         )
 
-                    # Show top rated or most hyped (show if we have ANY data)
-                    if len(top_rated) >= 1:
-                        # Show up to 3 top rated games
-                        top_games = "\n".join([f"**{name}** — {int(rating)}/100" for name, rating in top_rated[:3]])
-                        summary_embed.add_field(
-                            name="Top Rated",
-                            value=top_games,
-                            inline=True
-                        )
-                    elif len(most_hyped) >= 1:
+                    # Show most anticipated (always prefer hype over ratings)
+                    if len(most_hyped) >= 1:
                         # Show up to 3 most hyped games
                         hyped_games = "\n".join([f"**{name}** — {int(hypes)} follows" for name, hypes in most_hyped[:3]])
                         summary_embed.add_field(

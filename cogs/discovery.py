@@ -21,7 +21,8 @@ import re
 import json
 import asyncio
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote as urlquote
+import aiohttp
 import discord
 from discord.ext import commands, tasks
 from discord import SlashCommandGroup
@@ -167,6 +168,102 @@ def remove_guild_from_creator(session, user_id: int, guild_id: int):
                 logger.info(f"Updated primary guild for creator {user_id} to {guilds[0]}")
 
     return False
+
+
+async def lookup_steam_url(game_name: str) -> str:
+    """
+    Lookup Steam store page URL via Steam API with improved matching.
+    For DLC/seasons, links to the base game's Steam page.
+
+    Args:
+        game_name: Name of the game to search for
+
+    Returns:
+        Direct Steam store URL if found, otherwise None (to avoid bad matches)
+    """
+    try:
+        # Use Steam's store search API
+        search_term = urlquote(game_name)
+        api_url = f"https://store.steampowered.com/api/storesearch/?term={search_term}&cc=US"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                if response.status == 200:
+                    data = await response.json()
+
+                    # Check if we got results
+                    if data.get('total', 0) > 0 and data.get('items'):
+                        # Try to find a good match by comparing names
+                        game_name_lower = game_name.lower().strip()
+
+                        # Remove common suffixes that might not be in Steam name
+                        search_base = game_name_lower
+                        is_dlc_or_season = False
+                        dlc_suffixes = [
+                            ': season of', ': season ', ': episode ', '- dlc', '- expansion',
+                            ': the ', ' - the ', ': fate of', ': divine intervention'
+                        ]
+                        for suffix in dlc_suffixes:
+                            if suffix in search_base:
+                                search_base = search_base.split(suffix)[0].strip()
+                                is_dlc_or_season = True
+                                break
+
+                        for item in data['items'][:5]:  # Check top 5 results
+                            result_name = item.get('name', '').lower().strip()
+                            app_id = item.get('id')
+
+                            if not app_id:
+                                continue
+
+                            # Exact match (case-insensitive)
+                            if result_name == game_name_lower:
+                                steam_url = f"https://store.steampowered.com/app/{app_id}/"
+                                logger.info(f"Steam API: Exact match for '{game_name}': {steam_url}")
+                                return steam_url
+
+                            # Check if the base name matches (for DLC/seasons)
+                            if search_base in result_name or result_name in search_base:
+                                # Only accept if it's a very close match (>70% similarity)
+                                game_words = set(search_base.split())
+                                result_words = set(result_name.split())
+                                if game_words and len(game_words & result_words) / len(game_words) >= 0.7:
+                                    steam_url = f"https://store.steampowered.com/app/{app_id}/"
+                                    if is_dlc_or_season:
+                                        logger.info(f"Steam API: DLC/Season '{game_name}' -> Base game '{item.get('name')}': {steam_url}")
+                                    else:
+                                        logger.info(f"Steam API: Close match for '{game_name}' -> '{item.get('name')}': {steam_url}")
+                                    return steam_url
+
+                        # If we detected DLC/season and didn't find exact match, try searching just the base name
+                        if is_dlc_or_season:
+                            base_search_term = urlquote(search_base)
+                            base_api_url = f"https://store.steampowered.com/api/storesearch/?term={base_search_term}&cc=US"
+
+                            async with session.get(base_api_url, timeout=aiohttp.ClientTimeout(total=5)) as base_response:
+                                if base_response.status == 200:
+                                    base_data = await base_response.json()
+
+                                    if base_data.get('total', 0) > 0 and base_data.get('items'):
+                                        first_item = base_data['items'][0]
+                                        base_app_id = first_item.get('id')
+                                        base_name = first_item.get('name', '')
+
+                                        if base_app_id:
+                                            steam_url = f"https://store.steampowered.com/app/{base_app_id}/"
+                                            logger.info(f"Steam API: DLC/Season '{game_name}' -> Base game search '{base_name}': {steam_url}")
+                                            return steam_url
+
+        # No good match found
+        logger.debug(f"Steam API: No confident match found for '{game_name}'")
+        return None
+
+    except asyncio.TimeoutError:
+        logger.warning(f"Steam API: Timeout looking up '{game_name}'")
+    except Exception as e:
+        logger.warning(f"Steam API: Error looking up '{game_name}': {e}")
+
+    return None
 
 
 class DiscoveryCog(commands.Cog):
@@ -1305,11 +1402,25 @@ class DiscoveryCog(commands.Cog):
 
                         # Record announcement in database (without posting individual messages)
                         try:
+                            # Extract Steam App ID from websites if available
+                            steam_app_id = None
+                            if hasattr(game, 'websites') and game.websites:
+                                for website in game.websites:
+                                    if isinstance(website, dict) and website.get('category') == 13:  # Steam
+                                        steam_url_raw = website.get('url', '')
+                                        # Extract app ID from URL like https://store.steampowered.com/app/12345
+                                        if '/app/' in steam_url_raw:
+                                            try:
+                                                steam_app_id = int(steam_url_raw.split('/app/')[1].split('/')[0].split('?')[0])
+                                            except (ValueError, IndexError):
+                                                pass
+                                        break
+
                             announced = AnnouncedGame(
                                 guild_id=config.guild_id,
                                 igdb_id=game.id,
                                 igdb_slug=game.slug if hasattr(game, 'slug') else None,
-                                steam_id=None,
+                                steam_id=steam_app_id,
                                 game_name=game.name,
                                 release_date=game.release_date,
                                 genres=json.dumps(game.genres) if hasattr(game, 'genres') else None,
@@ -1320,7 +1431,7 @@ class DiscoveryCog(commands.Cog):
                             )
                             session.add(announced)
                             announced_count += 1
-                            logger.info(f"Recorded game '{game.name}' (IGDB:{game.id}) in guild {config.guild_id}")
+                            logger.info(f"Recorded game '{game.name}' (IGDB:{game.id}, Steam:{steam_app_id}) in guild {config.guild_id}")
                         except Exception as e:
                             logger.error(f"Failed to record game '{game.name}' in guild {config.guild_id}: {e}")
                             continue
@@ -1338,9 +1449,20 @@ class DiscoveryCog(commands.Cog):
                                 steam_url = None
                                 if hasattr(game, 'websites') and game.websites:
                                     for website in game.websites:
-                                        if isinstance(website, dict) and website.get('category') == 13:  # Steam
-                                            steam_url = website.get('url')
-                                            break
+                                        if isinstance(website, dict):
+                                            # First try category field (if available)
+                                            if website.get('category') == 13:  # Steam
+                                                steam_url = website.get('url')
+                                                break
+                                            # Fallback: parse URL to detect Steam store links
+                                            url = website.get('url', '')
+                                            if 'store.steampowered.com' in url:
+                                                steam_url = url
+                                                break
+
+                                # If IGDB doesn't have Steam URL, lookup via Steam API
+                                if not steam_url:
+                                    steam_url = await lookup_steam_url(game.name)
 
                                 found_game = FoundGame(
                                     guild_id=config.guild_id,
@@ -1351,6 +1473,7 @@ class DiscoveryCog(commands.Cog):
                                     summary=game.summary if hasattr(game, 'summary') else None,
                                     genres=json.dumps(game.genres) if hasattr(game, 'genres') else None,
                                     themes=json.dumps(game.themes) if hasattr(game, 'themes') else None,
+                                    keywords=json.dumps(game.keywords) if hasattr(game, 'keywords') and game.keywords else None,
                                     game_modes=json.dumps(game.game_modes) if hasattr(game, 'game_modes') else None,
                                     platforms=json.dumps(game.platforms) if hasattr(game, 'platforms') else None,
                                     cover_url=game.cover_url,
@@ -1367,20 +1490,109 @@ class DiscoveryCog(commands.Cog):
                         except Exception as e:
                             logger.warning(f"Failed to create FoundGame for '{game.name}': {e}")
 
-                    # Send ONE summary embed for all games shared on Discovery Network
+                    # Send detailed embed for all games shared on Discovery Network
                     if games_to_announce and discovery_channel:
                         try:
                             dash_url = f"{DASHBOARD_BASE_URL}/questlog/guild/{config.guild_id}/found-games/"
+
+                            # Find most anticipated game (highest hypes)
+                            most_anticipated = max(games_to_announce, key=lambda g: g.hypes if hasattr(g, 'hypes') and g.hypes else 0)
+                            most_anticipated_hypes = most_anticipated.hypes if hasattr(most_anticipated, 'hypes') and most_anticipated.hypes else 0
+
+                            # Group games by search config
+                            games_by_config = {}
+                            for game_id, meta in all_games_to_announce.items():
+                                if not meta["is_public"]:
+                                    continue
+                                sc = meta.get("search_config")
+                                if sc:
+                                    config_name = sc.name or "Unnamed Search"
+                                    if config_name not in games_by_config:
+                                        games_by_config[config_name] = []
+                                    games_by_config[config_name].append(meta["game"])
+
+                            # Collect all platforms and genres across all games
+                            all_platforms = set()
+                            all_genres = set()
+                            for game in games_to_announce:
+                                if hasattr(game, 'platforms') and game.platforms:
+                                    all_platforms.update(game.platforms)
+                                if hasattr(game, 'genres') and game.genres:
+                                    all_genres.update(game.genres)
+
+                            # Calculate release window
+                            release_dates = [g.release_date for g in games_to_announce if g.release_date]
+                            if release_dates:
+                                min_date = min(release_dates)
+                                max_date = max(release_dates)
+                                from datetime import datetime
+                                min_dt = datetime.fromtimestamp(min_date)
+                                max_dt = datetime.fromtimestamp(max_date)
+                                if min_dt.year == max_dt.year and min_dt.month == max_dt.month:
+                                    release_window = min_dt.strftime("%b %Y")
+                                elif min_dt.year == max_dt.year:
+                                    release_window = f"{min_dt.strftime('%b')} - {max_dt.strftime('%b %Y')}"
+                                else:
+                                    release_window = f"{min_dt.strftime('%b %Y')} - {max_dt.strftime('%b %Y')}"
+                            else:
+                                release_window = "TBA"
+
+                            # Build detailed embed
                             summary_embed = discord.Embed(
                                 title="🎮 New Games Discovered!",
                                 description=f"Found **{announced_count}** new game{'s' if announced_count != 1 else ''} matching your searches!",
                                 color=discord.Color.green()
                             )
+
+                            # Add search configs section
+                            if games_by_config:
+                                config_lines = []
+                                for config_name, games_list in list(games_by_config.items())[:5]:  # Limit to 5 configs
+                                    config_lines.append(f"**{config_name}**: {len(games_list)} game{'s' if len(games_list) != 1 else ''}")
+                                summary_embed.add_field(
+                                    name="📋 By Search Configuration",
+                                    value="\n".join(config_lines),
+                                    inline=False
+                                )
+
+                            # Most anticipated
                             summary_embed.add_field(
-                                name="📊 View All Games",
-                                value=f"[Click here to view all {announced_count} games on the dashboard]({dash_url})",
+                                name="🔥 Most Anticipated",
+                                value=f"**{most_anticipated.name}**\n{most_anticipated_hypes:,} follows" if most_anticipated_hypes > 0 else f"**{most_anticipated.name}**",
+                                inline=True
+                            )
+
+                            # Quick stats
+                            platform_str = ", ".join(list(all_platforms)[:4]) if all_platforms else "Various"
+                            if len(all_platforms) > 4:
+                                platform_str += f" +{len(all_platforms) - 4}"
+                            genre_str = ", ".join(list(all_genres)[:3]) if all_genres else "Various"
+                            if len(all_genres) > 3:
+                                genre_str += f" +{len(all_genres) - 3}"
+                            summary_embed.add_field(
+                                name="📊 Quick Stats",
+                                value=f"**Platforms:** {platform_str}\n**Genres:** {genre_str}",
+                                inline=True
+                            )
+
+                            # Release window
+                            summary_embed.add_field(
+                                name="📅 Release Window",
+                                value=release_window,
+                                inline=True
+                            )
+
+                            # Dashboard link
+                            summary_embed.add_field(
+                                name="🔗 View Full Details",
+                                value=f"[Click here to view all games on the dashboard]({dash_url})",
                                 inline=False
                             )
+
+                            # Set cover image of most anticipated game
+                            if most_anticipated.cover_url:
+                                summary_embed.set_thumbnail(url=most_anticipated.cover_url)
+
                             summary_embed.set_footer(text=f"Based on {len(search_configs)} active search configuration{'s' if len(search_configs) != 1 else ''}")
 
                             # Add role ping if configured
@@ -1389,7 +1601,7 @@ class DiscoveryCog(commands.Cog):
                                 ping_content = f"<@&{config.public_game_ping_role_id}>"
 
                             await discovery_channel.send(content=ping_content, embed=summary_embed)
-                            logger.info(f"Sent game summary for {announced_count} games in guild {config.guild_id}")
+                            logger.info(f"Sent detailed game summary for {announced_count} games in guild {config.guild_id}")
                         except Exception as e:
                             logger.warning(f"Failed to send game summary in guild {config.guild_id}: {e}")
 
@@ -3732,12 +3944,13 @@ class DiscoveryCog(commands.Cog):
                     games = [g for g in games if g.release_date and g.release_date <= announcement_cutoff]
                     logger.info(f"Search '{search_config.name}' found {len(games)} games within {announcement_window}-day window")
 
-                    # Add to master list, track privacy
+                    # Add to master list, track privacy and search config
                     for game in games:
                         if game.id not in all_games_to_announce:
                             all_games_to_announce[game.id] = {
                                 "game": game,
                                 "is_public": bool(search_config.show_on_website),
+                                "search_config": search_config,
                             }
 
                 except Exception as e:
@@ -3773,11 +3986,25 @@ class DiscoveryCog(commands.Cog):
 
                 # Record announcement in database
                 try:
+                    # Extract Steam App ID from websites if available
+                    steam_app_id = None
+                    if hasattr(game, 'websites') and game.websites:
+                        for website in game.websites:
+                            if isinstance(website, dict) and website.get('category') == 13:  # Steam
+                                steam_url_raw = website.get('url', '')
+                                # Extract app ID from URL like https://store.steampowered.com/app/12345
+                                if '/app/' in steam_url_raw:
+                                    try:
+                                        steam_app_id = int(steam_url_raw.split('/app/')[1].split('/')[0].split('?')[0])
+                                    except (ValueError, IndexError):
+                                        pass
+                                break
+
                     announced = AnnouncedGame(
                         guild_id=ctx.guild.id,
                         igdb_id=game.id,
                         igdb_slug=game.slug if hasattr(game, 'slug') else None,
-                        steam_id=None,
+                        steam_id=steam_app_id,
                         game_name=game.name,
                         release_date=game.release_date,
                         genres=json.dumps(game.genres) if hasattr(game, 'genres') else None,
@@ -3799,18 +4026,107 @@ class DiscoveryCog(commands.Cog):
             # Update last check time
             config.last_game_check_at = now
 
-            # Send ONE summary embed for games with "Share on Discovery Network" enabled
+            # Send detailed embed for games with "Share on Discovery Network" enabled
             dash_url = f"{DASHBOARD_BASE_URL}/questlog/guild/{ctx.guild.id}/found-games/"
+
+            # Find most anticipated game (highest hypes)
+            most_anticipated = max(games_to_announce, key=lambda g: g.hypes if hasattr(g, 'hypes') and g.hypes else 0)
+            most_anticipated_hypes = most_anticipated.hypes if hasattr(most_anticipated, 'hypes') and most_anticipated.hypes else 0
+
+            # Group games by search config
+            games_by_config = {}
+            for game_id, meta in all_games_to_announce.items():
+                if not meta["is_public"]:
+                    continue
+                sc = meta.get("search_config")
+                if sc:
+                    config_name = sc.name or "Unnamed Search"
+                    if config_name not in games_by_config:
+                        games_by_config[config_name] = []
+                    games_by_config[config_name].append(meta["game"])
+
+            # Collect all platforms and genres across all games
+            all_platforms = set()
+            all_genres = set()
+            for game in games_to_announce:
+                if hasattr(game, 'platforms') and game.platforms:
+                    all_platforms.update(game.platforms)
+                if hasattr(game, 'genres') and game.genres:
+                    all_genres.update(game.genres)
+
+            # Calculate release window
+            release_dates = [g.release_date for g in games_to_announce if g.release_date]
+            if release_dates:
+                min_date = min(release_dates)
+                max_date = max(release_dates)
+                from datetime import datetime as dt
+                min_dt = dt.fromtimestamp(min_date)
+                max_dt = dt.fromtimestamp(max_date)
+                if min_dt.year == max_dt.year and min_dt.month == max_dt.month:
+                    release_window = min_dt.strftime("%b %Y")
+                elif min_dt.year == max_dt.year:
+                    release_window = f"{min_dt.strftime('%b')} - {max_dt.strftime('%b %Y')}"
+                else:
+                    release_window = f"{min_dt.strftime('%b %Y')} - {max_dt.strftime('%b %Y')}"
+            else:
+                release_window = "TBA"
+
+            # Build detailed embed
             summary_embed = discord.Embed(
                 title="🎮 New Games Discovered!",
                 description=f"Found **{announced_count}** new game{'s' if announced_count != 1 else ''} matching your searches!",
                 color=discord.Color.green()
             )
+
+            # Add search configs section
+            if games_by_config:
+                config_lines = []
+                for cfg_name, games_list in list(games_by_config.items())[:5]:  # Limit to 5 configs
+                    config_lines.append(f"**{cfg_name}**: {len(games_list)} game{'s' if len(games_list) != 1 else ''}")
+                summary_embed.add_field(
+                    name="📋 By Search Configuration",
+                    value="\n".join(config_lines),
+                    inline=False
+                )
+
+            # Most anticipated
             summary_embed.add_field(
-                name="📊 View All Games",
-                value=f"[Click here to view all {announced_count} games on the dashboard]({dash_url})",
+                name="🔥 Most Anticipated",
+                value=f"**{most_anticipated.name}**\n{most_anticipated_hypes:,} follows" if most_anticipated_hypes > 0 else f"**{most_anticipated.name}**",
+                inline=True
+            )
+
+            # Quick stats
+            platform_str = ", ".join(list(all_platforms)[:4]) if all_platforms else "Various"
+            if len(all_platforms) > 4:
+                platform_str += f" +{len(all_platforms) - 4}"
+            genre_str = ", ".join(list(all_genres)[:3]) if all_genres else "Various"
+            if len(all_genres) > 3:
+                genre_str += f" +{len(all_genres) - 3}"
+            summary_embed.add_field(
+                name="📊 Quick Stats",
+                value=f"**Platforms:** {platform_str}\n**Genres:** {genre_str}",
+                inline=True
+            )
+
+            # Release window
+            summary_embed.add_field(
+                name="📅 Release Window",
+                value=release_window,
+                inline=True
+            )
+
+            # Dashboard link
+            summary_embed.add_field(
+                name="🔗 View Full Details",
+                value=f"[Click here to view all games on the dashboard]({dash_url})",
                 inline=False
             )
+
+            # Set cover image of most anticipated game
+            if most_anticipated.cover_url:
+                summary_embed.set_thumbnail(url=most_anticipated.cover_url)
+
             public_search_count = len([s for s in search_configs if s.show_on_website])
             summary_embed.set_footer(text=f"Based on {public_search_count} active search configuration{'s' if public_search_count != 1 else ''}")
 
@@ -3828,6 +4144,184 @@ class DiscoveryCog(commands.Cog):
         )
         response_embed.add_field(name="Dashboard", value=f"[View Games]({dash_url})", inline=False)
         await ctx.respond(embed=response_embed)
+
+    @discovery.command(name="debug-game", description="Debug why a specific game isn't appearing (Admin)")
+    @discord.default_permissions(administrator=True)
+    @commands.has_permissions(administrator=True)
+    @discord.option("game_name", str, description="Game name OR IGDB ID (e.g., 'Tearscape' or '318752')")
+    async def debug_game(self, ctx: discord.ApplicationContext, game_name: str):
+        """Search IGDB for a game and show why it might not match your filters."""
+        await ctx.defer(ephemeral=True)
+
+        game = None
+
+        # Check if input is an IGDB ID (all digits)
+        if game_name.isdigit():
+            igdb_id = int(game_name)
+            game = await igdb.get_game_full_details(igdb_id)
+            if not game:
+                await ctx.respond(f"❌ No game found on IGDB with ID {igdb_id}", ephemeral=True)
+                return
+        else:
+            # Search IGDB for the game by name
+            games = await igdb.search_games(game_name, limit=5)
+
+            if not games:
+                await ctx.respond(
+                    f"❌ No games found on IGDB matching '{game_name}'\n\n"
+                    f"**Tip:** Try using the IGDB ID instead (find it on the game's IGDB page).\n"
+                    f"Example: `/discovery debug-game 318752`",
+                    ephemeral=True
+                )
+                return
+
+            # Get the first matching game and fetch FULL details
+            basic_game = games[0]
+            game = await igdb.get_game_full_details(basic_game.id)
+
+        if not game:
+            await ctx.respond(f"❌ Could not fetch full details for '{basic_game.name}'", ephemeral=True)
+            return
+
+        # Get user's search configs
+        with db_session_scope() as session:
+            search_configs = session.query(GameSearchConfig).filter(
+                GameSearchConfig.guild_id == ctx.guild.id,
+                GameSearchConfig.enabled == True
+            ).all()
+
+            embed = discord.Embed(
+                title=f"🔍 Debug: {game.name}",
+                description=f"IGDB ID: {game.id}",
+                color=discord.Color.blue()
+            )
+
+            if game.cover_url:
+                embed.set_thumbnail(url=game.cover_url)
+
+            # Show game's actual data
+            if hasattr(game, 'genres') and game.genres:
+                embed.add_field(name="Genres", value=", ".join(game.genres), inline=True)
+            else:
+                embed.add_field(name="Genres", value="*None set*", inline=True)
+
+            if hasattr(game, 'themes') and game.themes:
+                embed.add_field(name="Themes", value=", ".join(game.themes), inline=True)
+            else:
+                embed.add_field(name="Themes", value="*None set*", inline=True)
+
+            if hasattr(game, 'keywords') and game.keywords:
+                embed.add_field(name="Keywords", value=", ".join(game.keywords[:10]), inline=False)
+            else:
+                embed.add_field(name="Keywords", value="*None set*", inline=False)
+
+            if hasattr(game, 'release_date') and game.release_date:
+                import datetime
+                release_dt = datetime.datetime.fromtimestamp(game.release_date)
+                embed.add_field(name="Release Date", value=release_dt.strftime("%b %d, %Y"), inline=True)
+            else:
+                embed.add_field(name="Release Date", value="*TBA*", inline=True)
+
+            # Check against each search config
+            if search_configs:
+                embed.add_field(name="\u200b", value="**📋 Your Search Configs:**", inline=False)
+
+                for config in search_configs[:5]:  # Limit to 5
+                    config_genres = json.loads(config.genres) if config.genres else []
+                    config_themes = json.loads(config.themes) if config.themes else []
+                    config_keywords = json.loads(config.keywords) if config.keywords else []
+
+                    # Check matches
+                    game_genres = game.genres if hasattr(game, 'genres') and game.genres else []
+                    game_themes = game.themes if hasattr(game, 'themes') and game.themes else []
+                    game_keywords = game.keywords if hasattr(game, 'keywords') and game.keywords else []
+
+                    # Genre match (case-insensitive partial match)
+                    genre_match = False
+                    matched_genre = None
+                    for cg in config_genres:
+                        for gg in game_genres:
+                            # Match if either contains the other or they're similar
+                            if cg.lower() in gg.lower() or gg.lower() in cg.lower():
+                                genre_match = True
+                                matched_genre = gg
+                                break
+                        if genre_match:
+                            break
+
+                    # Theme match
+                    theme_match = False
+                    matched_theme = None
+                    for ct in config_themes:
+                        for gt in game_themes:
+                            if ct.lower() in gt.lower() or gt.lower() in ct.lower():
+                                theme_match = True
+                                matched_theme = gt
+                                break
+                        if theme_match:
+                            break
+
+                    # Keyword match
+                    keyword_match = False
+                    matched_keyword = None
+                    for ck in config_keywords:
+                        for gk in game_keywords:
+                            if ck.lower() in gk.lower() or gk.lower() in ck.lower():
+                                keyword_match = True
+                                matched_keyword = gk
+                                break
+                        if keyword_match:
+                            break
+
+                    # Build status
+                    status_lines = []
+                    if config_genres:
+                        if genre_match:
+                            status_lines.append(f"✅ Genre: {matched_genre}")
+                        else:
+                            status_lines.append(f"❌ Genre: Need {config_genres}, game has {game_genres}")
+                    else:
+                        status_lines.append("⬜ Genre: Not required")
+
+                    if config_themes:
+                        if theme_match:
+                            status_lines.append(f"✅ Theme: {matched_theme}")
+                        else:
+                            status_lines.append(f"❌ Theme: Need {config_themes}, game has {game_themes}")
+                    else:
+                        status_lines.append("⬜ Theme: Not required")
+
+                    if config_keywords:
+                        if keyword_match:
+                            status_lines.append(f"✅ Keyword: {matched_keyword}")
+                        else:
+                            status_lines.append(f"❌ Keyword: Need {config_keywords}, game has {game_keywords}")
+                    else:
+                        status_lines.append("⬜ Keyword: Not required")
+
+                    # Overall match
+                    filters_configured = bool(config_genres or config_themes or config_keywords)
+                    would_match = True
+                    if config_genres and not genre_match:
+                        would_match = False
+                    if config_themes and not theme_match:
+                        would_match = False
+                    if config_keywords and not keyword_match:
+                        would_match = False
+
+                    overall = "✅ WOULD MATCH" if (would_match and filters_configured) else "❌ WOULD NOT MATCH"
+                    if not filters_configured:
+                        overall = "⚠️ NO FILTERS SET"
+
+                    embed.add_field(
+                        name=f"{config.name}",
+                        value=f"{overall}\n" + "\n".join(status_lines),
+                        inline=False
+                    )
+            else:
+                embed.add_field(name="Search Configs", value="*No enabled search configs found*", inline=False)
+
+            await ctx.respond(embed=embed, ephemeral=True)
 
     @tasks.loop(hours=1)
     async def featured_reminder_task(self):
