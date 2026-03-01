@@ -1,6 +1,6 @@
 # QuestLog Bot
 
-The Discord bot that pairs with the [QuestLog platform](https://github.com/CasualHeroes/ch-webserver). Handles server security, engagement, community discovery, XP/leveling, LFG, streaming integrations, and more - all fully open source and free.
+The Discord bot that pairs with the [QuestLog platform](https://github.com/CasualHeroes/QuestLog). Handles server security, engagement, community discovery, XP/leveling, LFG, streaming integrations, and more - all fully open source and free.
 
 > "WardenBot" was the internal codename during development. The bot is publicly known as **QuestLog Bot**.
 
@@ -40,7 +40,7 @@ The Discord bot that pairs with the [QuestLog platform](https://github.com/Casua
 - Reaction roles, temp roles, bulk role assignment
 
 ### Platform Integration
-- Pairs with [ch-webserver](https://github.com/CasualHeroes/ch-webserver) via internal API
+- Pairs with [QuestLog](https://github.com/CasualHeroes/QuestLog) via internal API
 - QuestLog web profile linking (Steam, Discord account)
 - Server poll and rotation voting sync
 - Site activity tracker - Discord-driven game status
@@ -81,7 +81,7 @@ The goal is a single cohesive community toolkit that works across open and feder
 
 ## Related Repos
 
-- [CasualHeroes/ch-webserver](https://github.com/CasualHeroes/QuestLog) - The web platform this bot integrates with
+- [CasualHeroes/QuestLog](https://github.com/CasualHeroes/QuestLog) - The web platform this bot integrates with
 
 ---
 
@@ -150,11 +150,11 @@ Copy `.env.example` for the full list. Key variables:
 | `DB_NAME` | MySQL database name (default: `warden`) |
 | `DB_SOCKET` or `DB_HOST` | Unix socket path or TCP host |
 
-### Integration with ch-webserver (optional)
+### Integration with QuestLog (optional)
 
 | Variable | Description |
 |---|---|
-| `DISCORD_BOT_API_TOKEN` | Shared secret for ch-webserver <-> bot API calls |
+| `DISCORD_BOT_API_TOKEN` | Shared secret for QuestLog <-> bot API calls |
 | `DJANGO_DB_NAME` / `DJANGO_DB_USER` / `DJANGO_DB_PASSWORD` | Access to the QuestLog web database for shared data |
 
 ### Discord OAuth (optional - for web dashboard)
@@ -193,7 +193,7 @@ wardenbot/
 - bot.py               - Entry point, cog loader, guild sync
 - config.py            - Settings, DB engine, bot instance
 - models.py            - SQLAlchemy models
-- api_server.py        - Internal aiohttp API (used by ch-webserver)
+- api_server.py        - Internal aiohttp API (used by QuestLog)
 - db.py                - Database session helpers
 - actions.py           - Shared action processing logic
 - cogs/
