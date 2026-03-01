@@ -81,7 +81,7 @@ The goal is a single cohesive community toolkit that works across open and feder
 
 ## Related Repos
 
-- [CasualHeroes/ch-webserver](https://github.com/CasualHeroes/ch-webserver) - The web platform this bot integrates with
+- [CasualHeroes/ch-webserver](https://github.com/CasualHeroes/QuestLog) - The web platform this bot integrates with
 
 ---
 
