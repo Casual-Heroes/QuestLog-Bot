@@ -182,13 +182,24 @@ class SiteActivityTracker(commands.Cog):
                         online += 1
 
                         # Check if they're actively playing this game
-                        if member.activity and hasattr(member.activity, 'name') and member.activity.name:
-                            activity_name = member.activity.name
+                        if member.activity:
+                            # Build searchable text from activity name, details, and state
+                            # This handles streaming services like GeForce NOW where the game
+                            # name appears in details (e.g., "Playing No Rest for the Wicked")
+                            activity_parts = []
+                            if hasattr(member.activity, 'name') and member.activity.name:
+                                activity_parts.append(member.activity.name)
+                            if hasattr(member.activity, 'details') and member.activity.details:
+                                activity_parts.append(member.activity.details)
+                            if hasattr(member.activity, 'state') and member.activity.state:
+                                activity_parts.append(member.activity.state)
+
+                            activity_text = " ".join(activity_parts).lower()
 
                             # Check against activity keywords for this game
-                            if any(keyword.lower() in activity_name.lower() for keyword in keywords):
+                            if activity_text and any(keyword.lower() in activity_text for keyword in keywords):
                                 active += 1
-                                logger.debug(f"[SiteActivityTracker] {member.name} is actively playing {game_key} (activity: {activity_name})")
+                                logger.debug(f"[SiteActivityTracker] {member.name} is actively playing {game_key} (activity: {activity_text})")
 
                 game_total += total
                 game_online += online

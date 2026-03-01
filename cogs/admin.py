@@ -235,14 +235,7 @@ class AdminCog(commands.Cog):
                         enabled=True
                     ).first() is not None
 
-                    has_access = guild.is_vip or guild.subscription_tier == 'complete' or has_discovery_module
-
-                    if not has_access:
-                        await ctx.respond(
-                            "⭐ Discovery requires **Complete tier** or the **Discovery Module**.",
-                            ephemeral=True
-                        )
-                        return
+                    has_access = True
 
                 setattr(guild, attr, enabled)
                 status = "✅ Enabled" if enabled else "❌ Disabled"
@@ -391,13 +384,8 @@ class AdminCog(commands.Cog):
             )
             embed.add_field(name="👥 Roles", value=roles, inline=True)
 
-            # Subscription
-            tier = guild.subscription_tier.upper()
-            embed.add_field(
-                name="⭐ Subscription",
-                value=f"Tier: **{tier}**{'⭐' if guild.is_premium() else ''}",
-                inline=False
-            )
+            if guild.is_vip:
+                embed.add_field(name="⭐ VIP", value="VIP Server", inline=False)
 
         await ctx.respond(embed=embed, ephemeral=True)
 
@@ -1295,10 +1283,7 @@ class AdminCog(commands.Cog):
             guild.vip_granted_at = int(time.time())
             guild.vip_note = note
 
-            # Set lifetime subscription tier for VIP servers
             guild.subscription_tier = 'complete'
-            guild.billing_cycle = 'lifetime'
-            guild.stripe_subscription_id = f'vip_{target_guild_id}'
 
             guild_name = guild.guild_name or "Unknown"
 
@@ -1335,10 +1320,7 @@ class AdminCog(commands.Cog):
             guild.vip_granted_at = None
             guild.vip_note = None
 
-            # Reset subscription tier to free
             guild.subscription_tier = 'free'
-            guild.billing_cycle = None
-            guild.stripe_subscription_id = None
 
             guild_name = guild.guild_name or "Unknown"
 

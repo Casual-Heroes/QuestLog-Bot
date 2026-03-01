@@ -1274,17 +1274,22 @@ class DiscoveryCog(commands.Cog):
                         continue
 
                     # Check if it's time to check (based on interval)
+                    interval_hours_setting = config.game_check_interval_hours or 24
+                    interval_seconds = interval_hours_setting * 3600
+
                     if config.last_game_check_at:
                         time_since_last = now - config.last_game_check_at
-                        interval_seconds = (config.game_check_interval_hours or 24) * 3600
                         hours_since = time_since_last / 3600
-                        interval_hours = interval_seconds / 3600
+
+                        logger.info(f"Guild {config.guild_id} interval check: last={config.last_game_check_at}, now={now}, diff={time_since_last}s ({hours_since:.2f}h), interval={interval_hours_setting}h ({interval_seconds}s)")
 
                         if time_since_last < interval_seconds:
-                            logger.info(f"Skipping guild {config.guild_id}: checked {hours_since:.2f}h ago (interval: {interval_hours:.0f}h)")
+                            logger.info(f"SKIPPING guild {config.guild_id}: checked {hours_since:.2f}h ago (interval: {interval_hours_setting}h)")
                             continue
                         else:
-                            logger.info(f"Proceeding with guild {config.guild_id}: {hours_since:.2f}h since last check (interval: {interval_hours:.0f}h)")
+                            logger.info(f"PROCEEDING with guild {config.guild_id}: {hours_since:.2f}h since last check (interval: {interval_hours_setting}h)")
+                    else:
+                        logger.info(f"Guild {config.guild_id}: No previous check timestamp, will process")
 
                     logger.info(f"Checking games for guild {config.guild_id}")
 
@@ -1612,12 +1617,17 @@ class DiscoveryCog(commands.Cog):
                     try:
                         old_timestamp = config.last_game_check_at
                         config.last_game_check_at = now
-                        session.flush()
                         session.commit()
-                        session.refresh(config)
-                        logger.info(f"Updated last_game_check_at for guild {config.guild_id}: {old_timestamp} → {now}")
+
+                        # Verify the update stuck by re-querying
+                        verify_config = session.get(DiscoveryConfig, config.guild_id)
+                        if verify_config and verify_config.last_game_check_at == now:
+                            logger.info(f"✅ TIMESTAMP UPDATE VERIFIED for guild {config.guild_id}: {old_timestamp} → {now}")
+                        else:
+                            actual = verify_config.last_game_check_at if verify_config else "NOT FOUND"
+                            logger.error(f"❌ TIMESTAMP UPDATE FAILED for guild {config.guild_id}: expected {now}, got {actual}")
                     except Exception as update_error:
-                        logger.error(f"Failed to update last_game_check_at for guild {config.guild_id}: {update_error}")
+                        logger.error(f"Failed to update last_game_check_at for guild {config.guild_id}: {update_error}", exc_info=True)
 
                 except Exception as e:
                     logger.error(f"Error processing game discovery for guild {config.guild_id}: {e}", exc_info=True)
@@ -1731,10 +1741,10 @@ class DiscoveryCog(commands.Cog):
                         enabled=True
                     ).first() is not None
 
-                    has_access = guild_record.subscription_tier == 'complete' or has_discovery_module
+                    has_access = True
 
                     if not has_access:
-                        logger.warning(f"[COTW] Guild {guild_id} has COTW enabled but no Discovery module or Complete tier")
+                        logger.warning(f"[COTW] Guild {guild_id} has COTW enabled but no Discovery module")
                         continue
 
                     await self._select_and_announce_cotw(guild_id)
@@ -2616,31 +2626,7 @@ class DiscoveryCog(commands.Cog):
                 await ctx.respond("Self-promo channel not found.", ephemeral=True)
                 return
 
-            # Check daily limit
-            tier = get_guild_tier(session, ctx.guild.id)
-            daily_limit = FeatureLimits.get_limit(tier, "self_promo_per_day")
-
-            if daily_limit is not None:  # None means unlimited
-                today_start = get_today_start_timestamp()
-                today_posts = (
-                    session.query(PromoPost)
-                    .filter(
-                        PromoPost.guild_id == ctx.guild.id,
-                        PromoPost.user_id == ctx.author.id,
-                        PromoPost.created_at >= today_start
-                    )
-                    .count()
-                )
-
-                if today_posts >= daily_limit:
-                    upgrade_msg = FeatureLimits.get_upgrade_message("self_promo_per_day", tier)
-                    await ctx.respond(
-                        f"**Daily limit reached!** You've posted {today_posts}/{daily_limit} times today.\n\n"
-                        f"{upgrade_msg}\n\n"
-                        f"Your limit resets at midnight UTC.",
-                        ephemeral=True
-                    )
-                    return
+            # No daily self-promo limit - all users have unlimited access
 
             # Get or create member
             db_member = session.get(GuildMember, (ctx.guild.id, ctx.author.id))
@@ -2668,8 +2654,7 @@ class DiscoveryCog(commands.Cog):
             )
             session.add(promo)
 
-            # Calculate remaining posts for today
-            remaining = "Unlimited" if daily_limit is None else f"{daily_limit - (today_posts + 1 if daily_limit else 0)}"
+            remaining = "Unlimited"
 
         # Post to self-promo channel
         embed = discord.Embed(
@@ -2688,9 +2673,7 @@ class DiscoveryCog(commands.Cog):
         try:
             await promo_channel.send(embed=embed)
             response_msg = f"Your promo has been posted in {promo_channel.mention}!"
-            if daily_limit is not None:
-                response_msg += f"\n\n**Daily posts remaining:** {remaining}"
-            response_msg += "\n\n**Tip:** Want to be featured? Use `/promo featured` (Premium servers)."
+            response_msg += "\n\n**Tip:** Use `/promo featured` to enter the featured pool!"
 
             await ctx.respond(response_msg, ephemeral=True)
         except discord.Forbidden:
@@ -2723,18 +2706,6 @@ class DiscoveryCog(commands.Cog):
 
         with db_session_scope() as session:
             guild = session.get(Guild, ctx.guild.id)
-            tier = get_guild_tier(session, ctx.guild.id)
-
-            # Check premium status using FeatureLimits
-            has_featured_pool = FeatureLimits.get_limit(tier, "featured_pool")
-            if not has_featured_pool:
-                await ctx.respond(
-                    "**Featured Pool requires QuestLog Premium!**\n\n"
-                    "Ask a server admin to upgrade with `/questlog premium`.\n\n"
-                    "Free alternative: Use `/promo post` to share your content!",
-                    ephemeral=True
-                )
-                return
 
             db_member = session.get(GuildMember, (ctx.guild.id, ctx.author.id))
 
@@ -2868,8 +2839,7 @@ class DiscoveryCog(commands.Cog):
                 .count()
             )
 
-            daily_limit = FeatureLimits.get_limit(tier, "self_promo_per_day")
-            daily_display = f"{today_posts}/{daily_limit}" if daily_limit else f"{today_posts} (Unlimited)"
+            daily_display = f"{today_posts} (Unlimited)"
 
             embed = discord.Embed(
                 title="Your Promo Status",

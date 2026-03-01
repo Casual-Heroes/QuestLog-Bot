@@ -154,18 +154,8 @@ class StreamingMonitorCog(commands.Cog):
         if not guild:
             return False
 
-        # VIP or Complete tier always has access
-        if guild.is_vip or guild.subscription_tier == 'complete':
-            return True
-
-        # Check for Discovery module
-        has_discovery_module = db.query(GuildModule).filter_by(
-            guild_id=guild_id,
-            module_name='discovery',
-            enabled=True
-        ).first() is not None
-
-        return has_discovery_module
+        # All guilds have streaming monitor access
+        return True
 
     def _should_skip_creator(self, creator_id: int) -> bool:
         """

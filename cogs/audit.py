@@ -42,30 +42,14 @@ def get_guild_tier(session, guild_id: int) -> str:
 
 
 def has_moderation_access(session, guild_id: int) -> bool:
-    """Check if guild has moderation access (Complete tier, VIP, or Moderation module)."""
+    """All guilds have full moderation access."""
     db_guild = session.get(Guild, guild_id)
-    if not db_guild:
-        return False
-    if db_guild.is_vip or db_guild.subscription_tier == 'complete':
-        return True
-    # Check for Moderation module subscription
-    has_mod_module = session.query(GuildModule).filter_by(
-        guild_id=guild_id,
-        module_name='moderation',
-        enabled=True
-    ).first() is not None
-    return has_mod_module
+    return db_guild is not None
 
 
 def get_retention_days(session, guild_id: int) -> int:
-    """Get audit log retention days based on tier or module subscription."""
-    tier = get_guild_tier(session, guild_id)
-
-    # If they have moderation module, give them premium-level retention (30 days)
-    if tier == "FREE" and has_moderation_access(session, guild_id):
-        return 30  # Module subscribers get premium retention
-
-    return FeatureLimits.get_limit(tier, "mod_log_days") or 7
+    """Audit log retention is unlimited for all guilds."""
+    return None  # None = no retention limit
 
 
 # Action type to emoji mapping for display

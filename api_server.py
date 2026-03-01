@@ -728,7 +728,7 @@ async def announce_cotw(request):
 
     except Exception as e:
         logger.error(f"Error announcing COTW: {e}", exc_info=True)
-        return web.json_response({'error': str(e)}, status=500)
+        return web.json_response({'error': 'Internal server error'}, status=500)
 
 
 async def announce_cotm(request):
@@ -828,7 +828,7 @@ async def announce_cotm(request):
 
     except Exception as e:
         logger.error(f"Error announcing COTM: {e}", exc_info=True)
-        return web.json_response({'error': str(e)}, status=500)
+        return web.json_response({'error': 'Internal server error'}, status=500)
 
 
 async def delete_message(request):
@@ -847,6 +847,9 @@ async def delete_message(request):
         if not guild:
             return web.json_response({'error': 'Guild not found'}, status=404)
 
+        # guild.get_channel() only returns channels that belong to this guild,
+        # preventing cross-guild channel access even if a valid channel_id from
+        # another guild is supplied.
         channel = guild.get_channel(channel_id)
         if not channel:
             return web.json_response({'error': 'Channel not found'}, status=404)
@@ -859,11 +862,11 @@ async def delete_message(request):
             return web.json_response({'success': True})
         except Exception as e:
             logger.warning(f"Failed to delete message {message_id}: {e}")
-            return web.json_response({'error': f'Failed to delete message: {str(e)}'}, status=500)
+            return web.json_response({'error': 'Failed to delete message'}, status=500)
 
     except Exception as e:
         logger.error(f"Error deleting message: {e}", exc_info=True)
-        return web.json_response({'error': str(e)}, status=500)
+        return web.json_response({'error': 'Internal server error'}, status=500)
 
 
 async def announce_network_cotw(request):
@@ -968,7 +971,7 @@ async def announce_network_cotw(request):
 
     except Exception as e:
         logger.error(f"Error announcing Network COTW: {e}", exc_info=True)
-        return web.json_response({'error': str(e)}, status=500)
+        return web.json_response({'error': 'Internal server error'}, status=500)
 
 
 async def announce_network_cotm(request):
@@ -1073,7 +1076,7 @@ async def announce_network_cotm(request):
 
     except Exception as e:
         logger.error(f"Error announcing Network COTM: {e}", exc_info=True)
-        return web.json_response({'error': str(e)}, status=500)
+        return web.json_response({'error': 'Internal server error'}, status=500)
 
 
 def create_app():

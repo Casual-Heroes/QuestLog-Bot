@@ -4,6 +4,7 @@
 import os
 import logging
 from contextlib import contextmanager
+from pathlib import Path
 from urllib.parse import quote_plus
 
 import discord
@@ -13,7 +14,12 @@ from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.pool import QueuePool
 from dotenv import load_dotenv
 
-load_dotenv(override=True)  # Force override existing environment variables
+# Load secrets: production file takes priority, local .env used for development
+_secrets_path = Path("/etc/casual-heroes/warden.env")
+if _secrets_path.exists():
+    load_dotenv(_secrets_path, override=True)
+else:
+    load_dotenv(override=True)  # fall back to local .env
 
 # Logging setup
 LOG_PATH = os.getenv("LOG_PATH", ".")
@@ -226,209 +232,25 @@ def get_bot_token() -> str:
     return token
 
 
-# Feature limits (Freemium with Limits Model)
-# All features available to all tiers, but with quantity limits
+# All features are unlimited - QuestLog Bot is fully open source and free.
 class FeatureLimits:
-    """Feature limits by subscription tier. None = unlimited."""
-
-    # Free tier - All features, limited quantities
-    FREE = {
-        # IAM & Bulk Operations
-        "bulk_users_per_action": 10,       # Mass assign/remove roles
-        "templates": 5,                     # Role + Channel templates combined
-        "active_temp_roles": 10,            # Concurrent temp role assignments
-        "export_members": 100,              # Members per CSV export
-
-        # Audit & Logging
-        "mod_log_days": 7,                  # Days of mod action history
-
-        # Self-Promo & Discovery
-        "self_promo_per_day": 2,            # Daily self-promo posts
-        "featured_pool": False,             # Premium: Enter featured rotation
-        "discovery_network": False,         # Pro: Cross-server discovery
-
-        # Legacy/XP Settings
-        "max_members": 2500,
-        "react_roles": 10,
-        "level_roles": 10,
-        "xp_excluded_channels": 10,
-        "xp_excluded_roles": 10,
-
-        # Premium Features
-        "game_server_sync": False,
-        "analytics": False,
-        "custom_branding": False,
-        "api_access": False,
-        "priority_support": False,
-    }
-
-    # Premium tier ($6.99/mo) - Higher limits, featured pool access
-    PREMIUM = {
-        # IAM & Bulk Operations
-        "bulk_users_per_action": 100,
-        "templates": 25,
-        "active_temp_roles": 50,
-        "export_members": 1000,
-
-        # Audit & Logging
-        "mod_log_days": 30,
-
-        # Self-Promo & Discovery
-        "self_promo_per_day": 10,
-        "featured_pool": True,
-        "discovery_network": False,
-
-        # Legacy/XP Settings
-        "max_members": None,
-        "react_roles": None,
-        "level_roles": None,
-        "xp_excluded_channels": None,
-        "xp_excluded_roles": None,
-
-        # Premium Features
-        "game_server_sync": True,
-        "analytics": True,
-        "custom_branding": False,
-        "api_access": False,
-        "priority_support": False,
-    }
-
-    # Pro tier ($12.99/mo) - Unlimited everything, cross-server discovery
-    PRO = {
-        # IAM & Bulk Operations
-        "bulk_users_per_action": None,      # Unlimited
-        "templates": None,
-        "active_temp_roles": None,
-        "export_members": None,
-
-        # Audit & Logging
-        "mod_log_days": 90,
-
-        # Self-Promo & Discovery
-        "self_promo_per_day": None,         # Unlimited
-        "featured_pool": True,
-        "discovery_network": True,          # Pro exclusive
-
-        # Legacy/XP Settings
-        "max_members": None,
-        "react_roles": None,
-        "level_roles": None,
-        "xp_excluded_channels": None,
-        "xp_excluded_roles": None,
-
-        # Premium Features
-        "game_server_sync": True,
-        "analytics": True,
-        "custom_branding": True,
-        "api_access": True,
-        "priority_support": True,
-    }
+    """Stub class kept for API compatibility. All limits are None (unlimited)."""
 
     @classmethod
     def get_limits(cls, tier: str) -> dict:
-        """Get limits for a subscription tier."""
-        tier = tier.upper()
-        if tier == "PRO":
-            return cls.PRO
-        elif tier == "PREMIUM":
-            return cls.PREMIUM
-        else:
-            return cls.FREE
+        return {}
 
     @classmethod
-    def get_limit(cls, tier: str, feature: str) -> int | bool | None:
-        """Get a specific limit value for a tier."""
-        limits = cls.get_limits(tier)
-        return limits.get(feature)
+    def get_limit(cls, tier: str, feature: str) -> None:
+        return None
 
     @classmethod
-    def check_limit(cls, tier: str, feature: str, current_count: int) -> tuple[bool, int | None]:
-        """
-        Check if an action is within limits.
-
-        Returns:
-            tuple: (is_allowed, limit_value)
-                - is_allowed: True if action is permitted
-                - limit_value: The limit (None = unlimited)
-        """
-        limit = cls.get_limit(tier, feature)
-        if limit is None:
-            return (True, None)
-        if isinstance(limit, bool):
-            return (limit, limit)
-        return (current_count < limit, limit)
+    def check_limit(cls, tier: str, feature: str, current_count: int) -> tuple[bool, None]:
+        return (True, None)
 
     @classmethod
     def get_upgrade_message(cls, feature: str, current_tier: str) -> str:
-        """Get a friendly upgrade message when a limit is hit."""
-        current_limit = cls.get_limit(current_tier, feature)
-
-        if current_tier.upper() == "FREE":
-            premium_limit = cls.get_limit("PREMIUM", feature)
-            if premium_limit is None:
-                return f"Upgrade to Premium for unlimited {feature.replace('_', ' ')}!"
-            return f"Upgrade to Premium for up to {premium_limit} {feature.replace('_', ' ')}!"
-        elif current_tier.upper() == "PREMIUM":
-            return f"Upgrade to Pro for unlimited {feature.replace('_', ' ')}!"
         return ""
-
-
-# Pricing configuration (Aggressive Volume Play)
-class Pricing:
-    """
-    QuestLog subscription pricing.
-    Strategy: Aggressive pricing to capture market share, QuestLog as hook for game server sales.
-    """
-
-    # Base monthly prices
-    PREMIUM_MONTHLY = 6.99
-    PRO_MONTHLY = 12.99
-
-    # Yearly pricing (30% off)
-    YEARLY_DISCOUNT = 0.30
-    PREMIUM_YEARLY = round(PREMIUM_MONTHLY * 12 * (1 - YEARLY_DISCOUNT), 2)  # $58.71
-    PRO_YEARLY = round(PRO_MONTHLY * 12 * (1 - YEARLY_DISCOUNT), 2)          # $109.11
-
-    # Lifetime (Pro only)
-    PRO_LIFETIME = 79.99
-
-    # Discount types (DO NOT STACK, except bundle)
-    DISCOUNTS = {
-        "yearly": 0.30,              # Built into yearly pricing
-        "veterans": 0.35,            # Requires verification
-        "first_responder": 0.30,     # Requires verification
-        "birthday": 0.20,            # One-time yearly, requires DOB
-        "holiday": 0.25,             # Black Friday, Cyber Monday, Christmas, etc.
-        "flash_sale": 0.15,          # Random/urgency
-        "game_server_bundle": 0.50,  # STACKS with yearly only
-    }
-
-    # Holidays that qualify for holiday discount
-    HOLIDAY_EVENTS = [
-        "black_friday",
-        "cyber_monday",
-        "christmas",
-        "new_year",
-        "presidents_day",
-        "hanukkah",
-        "july_4th",
-    ]
-
-    @classmethod
-    def get_discounted_price(cls, base_price: float, discount_type: str) -> float:
-        """Calculate discounted price."""
-        discount = cls.DISCOUNTS.get(discount_type, 0)
-        return round(base_price * (1 - discount), 2)
-
-    @classmethod
-    def get_bundle_price(cls, tier: str, yearly: bool = False) -> float:
-        """Get price with game server bundle (50% off, stacks with yearly)."""
-        if tier.upper() == "PREMIUM":
-            base = cls.PREMIUM_YEARLY if yearly else cls.PREMIUM_MONTHLY
-        else:
-            base = cls.PRO_YEARLY if yearly else cls.PRO_MONTHLY
-
-        return round(base * (1 - cls.DISCOUNTS["game_server_bundle"]), 2)
 
 
 # Default XP settings
@@ -462,8 +284,8 @@ class DefaultXPSettings:
     MAX_LEVEL = 99
 
     # Self-promo costs
-    SELF_PROMO_COST = 0           # FREE for all members
-    FEATURED_POOL_COST = 15       # PREMIUM: 15 tokens to enter featured pool
+    SELF_PROMO_COST = 0           # Free for all members
+    FEATURED_POOL_COST = 0        # Free for all members
     FEATURED_DURATION_DAYS = 3    # Featured for 3 days
 
 
@@ -498,20 +320,6 @@ class DefaultVerificationSettings:
 
     VERIFICATION_TIMEOUT_HOURS = 24
     KICK_ON_TIMEOUT = False
-
-
-# Stripe configuration (Premium Subscriptions)
-STRIPE_API_KEY = os.getenv("STRIPE_API_KEY")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
-
-# Price IDs from Stripe Dashboard
-STRIPE_PRICES = {
-    "premium_monthly": os.getenv("STRIPE_PRICE_PREMIUM_MONTHLY"),
-    "premium_yearly": os.getenv("STRIPE_PRICE_PREMIUM_YEARLY"),
-    "pro_monthly": os.getenv("STRIPE_PRICE_PRO_MONTHLY"),
-    "pro_yearly": os.getenv("STRIPE_PRICE_PRO_YEARLY"),
-    "lifetime": os.getenv("STRIPE_PRICE_LIFETIME"),
-}
 
 
 # Environment

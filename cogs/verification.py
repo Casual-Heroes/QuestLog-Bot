@@ -53,7 +53,8 @@ def has_moderation_access(session, guild_id: int) -> bool:
     db_guild = session.get(Guild, guild_id)
     if not db_guild:
         return False
-    if db_guild.is_vip or db_guild.subscription_tier == 'complete':
+    # All guilds have full access
+    if True:
         return True
     # Check for Moderation module subscription
     has_mod_module = session.query(GuildModule).filter_by(

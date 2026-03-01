@@ -2698,19 +2698,9 @@ class LFGCog(commands.Cog):
     # =============================================================================
 
     def _has_lfg_access(self, session, guild_id: int) -> bool:
-        """Check if guild has LFG access (Complete tier, VIP, or LFG module)."""
+        """All guilds have LFG access."""
         guild = session.query(Guild).filter_by(guild_id=guild_id).first()
-        if not guild:
-            return False
-        if guild.is_vip or guild.subscription_tier == 'complete':
-            return True
-        # Check for LFG module subscription
-        has_lfg_module = session.query(GuildModule).filter_by(
-            guild_id=guild_id,
-            module_name='lfg',
-            enabled=True
-        ).first() is not None
-        return has_lfg_module
+        return guild is not None
 
     # =============================================================================
     # ADMIN COMMANDS
@@ -3774,14 +3764,11 @@ class GameButton(discord.ui.Button):
                         enabled=True
                     ).first() is not None
 
-                    has_access = guild_record.subscription_tier == 'complete' or has_lfg_module
+                    has_access = True
 
                     if not has_access:
                         await interaction.response.send_message(
-                            "❌ **LFG Groups require Complete tier or LFG Module**\n\n"
-                            "The LFG Browser feature requires a subscription.\n"
-                            "Upgrade your server to create and manage LFG groups!\n\n"
-                            "Visit the dashboard to upgrade: https://dashboard.casual-heroes.com",
+                            "❌ LFG access is unavailable.",
                             ephemeral=True
                         )
                         return

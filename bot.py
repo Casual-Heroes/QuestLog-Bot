@@ -26,7 +26,7 @@ from config import (
     IS_PRODUCTION,
     get_debug_guilds,
 )
-from models import Guild, SubscriptionTier
+from models import Guild
 
 
 # ====== Rotating Presence ======
@@ -439,7 +439,6 @@ def main():
         "cogs.admin",
         "cogs.action_processor",
         "cogs.activity_tracker",
-        "cogs.billing",
         "cogs.guild_sync_cog",  # Syncs member counts from Discord every 5 min
         "cogs.guild_sync",  # Auto-syncs roles/channels when they change (60s cooldown)
         "cogs.flair_cog",  # Flair store - let members customize their profile
@@ -447,6 +446,7 @@ def main():
         "cogs.scheduled_messages",  # Scheduled message processor
         "cogs.streaming_monitor",  # YouTube/Twitch live stream monitor & notifications
         "cogs.site_activity_tracker",  # Site activity tracker - database-driven Discord game tracking
+        "cogs.emergency",              # Owner-only emergency kill switch for incident response
     ]
 
     loaded_count = 0
