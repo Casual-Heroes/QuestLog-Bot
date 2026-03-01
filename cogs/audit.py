@@ -262,6 +262,8 @@ class AuditCog(commands.Cog):
             for guild in guilds:
                 try:
                     retention_days = get_retention_days(session, guild.guild_id)
+                    if retention_days is None:
+                        continue  # Unlimited retention — nothing to clean up
                     cutoff_time = int(time.time()) - (retention_days * 86400)
 
                     # Delete old logs
