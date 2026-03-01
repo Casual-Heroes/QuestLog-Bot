@@ -249,7 +249,7 @@ Replace `wardenbot` with whatever user the bot process runs as. Replace service 
 - All emergency responses ephemeral and require a `CONFIRM` modal for destructive actions
 - Guild channel access scoped to guild - cross-guild channel manipulation not possible
 
-If you find a security issue, please report it at [github.com/CasualHeroes/WardenBot/issues](https://github.com/CasualHeroes/WardenBot/issues).
+If you find a security issue, please report it at [github.com/CasualHeroes/WardenBot/issues](https://github.com/CasualHeroes/QuestLog-Bot/issues).
 
 ---
 
