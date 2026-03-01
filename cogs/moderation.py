@@ -80,16 +80,6 @@ COMPILED_SLUR_PATTERNS = [re.compile(p, re.IGNORECASE) for p in SLUR_PATTERNS]
 COMPILED_OPTIONAL_PATTERNS = [re.compile(p, re.IGNORECASE) for p in OPTIONAL_SLUR_PATTERNS]
 
 
-def get_guild_tier(session, guild_id: int) -> str:
-    """Get the subscription tier for a guild."""
-    db_guild = session.get(Guild, guild_id)
-    if not db_guild:
-        return "FREE"
-    if db_guild.is_vip:
-        return "PRO"
-    return db_guild.subscription_tier.upper() if db_guild.subscription_tier else "FREE"
-
-
 def check_for_slurs(content: str, strict_mode: bool = False) -> tuple[bool, str | None]:
     """
     Check message content for slurs.

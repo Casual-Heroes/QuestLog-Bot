@@ -14,11 +14,6 @@ Base = declarative_base()
 
 # Enums
 
-class SubscriptionTier(str, Enum):
-    FREE = "free"
-    COMPLETE = "complete"
-    # Note: Individual module subscriptions are tracked in guild_modules table, not here
-
 class VerificationType(str, Enum):
     NONE = "none"
     BUTTON = "button"
@@ -150,21 +145,7 @@ class Guild(Base):
     guild_name = Column(String(255), nullable=True)
     owner_id = Column(BigInteger, nullable=True)
 
-    # Subscription
-    # Use explicit enum values to match database (SQLAlchemy would use enum NAMES otherwise)
-    subscription_tier = Column(
-        SQLEnum('free', 'complete', name='subscriptiontier'),
-        default='free'
-    )
-    billing_cycle = Column(
-        SQLEnum('monthly', '3month', '6month', 'yearly', 'lifetime', name='billingcycle'),
-        nullable=True
-    )
-    subscription_expires = Column(BigInteger, nullable=True)
-    stripe_customer_id = Column(String(255), nullable=True)
-    stripe_subscription_id = Column(String(255), nullable=True)
-
-    # VIP flag - unlocks premium for free (friends & family)
+    # VIP flag - partner/trust marker (no feature gating, everything is free)
     is_vip = Column(Boolean, default=False)
     vip_granted_by = Column(BigInteger, nullable=True)
     vip_granted_at = Column(BigInteger, nullable=True)
@@ -240,55 +221,8 @@ class Guild(Base):
     react_roles = relationship("ReactRole", back_populates="guild", cascade="all, delete-orphan")
     creator_profiles = relationship("CreatorProfile", back_populates="guild", cascade="all, delete-orphan")
 
-    def is_premium(self) -> bool:
-        """Check if guild has active premium or VIP status."""
-        if self.is_vip:
-            return True
-        if self.subscription_tier == SubscriptionTier.FREE:
-            return False
-        if self.subscription_expires and self.subscription_expires < int(time.time()):
-            return False
-        return True
-
     def __repr__(self):
-        return f"<Guild(id={self.guild_id}, name={self.guild_name}, tier={self.subscription_tier})>"
-
-
-# Guild Modules (Modular Subscription System)
-
-class GuildModule(Base):
-    """
-    Tracks which modules each guild has subscribed to.
-    Supports modular pricing where guilds can subscribe to individual modules.
-    """
-    __tablename__ = "guild_modules"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    guild_id = Column(BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"), nullable=False)
-    module_name = Column(String(50), nullable=False)  # 'engagement', 'roles', 'moderation', 'discovery', 'lfg'
-    enabled = Column(Boolean, nullable=False, default=True)
-
-    # Stripe subscription info for this specific module
-    stripe_subscription_id = Column(String(255), nullable=True)
-    stripe_product_id = Column(String(255), nullable=True)
-    stripe_price_id = Column(String(255), nullable=True)
-
-    # Expiration
-    expires_at = Column(BigInteger, nullable=True)
-
-    # Activation tracking
-    activated_at = Column(BigInteger, nullable=False, default=lambda: int(time.time()))
-    activated_by = Column(BigInteger, nullable=True)  # User ID who activated
-
-    __table_args__ = (
-        Index("idx_guild_module_guild", "guild_id"),
-        Index("idx_guild_module_name", "module_name"),
-        Index("idx_guild_module_subscription", "stripe_subscription_id"),
-        UniqueConstraint("guild_id", "module_name", name="uq_guild_module"),
-    )
-
-    def __repr__(self):
-        return f"<GuildModule(guild_id={self.guild_id}, module={self.module_name}, enabled={self.enabled})>"
+        return f"<Guild(id={self.guild_id}, name={self.guild_name})>"
 
 
 # Guild Member
@@ -1083,36 +1017,6 @@ class ServerListing(Base):
     __table_args__ = (
         Index("idx_listing_published", "is_published", "categories"),
         Index("idx_listing_members", "member_count"),
-    )
-
-
-# Subscriptions
-
-class Subscription(Base):
-    """Premium subscription tracking."""
-    __tablename__ = "subscriptions"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    guild_id = Column(BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"))
-
-    stripe_customer_id = Column(String(255), nullable=True)
-    stripe_subscription_id = Column(String(255), nullable=True)
-
-    tier = Column(SQLEnum(SubscriptionTier), default=SubscriptionTier.COMPLETE)
-    price_cents = Column(Integer, default=1499)
-    billing_period = Column(String(20), default="monthly")
-
-    started_at = Column(BigInteger, default=lambda: int(time.time()))
-    current_period_start = Column(BigInteger, nullable=True)
-    current_period_end = Column(BigInteger, nullable=True)
-    canceled_at = Column(BigInteger, nullable=True)
-
-    is_active = Column(Boolean, default=True)
-    cancel_at_period_end = Column(Boolean, default=False)
-
-    __table_args__ = (
-        Index("idx_subscription_guild", "guild_id"),
-        Index("idx_subscription_stripe", "stripe_subscription_id"),
     )
 
 

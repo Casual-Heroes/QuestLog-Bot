@@ -30,39 +30,12 @@ from captcha.image import ImageCaptcha
 
 from config import (
     db_session_scope, logger, get_debug_guilds,
-    DefaultVerificationSettings, FeatureLimits
+    DefaultVerificationSettings
 )
 from models import (
-    Guild, GuildModule, GuildMember, VerificationConfig, VerificationType,
+    Guild, GuildMember, VerificationConfig, VerificationType,
     AuditLog, AuditAction
 )
-
-
-def get_guild_tier(session, guild_id: int) -> str:
-    """Get the subscription tier for a guild."""
-    db_guild = session.get(Guild, guild_id)
-    if not db_guild:
-        return "FREE"
-    if db_guild.is_vip:
-        return "PRO"
-    return db_guild.subscription_tier.upper() if db_guild.subscription_tier else "FREE"
-
-
-def has_moderation_access(session, guild_id: int) -> bool:
-    """Check if guild has moderation access (Complete tier, VIP, or Moderation module)."""
-    db_guild = session.get(Guild, guild_id)
-    if not db_guild:
-        return False
-    # All guilds have full access
-    if True:
-        return True
-    # Check for Moderation module subscription
-    has_mod_module = session.query(GuildModule).filter_by(
-        guild_id=guild_id,
-        module_name='moderation',
-        enabled=True
-    ).first() is not None
-    return has_mod_module
 
 
 def generate_captcha(length: int = 6) -> str:

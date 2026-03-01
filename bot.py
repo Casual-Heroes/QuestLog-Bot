@@ -192,7 +192,6 @@ async def sync_all_guilds():
                     guild_id=guild.id,
                     guild_name=guild.name,
                     owner_id=guild.owner_id,
-                    subscription_tier='free',
                     bot_present=True,
                     left_at=None,
                     cached_channels=json.dumps(channels_data),
@@ -273,7 +272,6 @@ async def on_guild_join(guild: discord.Guild):
                 guild_id=guild.id,
                 guild_name=guild.name,
                 owner_id=guild.owner_id,
-                subscription_tier='free',
                 bot_present=True,
                 left_at=None,
                 cached_channels=json.dumps(channels_data),
@@ -310,8 +308,7 @@ async def on_guild_join(guild: discord.Guild):
                     "• `/questlog setup` - Quick setup wizard\n"
                     "• `/questlog help` - See all commands\n"
                     "• `/questlog dashboard` - Web dashboard\n\n"
-                    "**Free features:** XP, leveling, anti-raid, verification\n"
-                    "**Premium:** Discovery network, game server sync, analytics"
+                    "**All features are free:** XP, leveling, anti-raid, verification, discovery, and more!"
                 ),
                 color=discord.Color.brand_green()
             )

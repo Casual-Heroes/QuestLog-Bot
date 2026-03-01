@@ -15,7 +15,7 @@ from config import (
     IS_PRODUCTION,
     get_debug_guilds,
 )
-from models import Guild, GuildMember, SubscriptionTier
+from models import Guild, GuildMember
 
 # URLs (centralized for easy updating)
 WEBSITE_URL = "https://casual-heroes.com/questlog/overview/"
@@ -77,9 +77,9 @@ class CoreCog(commands.Cog):
             inline=True
         )
 
-        # Premium features
+        # Engagement features
         embed.add_field(
-            name="⭐ Premium Features",
+            name="🎮 Engagement",
             value=(
                 "`/promo post` - Self-promotion\n"
                 "`/promo featured` - Enter featured pool\n"
@@ -92,10 +92,7 @@ class CoreCog(commands.Cog):
         # Admin
         embed.add_field(
             name="⚙️ Admin",
-            value=(
-                "`/premium` - View pricing\n"
-                f"[Web Dashboard]({DASHBOARD_URL}) - Manage settings"
-            ),
+            value=f"[Web Dashboard]({DASHBOARD_URL}) - Manage settings",
             inline=False
         )
 
@@ -141,9 +138,9 @@ class CoreCog(commands.Cog):
 
         await ctx.respond(embed=embed, ephemeral=True)
 
-    @discord.slash_command(name="status", description="View server status and subscription")
+    @discord.slash_command(name="status", description="View server status")
     async def status(self, ctx: discord.ApplicationContext):
-        """Show guild status and subscription info."""
+        """Show guild status."""
         with db_session_scope() as session:
             guild = session.get(Guild, ctx.guild.id)
 
@@ -158,18 +155,14 @@ class CoreCog(commands.Cog):
                 .count()
             )
 
-            tier = guild.subscription_tier.upper()
-            is_premium = guild.is_premium()
-
             embed = discord.Embed(
                 title=f"🏠 {ctx.guild.name}",
-                color=discord.Color.gold() if is_premium else discord.Color.blurple()
+                color=discord.Color.blurple()
             )
 
             embed.add_field(
                 name="📊 Status",
                 value=(
-                    f"Tier: **{tier}** {'⭐' if is_premium else ''}\n"
                     f"Members Tracked: **{member_count}**\n"
                     f"XP System: **{'✅ Enabled' if guild.xp_enabled else '❌ Disabled'}**\n"
                     f"Anti-Raid: **{'✅ Enabled' if guild.anti_raid_enabled else '❌ Disabled'}**"
@@ -187,100 +180,14 @@ class CoreCog(commands.Cog):
                 features.append("✅ Verification")
             if guild.audit_logging_enabled:
                 features.append("✅ Audit Logging")
-            if is_premium and guild.discovery_enabled:
-                features.append("⭐ Discovery Network")
+            if guild.discovery_enabled:
+                features.append("✅ Discovery Network")
 
             embed.add_field(
                 name="🔧 Features",
                 value="\n".join(features) if features else "None enabled",
                 inline=True
             )
-
-            if not is_premium:
-                embed.add_field(
-                    name="⭐ Upgrade QuestLog",
-                    value=(
-                        "Unlock powerful modules: Discovery, Events, Advanced Security, and more!\n"
-                        "Use `/premium` to see pricing options"
-                    ),
-                    inline=False
-                )
-
-        await ctx.respond(embed=embed, ephemeral=True)
-
-    @discord.slash_command(name="premium", description="View premium subscription options")
-    async def premium(self, ctx: discord.ApplicationContext):
-        """Show premium subscription info."""
-        with db_session_scope() as session:
-            guild = session.get(Guild, ctx.guild.id)
-            is_premium = guild.is_premium() if guild else False
-
-        embed = discord.Embed(
-            title="⭐ QuestLog Pricing",
-            description="Choose the features that fit your community's needs.",
-            color=discord.Color.gold()
-        )
-
-        # Free tier
-        embed.add_field(
-            name="🆓 Free Tier",
-            value=(
-                "• XP & Leveling (all sources)\n"
-                "• Hero Tokens\n"
-                "• Basic Anti-Raid\n"
-                "• Button Verification\n"
-                "• 10 React Roles\n"
-                "• 7-Day Audit Logs\n"
-                "• Up to 2,500 members"
-            ),
-            inline=False
-        )
-
-        # Module-based tier
-        embed.add_field(
-            name="🧩 Module-Based (Pick & Choose)",
-            value=(
-                "Subscribe to individual modules:\n"
-                "• **Engagement Suite** - $5/mo\n"
-                "• **Role Management** - $4/mo\n"
-                "• **Moderation & Security** - $5/mo\n"
-                "• **Discovery & Promotion** - $5/mo\n"
-                "• **Events & Attendance (LFG)** - $4/mo\n\n"
-                "_Only pay for what you need!_"
-            ),
-            inline=False
-        )
-
-        # Complete tier
-        embed.add_field(
-            name="🚀 Complete (Everything Unlocked)",
-            value=(
-                "• All modules included\n"
-                "• Unlimited members\n"
-                "• Priority support\n"
-                "• Early access to new features\n\n"
-                "_Best value for full-featured communities_"
-            ),
-            inline=False
-        )
-
-        if is_premium:
-            embed.add_field(
-                name="✅ Your Status",
-                value="This server has an active subscription! Thank you for supporting QuestLog! 🎉",
-                inline=False
-            )
-        else:
-            embed.add_field(
-                name="💎 Get Started",
-                value=(
-                    f"Visit the [Dashboard]({DASHBOARD_URL}guild/{ctx.guild.id}/billing) to manage your subscription.\n"
-                    "Choose individual modules or go Complete!"
-                ),
-                inline=False
-            )
-
-        embed.set_footer(text=f"Questions? Join {SUPPORT_INVITE}")
 
         await ctx.respond(embed=embed, ephemeral=True)
 
@@ -306,8 +213,7 @@ class CoreCog(commands.Cog):
                 f"Visit the [Dashboard]({DASHBOARD_URL}guild/{ctx.guild.id}) to:\n"
                 "• Set up notification channels\n"
                 "• Configure verification settings\n"
-                "• Enable/disable modules\n"
-                "• Manage subscription"
+                "• Enable/disable modules"
             ),
             inline=False
         )

@@ -27,29 +27,8 @@ from discord.ext import commands, tasks
 from discord import SlashCommandGroup
 from datetime import datetime, timedelta
 
-from config import db_session_scope, logger, get_debug_guilds, FeatureLimits
-from models import Guild, GuildModule, GuildMember, AuditLog, AuditAction
-
-
-def get_guild_tier(session, guild_id: int) -> str:
-    """Get the subscription tier for a guild."""
-    db_guild = session.get(Guild, guild_id)
-    if not db_guild:
-        return "FREE"
-    if db_guild.is_vip:
-        return "PRO"
-    return db_guild.subscription_tier.upper() if db_guild.subscription_tier else "FREE"
-
-
-def has_moderation_access(session, guild_id: int) -> bool:
-    """All guilds have full moderation access."""
-    db_guild = session.get(Guild, guild_id)
-    return db_guild is not None
-
-
-def get_retention_days(session, guild_id: int) -> int:
-    """Audit log retention is unlimited for all guilds."""
-    return None  # None = no retention limit
+from config import db_session_scope, logger, get_debug_guilds
+from models import Guild, GuildMember, AuditLog, AuditAction
 
 
 # Action type to emoji mapping for display
@@ -253,36 +232,8 @@ class AuditCog(commands.Cog):
 
     @tasks.loop(hours=24)
     async def cleanup_old_logs_task(self):
-        """Clean up audit logs older than retention period."""
-        logger.info("Running audit log cleanup task...")
-
-        with db_session_scope() as session:
-            guilds = session.query(Guild).all()
-
-            for guild in guilds:
-                try:
-                    retention_days = get_retention_days(session, guild.guild_id)
-                    if retention_days is None:
-                        continue  # Unlimited retention — nothing to clean up
-                    cutoff_time = int(time.time()) - (retention_days * 86400)
-
-                    # Delete old logs
-                    deleted = (
-                        session.query(AuditLog)
-                        .filter(
-                            AuditLog.guild_id == guild.guild_id,
-                            AuditLog.timestamp < cutoff_time
-                        )
-                        .delete()
-                    )
-
-                    if deleted > 0:
-                        logger.debug(f"Cleaned up {deleted} old audit logs for guild {guild.guild_id}")
-
-                except Exception as e:
-                    logger.error(f"Error cleaning up logs for guild {guild.guild_id}: {e}")
-
-        logger.info("Audit log cleanup completed")
+        """Audit logs are retained indefinitely — no cleanup needed."""
+        logger.debug("Audit log cleanup task running — retention is unlimited, nothing to delete")
 
     @cleanup_old_logs_task.before_loop
     async def before_cleanup(self):
@@ -801,13 +752,8 @@ class AuditCog(commands.Cog):
         limit = min(limit, 50)
 
         with db_session_scope() as session:
-            tier = get_guild_tier(session, ctx.guild.id)
-            retention_days = get_retention_days(session, ctx.guild.id)
-            cutoff_time = int(time.time()) - (retention_days * 86400)
-
             query = session.query(AuditLog).filter(
                 AuditLog.guild_id == ctx.guild.id,
-                AuditLog.timestamp >= cutoff_time
             )
 
             if user:
@@ -827,7 +773,7 @@ class AuditCog(commands.Cog):
 
             if not logs:
                 await ctx.respond(
-                    f"No audit logs found matching your criteria (last {retention_days} days).",
+                    "No audit logs found matching your criteria.",
                     ephemeral=True
                 )
                 return
@@ -836,7 +782,7 @@ class AuditCog(commands.Cog):
                 title="Audit Log Search Results",
                 color=discord.Color.blue()
             )
-            embed.set_footer(text=f"{tier} tier: {retention_days}-day retention | Showing {len(logs)} results")
+            embed.set_footer(text=f"Showing {len(logs)} results")
 
             for log in logs[:15]:  # Show max 15 in embed
                 emoji = ACTION_EMOJIS.get(log.action, "📋")
@@ -875,9 +821,6 @@ class AuditCog(commands.Cog):
         limit = min(limit, 25)
 
         with db_session_scope() as session:
-            tier = get_guild_tier(session, ctx.guild.id)
-            retention_days = get_retention_days(session, ctx.guild.id)
-
             logs = (
                 session.query(AuditLog)
                 .filter(AuditLog.guild_id == ctx.guild.id)
@@ -894,7 +837,6 @@ class AuditCog(commands.Cog):
                 title="Recent Audit Logs",
                 color=discord.Color.blue()
             )
-            embed.set_footer(text=f"{tier} tier: {retention_days}-day retention")
 
             for log in logs:
                 emoji = ACTION_EMOJIS.get(log.action, "📋")
@@ -921,17 +863,10 @@ class AuditCog(commands.Cog):
     async def audit_stats(self, ctx: discord.ApplicationContext):
         """View audit log statistics."""
         with db_session_scope() as session:
-            tier = get_guild_tier(session, ctx.guild.id)
-            retention_days = get_retention_days(session, ctx.guild.id)
-            cutoff_time = int(time.time()) - (retention_days * 86400)
-
             # Total logs
             total = (
                 session.query(AuditLog)
-                .filter(
-                    AuditLog.guild_id == ctx.guild.id,
-                    AuditLog.timestamp >= cutoff_time
-                )
+                .filter(AuditLog.guild_id == ctx.guild.id)
                 .count()
             )
 
@@ -953,7 +888,6 @@ class AuditCog(commands.Cog):
                     session.query(AuditLog)
                     .filter(
                         AuditLog.guild_id == ctx.guild.id,
-                        AuditLog.timestamp >= cutoff_time,
                         AuditLog.action.in_(actions)
                     )
                     .count()
@@ -966,7 +900,6 @@ class AuditCog(commands.Cog):
                 session.query(AuditLog.actor_name, func.count(AuditLog.id))
                 .filter(
                     AuditLog.guild_id == ctx.guild.id,
-                    AuditLog.timestamp >= cutoff_time,
                     AuditLog.actor_name.isnot(None)
                 )
                 .group_by(AuditLog.actor_name)
@@ -982,7 +915,7 @@ class AuditCog(commands.Cog):
 
         embed.add_field(
             name="Overview",
-            value=f"**Total Logs:** {total:,}\n**Today:** {today_count:,}\n**Retention:** {retention_days} days",
+            value=f"**Total Logs:** {total:,}\n**Today:** {today_count:,}\n**Retention:** Unlimited",
             inline=False
         )
 
@@ -996,8 +929,6 @@ class AuditCog(commands.Cog):
                 f"{name}: {count}" for name, count in top_actors
             ])
             embed.add_field(name="Top Actors", value=actors_text, inline=True)
-
-        embed.set_footer(text=f"{tier} tier | Upgrade for longer retention")
 
         await ctx.respond(embed=embed, ephemeral=True)
 
@@ -1022,15 +953,12 @@ class AuditCog(commands.Cog):
         await ctx.defer(ephemeral=True)
 
         with db_session_scope() as session:
-            tier = get_guild_tier(session, ctx.guild.id)
-            retention_days = get_retention_days(session, ctx.guild.id)
-            export_days = min(days or retention_days, retention_days)
-            cutoff_time = int(time.time()) - (export_days * 86400)
-
             query = session.query(AuditLog).filter(
                 AuditLog.guild_id == ctx.guild.id,
-                AuditLog.timestamp >= cutoff_time
             )
+            if days:
+                cutoff_time = int(time.time()) - (days * 86400)
+                query = query.filter(AuditLog.timestamp >= cutoff_time)
 
             if category and category != "all":
                 actions = ACTION_CATEGORIES.get(category, [])
@@ -1066,11 +994,12 @@ class AuditCog(commands.Cog):
                 ])
 
             output.seek(0)
-            filename = f"audit_logs_{ctx.guild.id}_{category}_{export_days}d.csv"
+            day_label = f"{days}d" if days else "all"
+            filename = f"audit_logs_{ctx.guild.id}_{category}_{day_label}.csv"
             file = discord.File(io.BytesIO(output.getvalue().encode()), filename=filename)
 
         await ctx.followup.send(
-            f"Exported **{len(logs)}** audit logs ({export_days} days, {category}):",
+            f"Exported **{len(logs)}** audit logs ({day_label}, {category}):",
             file=file,
             ephemeral=True
         )
@@ -1086,17 +1015,12 @@ class AuditCog(commands.Cog):
     ):
         """View all audit logs for a specific user."""
         with db_session_scope() as session:
-            tier = get_guild_tier(session, ctx.guild.id)
-            retention_days = get_retention_days(session, ctx.guild.id)
-            cutoff_time = int(time.time()) - (retention_days * 86400)
-
             # Logs where user is actor
             as_actor = (
                 session.query(AuditLog)
                 .filter(
                     AuditLog.guild_id == ctx.guild.id,
                     AuditLog.actor_id == member.id,
-                    AuditLog.timestamp >= cutoff_time
                 )
                 .count()
             )
@@ -1107,7 +1031,6 @@ class AuditCog(commands.Cog):
                 .filter(
                     AuditLog.guild_id == ctx.guild.id,
                     AuditLog.target_id == member.id,
-                    AuditLog.timestamp >= cutoff_time
                 )
                 .count()
             )
@@ -1118,7 +1041,6 @@ class AuditCog(commands.Cog):
                 .filter(
                     AuditLog.guild_id == ctx.guild.id,
                     AuditLog.actor_id == member.id,
-                    AuditLog.timestamp >= cutoff_time
                 )
                 .order_by(AuditLog.timestamp.desc())
                 .limit(5)
@@ -1131,7 +1053,6 @@ class AuditCog(commands.Cog):
                 .filter(
                     AuditLog.guild_id == ctx.guild.id,
                     AuditLog.target_id == member.id,
-                    AuditLog.timestamp >= cutoff_time
                 )
                 .order_by(AuditLog.timestamp.desc())
                 .limit(5)
@@ -1164,8 +1085,6 @@ class AuditCog(commands.Cog):
             ])
             embed.add_field(name="Recent Events", value=targeted_text, inline=True)
 
-        embed.set_footer(text=f"{tier} tier: {retention_days}-day retention")
-
         await ctx.respond(embed=embed, ephemeral=True)
 
     @audit.command(name="config", description="Configure audit logging")
@@ -1185,9 +1104,6 @@ class AuditCog(commands.Cog):
             if not db_guild:
                 await ctx.respond("Run `/questlog setup` first.", ephemeral=True)
                 return
-
-            tier = get_guild_tier(session, ctx.guild.id)
-            retention_days = get_retention_days(session, ctx.guild.id)
 
             changes = []
 
@@ -1218,7 +1134,7 @@ class AuditCog(commands.Cog):
                 )
                 embed.add_field(
                     name="Retention",
-                    value=f"{retention_days} days ({tier})",
+                    value="Unlimited",
                     inline=True
                 )
                 await ctx.respond(embed=embed, ephemeral=True)
