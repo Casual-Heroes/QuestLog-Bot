@@ -29,7 +29,6 @@ from config import (
     db_session_scope,
     logger,
     DefaultRaidSettings,
-    FeatureLimits,
     get_debug_guilds,
 )
 from models import (
@@ -42,15 +41,6 @@ from models import (
     ModAction,
 )
 
-
-def get_guild_tier(session, guild_id: int) -> str:
-    """Get the subscription tier for a guild."""
-    db_guild = session.get(Guild, guild_id)
-    if not db_guild:
-        return "FREE"
-    if db_guild.is_vip:
-        return "PRO"
-    return db_guild.subscription_tier.upper() if db_guild.subscription_tier else "FREE"
 
 # Dangerous permissions that should trigger alerts
 DANGEROUS_PERMS = [
@@ -568,9 +558,7 @@ class SecurityCog(commands.Cog):
     ):
         """View recent moderator actions."""
         with db_session_scope() as session:
-            # Get tier-based log retention days
-            tier = get_guild_tier(session, ctx.guild.id)
-            log_days = FeatureLimits.get_limit(tier, "mod_log_days") or 7
+            log_days = 30
             cutoff_time = int(time.time()) - (log_days * 86400)
 
             query = session.query(ModAction).filter(

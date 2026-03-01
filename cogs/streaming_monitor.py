@@ -49,7 +49,6 @@ from models import (
     ApprovedStreamer,
     GuildMember,
     Guild,
-    GuildModule,
     StreamNotificationHistory,
 )
 

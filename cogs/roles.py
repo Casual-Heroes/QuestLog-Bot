@@ -20,85 +20,11 @@ import csv
 import discord
 from discord.ext import commands, tasks
 
-from config import db_session_scope, logger, get_debug_guilds, FeatureLimits
+from config import db_session_scope, logger, get_debug_guilds
 from models import (
-    Guild, GuildModule, GuildMember, ReactRole, LevelRole,
+    Guild, GuildMember, ReactRole, LevelRole,
     TempRole, RoleTemplate, RoleRequest, ModAction, ChannelTemplate
 )
-
-
-def get_guild_tier(session, guild_id: int) -> str:
-    """Get the subscription tier for a guild."""
-    db_guild = session.get(Guild, guild_id)
-    if not db_guild:
-        return "FREE"
-    # VIP gets Pro features
-    if db_guild.is_vip:
-        return "PRO"
-    return db_guild.subscription_tier.upper() if db_guild.subscription_tier else "FREE"
-
-
-def get_effective_tier(session, guild_id: int) -> str:
-    """
-    Get effective tier considering module subscriptions.
-    If guild has 'roles' module, treat as PREMIUM for feature limits.
-    """
-    tier = get_guild_tier(session, guild_id)
-    if tier != "FREE":
-        return tier
-
-    # Check for Roles module subscription - gives premium-level limits
-    has_roles_module = session.query(GuildModule).filter_by(
-        guild_id=guild_id,
-        module_name='roles',
-        enabled=True
-    ).first() is not None
-
-    if has_roles_module:
-        return "PREMIUM"  # Module subscribers get premium limits
-
-    return tier
-
-
-async def check_limit_and_respond(
-    ctx: discord.ApplicationContext,
-    session,
-    feature: str,
-    current_count: int = 0,
-    action_count: int = 1
-) -> tuple[bool, int | None]:
-    """
-    Check if action is within limits. Returns (is_allowed, limit).
-    If not allowed, sends upgrade message and returns False.
-    Uses effective tier which accounts for module subscriptions.
-    """
-    tier = get_effective_tier(session, ctx.guild.id)
-    limit = FeatureLimits.get_limit(tier, feature)
-
-    # None = unlimited
-    if limit is None:
-        return (True, None)
-
-    # Boolean feature (like featured_pool)
-    if isinstance(limit, bool):
-        if not limit:
-            upgrade_msg = FeatureLimits.get_upgrade_message(feature, tier)
-            await ctx.respond(f"⭐ {upgrade_msg}", ephemeral=True)
-            return (False, limit)
-        return (True, limit)
-
-    # Numeric limit - check if action would exceed
-    if current_count + action_count > limit:
-        upgrade_msg = FeatureLimits.get_upgrade_message(feature, tier)
-        await ctx.respond(
-            f"⚠️ **Limit Reached!** You can only use **{limit}** {feature.replace('_', ' ')} on the {tier} tier.\n"
-            f"Current: {current_count} | Requested: {action_count}\n\n"
-            f"⭐ {upgrade_msg}",
-            ephemeral=True
-        )
-        return (False, limit)
-
-    return (True, limit)
 
 # Dangerous permissions that should trigger alerts
 DANGEROUS_PERMS = [
@@ -454,19 +380,7 @@ class RolesCog(commands.Cog):
             await ctx.respond("No users to assign the role to.", ephemeral=True)
             return
 
-        # Check bulk operation limit
-        with db_session_scope() as session:
-            allowed, limit = await check_limit_and_respond(
-                ctx, session, "bulk_users_per_action", current_count=0, action_count=len(members)
-            )
-            if not allowed:
-                return
-
         await ctx.defer(ephemeral=True)
-
-        # If limit exists and members exceed it, only process up to limit
-        if limit and len(members) > limit:
-            members = members[:limit]
             await ctx.followup.send(
                 f"📊 Processing first **{limit}** members (tier limit). Upgrade for more!",
                 ephemeral=True
@@ -520,19 +434,7 @@ class RolesCog(commands.Cog):
             await ctx.respond("No users have that role.", ephemeral=True)
             return
 
-        # Check bulk operation limit
-        with db_session_scope() as session:
-            allowed, limit = await check_limit_and_respond(
-                ctx, session, "bulk_users_per_action", current_count=0, action_count=len(members)
-            )
-            if not allowed:
-                return
-
         await ctx.defer(ephemeral=True)
-
-        # If limit exists and members exceed it, only process up to limit
-        if limit and len(members) > limit:
-            members = members[:limit]
             await ctx.followup.send(
                 f"📊 Processing first **{limit}** members (tier limit). Upgrade for more!",
                 ephemeral=True
@@ -599,13 +501,6 @@ class RolesCog(commands.Cog):
                 .count()
             )
             total_templates = role_template_count + channel_template_count
-
-            # Check limit
-            allowed, limit = await check_limit_and_respond(
-                ctx, session, "templates", current_count=total_templates, action_count=1
-            )
-            if not allowed:
-                return
 
             template = RoleTemplate(
                 guild_id=ctx.guild.id,
@@ -724,20 +619,6 @@ class RolesCog(commands.Cog):
             await ctx.respond("❌ You cannot assign a role higher than your own.", ephemeral=True)
             return
 
-        # Check active temp roles limit
-        with db_session_scope() as session:
-            active_count = (
-                session.query(TempRole)
-                .filter(TempRole.guild_id == ctx.guild.id, TempRole.is_active == True)
-                .count()
-            )
-
-            allowed, limit = await check_limit_and_respond(
-                ctx, session, "active_temp_roles", current_count=active_count, action_count=1
-            )
-            if not allowed:
-                return
-
         try:
             await member.add_roles(role, reason=f"Temp role by {ctx.author}: {reason or 'No reason'}")
         except discord.Forbidden:
@@ -826,17 +707,6 @@ class RolesCog(commands.Cog):
             await ctx.respond(f"No members have the {role.name} role.", ephemeral=True)
             return
 
-        # Check export limit
-        with db_session_scope() as session:
-            tier = get_guild_tier(session, ctx.guild.id)
-            limit = FeatureLimits.get_limit(tier, "export_members")
-
-        # Limit export if needed
-        export_limited = False
-        if limit and len(members) > limit:
-            members = members[:limit]
-            export_limited = True
-
         await ctx.defer(ephemeral=True)
 
         output = io.StringIO()
@@ -864,11 +734,7 @@ class RolesCog(commands.Cog):
             details=f"Exported {len(members)} members"
         )
 
-        response = f"📊 Exported **{len(members)}** members with **{role.name}**:"
-        if export_limited:
-            response += f"\n⚠️ *Limited to {limit} members. Upgrade for more!*"
-
-        await ctx.respond(response, file=file, ephemeral=True)
+        await ctx.respond(f"📊 Exported **{len(members)}** members with **{role.name}**:", file=file, ephemeral=True)
 
     @iam.command(name="audit-mods", description="Audit moderator role assignments")
     @discord.default_permissions(administrator=True)

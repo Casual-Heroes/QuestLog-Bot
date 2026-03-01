@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from config import db_session_scope, logger, get_debug_guilds
-from models import Guild, GuildModule, FeedbackConfig, Suggestion, SuggestionStatus, GuildMember, LFGGroup
+from models import Guild, FeedbackConfig, Suggestion, SuggestionStatus, GuildMember, LFGGroup
 
 # Bot owner ID - only this user can grant VIP status
 # Set via environment variable or hardcode your Discord user ID
@@ -227,16 +227,6 @@ class AdminCog(commands.Cog):
 
             attr = feature_map.get(feature)
             if attr:
-                # Check access for discovery (Complete tier, VIP, or Discovery module)
-                if feature == "discovery" and enabled:
-                    has_discovery_module = session.query(GuildModule).filter_by(
-                        guild_id=ctx.guild.id,
-                        module_name='discovery',
-                        enabled=True
-                    ).first() is not None
-
-                    has_access = True
-
                 setattr(guild, attr, enabled)
                 status = "✅ Enabled" if enabled else "❌ Disabled"
                 await ctx.respond(
@@ -1283,8 +1273,6 @@ class AdminCog(commands.Cog):
             guild.vip_granted_at = int(time.time())
             guild.vip_note = note
 
-            guild.subscription_tier = 'complete'
-
             guild_name = guild.guild_name or "Unknown"
 
         logger.info(f"VIP granted to {guild_name} ({target_guild_id}) by {message.author}")
@@ -1319,8 +1307,6 @@ class AdminCog(commands.Cog):
             guild.vip_granted_by = None
             guild.vip_granted_at = None
             guild.vip_note = None
-
-            guild.subscription_tier = 'free'
 
             guild_name = guild.guild_name or "Unknown"
 

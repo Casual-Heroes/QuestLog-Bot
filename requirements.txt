@@ -11,9 +11,6 @@ mysql-connector-python>=8.0.0
 # Environment
 python-dotenv>=1.0.0
 
-# Payments (optional - for premium subscriptions)
-stripe>=7.0.0
-
 # Utilities
 aiohttp>=3.9.0
 

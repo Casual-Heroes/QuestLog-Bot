@@ -17,7 +17,7 @@ import sys
 sys.path.insert(0, '..')
 from db import get_db_session
 from models import (
-    LFGGame, LFGGroup, LFGMember, Guild, GuildModule,
+    LFGGame, LFGGroup, LFGMember, Guild,
     LFGAttendance, LFGMemberStats, LFGConfig, AttendanceStatus
 )
 from utils import igdb
@@ -3754,25 +3754,6 @@ class GameButton(discord.ui.Button):
         """Open LFG creation view for this game."""
         try:
             with get_db_session() as session:
-                # Check guild subscription - requires Complete tier OR LFG module
-                guild_record = session.query(Guild).filter_by(guild_id=interaction.guild.id).first()
-                if guild_record and not guild_record.is_vip:
-                    # Check for LFG module subscription
-                    has_lfg_module = session.query(GuildModule).filter_by(
-                        guild_id=interaction.guild.id,
-                        module_name='lfg',
-                        enabled=True
-                    ).first() is not None
-
-                    has_access = True
-
-                    if not has_access:
-                        await interaction.response.send_message(
-                            "❌ LFG access is unavailable.",
-                            ephemeral=True
-                        )
-                        return
-
                 # Reload game config from DB
                 game_config = session.query(LFGGame).filter_by(id=self.game.id).first()
                 if not game_config or not game_config.enabled:

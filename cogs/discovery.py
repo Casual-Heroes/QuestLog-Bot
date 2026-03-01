@@ -28,26 +28,16 @@ from discord.ext import commands, tasks
 from discord import SlashCommandGroup
 
 from config import (
-    db_session_scope, logger, get_debug_guilds, DefaultXPSettings, FeatureLimits
+    db_session_scope, logger, get_debug_guilds, DefaultXPSettings
 )
 from models import (
-    Guild, GuildMember, GuildModule, PromoPost, FeaturedPool, FeaturedCreator, DiscoveryNetwork,
+    Guild, GuildMember, PromoPost, FeaturedPool, FeaturedCreator, DiscoveryNetwork,
     ServerListing, PromoTier, DiscoveryConfig, XPConfig, AnnouncedGame, FoundGame,
     GameSearchConfig, CreatorOfTheMonth, CreatorOfTheWeek
 )
 from utils import igdb
 
 DASHBOARD_BASE_URL = "https://dashboard.casual-heroes.com"
-
-
-def get_guild_tier(session, guild_id: int) -> str:
-    """Get the effective tier for a guild (FREE, PREMIUM, or PRO)."""
-    db_guild = session.get(Guild, guild_id)
-    if not db_guild:
-        return "FREE"
-    if db_guild.is_vip:
-        return "PRO"
-    return db_guild.subscription_tier.upper() if db_guild.subscription_tier else "FREE"
 
 
 def get_today_start_timestamp() -> int:
@@ -1734,19 +1724,6 @@ class DiscoveryCog(commands.Cog):
                         logger.warning(f"[COTW] Guild {guild_id} not found in database")
                         continue
 
-                    # Check for Discovery module subscription or Complete tier
-                    has_discovery_module = session.query(GuildModule).filter_by(
-                        guild_id=guild_id,
-                        module_name='discovery',
-                        enabled=True
-                    ).first() is not None
-
-                    has_access = True
-
-                    if not has_access:
-                        logger.warning(f"[COTW] Guild {guild_id} has COTW enabled but no Discovery module")
-                        continue
-
                     await self._select_and_announce_cotw(guild_id)
                     await asyncio.sleep(2)  # Small delay between guilds
 
@@ -1782,19 +1759,6 @@ class DiscoveryCog(commands.Cog):
                     guild_record = session.query(Guild).filter_by(guild_id=guild_id).first()
                     if not guild_record:
                         logger.warning(f"[COTM] Guild {guild_id} not found in database")
-                        continue
-
-                    # Check for Discovery module subscription or Complete tier
-                    has_discovery_module = session.query(GuildModule).filter_by(
-                        guild_id=guild_id,
-                        module_name='discovery',
-                        enabled=True
-                    ).first() is not None
-
-                    has_access = guild_record.subscription_tier == 'complete' or has_discovery_module
-
-                    if not has_access:
-                        logger.warning(f"[COTM] Guild {guild_id} has COTM enabled but no Discovery module or Complete tier")
                         continue
 
                     await self._select_and_announce_cotm(guild_id)
@@ -2786,7 +2750,6 @@ class DiscoveryCog(commands.Cog):
         """Check if you're in the featured pool and your promo history."""
         with db_session_scope() as session:
             db_member = session.get(GuildMember, (ctx.guild.id, ctx.author.id))
-            tier = get_guild_tier(session, ctx.guild.id)
 
             if not db_member:
                 await ctx.respond("You haven't earned any hero_tokens yet! Start chatting to earn XP.", ephemeral=True)

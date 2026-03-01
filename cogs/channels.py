@@ -17,65 +17,8 @@ import asyncio
 import discord
 from discord.ext import commands
 
-from config import db_session_scope, logger, get_debug_guilds, FeatureLimits
-from models import Guild, GuildModule, ChannelTemplate, ModAction, RoleTemplate
-
-
-def get_guild_tier(session, guild_id: int) -> str:
-    """Get the subscription tier for a guild."""
-    db_guild = session.get(Guild, guild_id)
-    if not db_guild:
-        return "FREE"
-    if db_guild.is_vip:
-        return "PRO"
-    return db_guild.subscription_tier.upper() if db_guild.subscription_tier else "FREE"
-
-
-def get_effective_tier(session, guild_id: int) -> str:
-    """
-    Get effective tier considering module subscriptions.
-    If guild has 'roles' module, treat as PREMIUM for feature limits.
-    """
-    tier = get_guild_tier(session, guild_id)
-    if tier != "FREE":
-        return tier
-
-    # Check for Roles module subscription - gives premium-level limits
-    has_roles_module = session.query(GuildModule).filter_by(
-        guild_id=guild_id,
-        module_name='roles',
-        enabled=True
-    ).first() is not None
-
-    if has_roles_module:
-        return "PREMIUM"  # Module subscribers get premium limits
-
-    return tier
-
-
-async def check_template_limit(ctx, session) -> tuple[bool, int | None]:
-    """Check if guild can create more templates. Uses effective tier for module support."""
-    tier = get_effective_tier(session, ctx.guild.id)
-    limit = FeatureLimits.get_limit(tier, "templates")
-
-    if limit is None:
-        return (True, None)
-
-    # Count total templates (role + channel combined)
-    role_count = session.query(RoleTemplate).filter(RoleTemplate.guild_id == ctx.guild.id).count()
-    channel_count = session.query(ChannelTemplate).filter(ChannelTemplate.guild_id == ctx.guild.id).count()
-    total = role_count + channel_count
-
-    if total >= limit:
-        upgrade_msg = FeatureLimits.get_upgrade_message("templates", tier)
-        await ctx.respond(
-            f"⚠️ **Template Limit Reached!** You have **{total}/{limit}** templates on the {tier} tier.\n\n"
-            f"⭐ {upgrade_msg}",
-            ephemeral=True
-        )
-        return (False, limit)
-
-    return (True, limit)
+from config import db_session_scope, logger, get_debug_guilds
+from models import Guild, ChannelTemplate, ModAction, RoleTemplate
 
 
 class ChannelsCog(commands.Cog):
@@ -167,10 +110,6 @@ class ChannelsCog(commands.Cog):
                 await ctx.respond(f"Template '{template_name}' already exists.", ephemeral=True)
                 return
 
-            # Check template limit
-            allowed, limit = await check_template_limit(ctx, session)
-            if not allowed:
-                return
 
             template = ChannelTemplate(
                 guild_id=ctx.guild.id,

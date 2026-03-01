@@ -44,7 +44,6 @@ from models import (
     RSSFeed,
     RSSFeedEntry,
     Guild,
-    GuildModule,
 )
 
 # Import requests for secure fetching (optional - falls back to feedparser if not available)
