@@ -57,6 +57,8 @@ async def force_guild_sync(request):
         if guild_id:
             try:
                 guild_id = int(guild_id)
+                if guild_id <= 0 or guild_id > 9223372036854775807:
+                    return web.json_response({'error': 'Invalid guild ID'}, status=400)
                 guild = bot_instance.get_guild(guild_id)
                 if not guild:
                     return web.json_response({'error': 'Guild not found'}, status=404)
@@ -196,11 +198,14 @@ async def mod_untimeout(request):
         if not guild_id_raw or not user_id_raw or not requester_id:
             return web.json_response({'error': 'guild_id, user_id, and requester_id are required'}, status=400)
 
-        # Convert to integers with error handling
+        # Convert to integers with bounds checking (Discord snowflakes are max 19 digits)
+        _MAX_SNOWFLAKE = 9223372036854775807
         try:
             guild_id = int(guild_id_raw)
             user_id = int(user_id_raw)
             requester_id = int(requester_id)
+            if not all(0 < x <= _MAX_SNOWFLAKE for x in (guild_id, user_id, requester_id)):
+                return web.json_response({'error': 'Invalid ID value'}, status=400)
         except (ValueError, TypeError) as e:
             logger.error(f"Invalid ID format in mod_untimeout: {e}")
             return web.json_response({'error': 'Invalid ID format - must be integers'}, status=400)

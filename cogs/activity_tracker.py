@@ -103,7 +103,7 @@ class ActivityTrackerCog(commands.Cog):
                         playing_count += 1
                         break
 
-            topic = f"{emoji_str}{tracker.label}: {total_count} members — {playing_count} currently playing"
+            topic = f"{emoji_str}{tracker.label}: {total_count} members - {playing_count} currently playing"
         else:
             topic = f"{emoji_str}{tracker.label}: {total_count} members"
 
