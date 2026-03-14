@@ -335,6 +335,8 @@ class XPCog(commands.Cog):
         db_member.level = new_level
 
         # Dual-write: keep web_users.web_xp unified if this Discord user has a linked QuestLog account
+        # Also detect if the unified web level went up - if so, surface it so this guild sends a notification.
+        notify_old_level = old_level
         try:
             from sqlalchemy import text as sa_text
             import time as _time
@@ -395,6 +397,12 @@ class XPCog(commands.Cog):
                     ),
                     {"xp": new_web_xp, "lvl": new_web_level, "hp": new_hp, "uid": web_row.id},
                 )
+
+                # If web level went up but guild-local didn't, surface the web level-up so
+                # this guild fires a level-up notification. Each guild handles its own notify.
+                if new_web_level > old_web_level and new_level <= old_level:
+                    new_level = new_web_level
+                    notify_old_level = old_web_level
         except Exception as _e:
             logger.debug(f"web_xp dual-write skipped for user_id={user_id}: {_e}")
 
@@ -403,7 +411,7 @@ class XPCog(commands.Cog):
             f"old_level={old_level}, new_level={new_level}, tokens={token_diff}"
         )
 
-        return (old_level, new_level, db_member.hero_tokens, token_diff)
+        return (notify_old_level, new_level, db_member.hero_tokens, token_diff)
 
     async def send_level_up_notification(self, guild: discord.Guild, member: discord.Member,
                                          old_level: int, new_level: int,
