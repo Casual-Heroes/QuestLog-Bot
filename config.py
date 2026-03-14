@@ -322,6 +322,11 @@ class DefaultVerificationSettings:
     KICK_ON_TIMEOUT = False
 
 
+# QuestLog internal API (for bridge relay and other cross-platform features)
+QUESTLOG_INTERNAL_API_URL = os.getenv("QUESTLOG_INTERNAL_API_URL", "https://casual-heroes.com/ql")
+QUESTLOG_BOT_SECRET = os.getenv("QUESTLOG_BOT_SECRET", "")
+MATRIX_ACCESS_TOKEN = os.getenv("MATRIX_ACCESS_TOKEN", "")
+
 # Environment
 IS_PRODUCTION = os.getenv("ENVIRONMENT", "development").lower() == "production"
 DEBUG_GUILD_ID = int(os.getenv("DEBUG_GUILD_ID", 0)) if os.getenv("DEBUG_GUILD_ID") else None

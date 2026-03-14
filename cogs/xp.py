@@ -334,6 +334,70 @@ class XPCog(commands.Cog):
         new_level = XPCog.calculate_level(session, db_member.xp, xp_config["max_level"])
         db_member.level = new_level
 
+        # Dual-write: keep web_users.web_xp unified if this Discord user has a linked QuestLog account
+        try:
+            from sqlalchemy import text as sa_text
+            import time as _time
+            # Map WardenBot source names to web_xp_events action types
+            _source_to_action = {
+                "messages": "discord_message",
+                "media":    "discord_media",
+                "reactions":"discord_reaction",
+                "voice":    "discord_voice",
+                "gaming":   "discord_gaming",
+                "game_launch": "discord_gaming",
+            }
+            web_action = _source_to_action.get(source, "discord_message")
+            web_ref_id = f"discord_{guild_id}_{user_id}_{int(_time.time())}"
+
+            web_row = session.execute(
+                sa_text("SELECT id, web_xp, web_level, hero_points FROM web_users WHERE discord_id = :did LIMIT 1"),
+                {"did": str(user_id)},
+            ).fetchone()
+            if web_row:
+                old_web_xp = web_row.web_xp or 0
+                old_web_level = web_row.web_level or 1
+                new_web_xp = old_web_xp + int(final_xp)
+
+                # Calculate new level using same formula as site
+                web_lv = 1
+                while web_lv < 99:
+                    if new_web_xp < int(7 * ((web_lv + 1) ** 1.5)):
+                        break
+                    web_lv += 1
+                new_web_level = web_lv
+
+                # HP: award 10 HP per 50 XP threshold crossed
+                old_thresholds = old_web_xp // 50
+                new_thresholds = new_web_xp // 50
+                hp_gain = int((new_thresholds - old_thresholds) * 10)
+
+                # HP: bonus for level-up (5 HP per level gained)
+                if new_web_level > old_web_level:
+                    hp_gain += (new_web_level - old_web_level) * 5
+
+                new_hp = (web_row.hero_points or 0) + hp_gain
+
+                # Log to web_xp_events
+                session.execute(
+                    sa_text(
+                        "INSERT INTO web_xp_events (user_id, action_type, xp, source, ref_id, created_at) "
+                        "VALUES (:uid, :at, :xp, 'discord', :ref, :ts)"
+                    ),
+                    {"uid": web_row.id, "at": web_action, "xp": int(final_xp),
+                     "ref": web_ref_id, "ts": int(_time.time())},
+                )
+
+                # Update unified totals
+                session.execute(
+                    sa_text(
+                        "UPDATE web_users SET web_xp = :xp, web_level = :lvl, hero_points = :hp WHERE id = :uid"
+                    ),
+                    {"xp": new_web_xp, "lvl": new_web_level, "hp": new_hp, "uid": web_row.id},
+                )
+        except Exception as _e:
+            logger.debug(f"web_xp dual-write skipped for user_id={user_id}: {_e}")
+
         logger.debug(
             f"XP Award: guild={guild_id}, user={user_id}, amount={amount}, "
             f"old_level={old_level}, new_level={new_level}, tokens={token_diff}"
@@ -617,6 +681,9 @@ class XPCog(commands.Cog):
     async def on_message(self, message: discord.Message):
         """Award XP for messages."""
         if message.author.bot or not message.guild:
+            return
+        # Never award XP for bridged messages - XP is earned on the origin platform only
+        if message.content and message.content.startswith(('**[D]', '**[F]', '**[M]', '[D]', '[F]', '[M]')):
             return
 
         guild_id = message.guild.id
@@ -1058,7 +1125,10 @@ class XPCog(commands.Cog):
         member: discord.Member = None
     ):
         """View XP profile."""
+        from sqlalchemy import text as sa_text
         target = member or ctx.author
+        guild_id_str = str(ctx.guild.id)
+        user_id_str = str(target.id)
 
         with db_session_scope() as session:
             db_member = session.get(GuildMember, (ctx.guild.id, target.id))
@@ -1075,65 +1145,140 @@ class XPCog(commands.Cog):
             db_guild = session.get(Guild, ctx.guild.id)
             token_name = db_guild.token_name if db_guild and db_guild.token_name else "Hero Tokens"
 
-            embed = discord.Embed(
-                title=f"📊 {target.display_name}'s Profile",
-                color=discord.Color.gold()
-            )
-
-            embed.add_field(name="🏆 Level", value=f"**{db_member.level}**", inline=True)
-            embed.add_field(name="⭐ XP", value=f"**{db_member.xp:,.0f}**", inline=True)
-            embed.add_field(name=f"🪙 {token_name}", value=f"**{db_member.hero_tokens}**", inline=True)
-
-            embed.add_field(
-                name="📈 Activity",
-                value=(
-                    f"Messages: {db_member.message_count}\n"
-                    f"  └ Media: {db_member.media_count}\n"
-                    f"Voice: {db_member.voice_minutes} min\n"
-                    f"Reactions: {db_member.reaction_count}"
+            # Check if guild is in the QuestLog Network
+            network_row = session.execute(
+                sa_text(
+                    "SELECT id FROM web_communities "
+                    "WHERE platform='discord' AND platform_id=:g AND network_status='approved' LIMIT 1"
                 ),
-                inline=True
-            )
+                {"g": guild_id_str},
+            ).fetchone()
+            is_network = network_row is not None
+
+            # Fetch unified QuestLog profile if network-approved
+            unified_row = None
+            if is_network:
+                unified_row = session.execute(
+                    sa_text(
+                        "SELECT web_xp, web_level, hero_points, username "
+                        "FROM web_users WHERE discord_id=:did LIMIT 1"
+                    ),
+                    {"did": user_id_str},
+                ).fetchone()
+
+            # Build embed
+            if is_network and unified_row:
+                embed = discord.Embed(
+                    title=f"📊 {target.display_name}'s QuestLog Profile",
+                    url=f"https://casual-heroes.com/ql/profile/{unified_row.username}/",
+                    color=0x6366F1,
+                )
+                embed.add_field(name="🌐 QuestLog XP", value=f"**{unified_row.web_xp:,.0f}**", inline=True)
+                embed.add_field(name="🏆 QL Level", value=f"**{unified_row.web_level}**", inline=True)
+                embed.add_field(name="🪙 Hero Points", value=f"**{unified_row.hero_points}**", inline=True)
+                embed.add_field(
+                    name="📈 Server Activity",
+                    value=(
+                        f"Messages: {db_member.message_count}\n"
+                        f"  └ Media: {db_member.media_count}\n"
+                        f"Voice: {db_member.voice_minutes} min\n"
+                        f"Reactions: {db_member.reaction_count}"
+                    ),
+                    inline=True,
+                )
+                embed.set_footer(text="QuestLog Network - unified profile | casual-heroes.com/ql/")
+            else:
+                embed = discord.Embed(
+                    title=f"📊 {target.display_name}'s Profile",
+                    color=discord.Color.gold(),
+                )
+                embed.add_field(name="🏆 Level", value=f"**{db_member.level}**", inline=True)
+                embed.add_field(name="⭐ XP", value=f"**{db_member.xp:,.0f}**", inline=True)
+                embed.add_field(name=f"🪙 {token_name}", value=f"**{db_member.hero_tokens}**", inline=True)
+                embed.add_field(
+                    name="📈 Activity",
+                    value=(
+                        f"Messages: {db_member.message_count}\n"
+                        f"  └ Media: {db_member.media_count}\n"
+                        f"Voice: {db_member.voice_minutes} min\n"
+                        f"Reactions: {db_member.reaction_count}"
+                    ),
+                    inline=True,
+                )
+                if is_network:
+                    # Guild is in network but user hasn't linked their QuestLog account
+                    embed.add_field(
+                        name="",
+                        value="[Link your QuestLog account](https://casual-heroes.com/ql/) to see your unified profile!",
+                        inline=False,
+                    )
+                    embed.set_footer(text="QuestLog Network server | casual-heroes.com/ql/")
+                else:
+                    embed.set_footer(text="Earn XP by chatting, voice, reactions, and more!")
 
             embed.set_thumbnail(url=target.display_avatar.url)
-            embed.set_footer(text="Earn XP by chatting, voice, reactions, and more!")
 
         await ctx.respond(embed=embed, ephemeral=True)
 
     @xp.command(name="leaderboard", description="View server XP leaderboard")
     async def xp_leaderboard(self, ctx: discord.ApplicationContext):
-        """View leaderboard."""
+        """View leaderboard. Uses unified leaderboard if guild is opted in to QuestLog Network."""
+        from sqlalchemy import text as sa_text
+        guild_id_str = str(ctx.guild.id)
+
         with db_session_scope() as session:
-            top_members = (
-                session.query(GuildMember)
-                .filter(GuildMember.guild_id == ctx.guild.id)
-                .order_by(GuildMember.xp.desc())
-                .limit(10)
-                .all()
-            )
+            # Check if this Discord guild is opted in to unified XP
+            community = session.execute(
+                sa_text(
+                    "SELECT site_xp_to_guild FROM web_communities "
+                    "WHERE platform='discord' AND platform_id=:g AND network_status='approved' AND is_active=1 LIMIT 1"
+                ),
+                {"g": guild_id_str}
+            ).fetchone()
+            is_unified = bool(community and community[0])
 
-            if not top_members:
-                await ctx.respond("No one has earned XP yet!", ephemeral=True)
-                return
-
-            embed = discord.Embed(
-                title=f"🏆 {ctx.guild.name} Leaderboard",
-                color=discord.Color.gold()
-            )
-
-            leaderboard_text = ""
-            medals = ["🥇", "🥈", "🥉"]
-
-            for i, member in enumerate(top_members):
-                medal = medals[i] if i < 3 else f"**{i+1}.**"
-                name = member.display_name or f"User {member.user_id}"
-                leaderboard_text += (
-                    f"{medal} {name} - Level **{member.level}** "
-                    f"({member.xp:,.0f} XP)\n"
+            if is_unified:
+                rows = session.execute(
+                    sa_text(
+                        "SELECT wu.username, ul.xp_total, wu.web_level "
+                        "FROM web_unified_leaderboard ul "
+                        "JOIN web_users wu ON wu.id = ul.user_id "
+                        "WHERE ul.guild_id = :g AND ul.platform = 'discord' "
+                        "ORDER BY ul.xp_total DESC LIMIT 10"
+                    ),
+                    {"g": guild_id_str}
+                ).fetchall()
+                title = f"🏆 {ctx.guild.name} - Unified Leaderboard"
+                footer = "QuestLog Network - unified XP across all platforms | casual-heroes.com/ql/"
+            else:
+                top_members = (
+                    session.query(GuildMember)
+                    .filter(GuildMember.guild_id == ctx.guild.id)
+                    .order_by(GuildMember.xp.desc())
+                    .limit(10)
+                    .all()
                 )
+                rows = [(m.display_name or f"User {m.user_id}", m.xp, m.level) for m in top_members]
+                title = f"🏆 {ctx.guild.name} Leaderboard"
+                footer = "Earn XP by chatting, reacting, and joining voice!"
 
-            embed.description = leaderboard_text
+        if not rows:
+            await ctx.respond("No one has earned XP yet!", ephemeral=True)
+            return
 
+        medals = ["🥇", "🥈", "🥉"]
+        lines = []
+        for i, row in enumerate(rows):
+            medal = medals[i] if i < 3 else f"**{i+1}.**"
+            name, xp, level = row[0], row[1], row[2]
+            lines.append(f"{medal} **{name}** - Level **{level}** ({xp:,.0f} XP)")
+
+        embed = discord.Embed(
+            title=title,
+            description="\n".join(lines),
+            color=discord.Color.gold()
+        )
+        embed.set_footer(text=footer)
         await ctx.respond(embed=embed)
 
     # Admin commands
