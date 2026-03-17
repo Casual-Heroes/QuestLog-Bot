@@ -267,57 +267,56 @@ class BridgeCog(commands.Cog):
         except Exception as e:
             logger.debug(f"BridgeCog (Discord): reaction relay error: {e}")
 
-    # DISABLED - typing relay not shipped yet
-    # @commands.Cog.listener()
-    # async def on_typing(self, channel, user, when):
-    #     """Relay Discord typing indicators to Matrix rooms via Matrix HTTP API."""
-    #     if not MATRIX_ACCESS_TOKEN:
-    #         return
-    #     if user.bot:
-    #         return
-    #
-    #     channel_id = str(channel.id)
-    #     try:
-    #         if not self._session or self._session.closed:
-    #             return
-    #         # Ask hub which Matrix rooms this Discord channel bridges to
-    #         async with self._session.post(
-    #             _TYPING_URL,
-    #             json={'source_platform': 'discord', 'discord_channel_id': channel_id, 'typing_users': [str(user)]},
-    #             headers=_HEADERS,
-    #             timeout=aiohttp.ClientTimeout(total=3),
-    #         ) as resp:
-    #             if resp.status != 200:
-    #                 return
-    #             data = await resp.json()
-    #
-    #         mx_user = f'@wardenbot:{MATRIX_HOMESERVER.split("//")[-1].rstrip("/")}'
-    #         matrix_headers = {
-    #             'Authorization': f'Bearer {MATRIX_ACCESS_TOKEN}',
-    #             'Content-Type': 'application/json',
-    #         }
-    #         homeserver = MATRIX_HOMESERVER.rstrip('/')
-    #         for target in data.get('targets', []):
-    #             if target.get('platform') != 'matrix':
-    #                 continue
-    #             room_id = target.get('channel_id', '')
-    #             if not room_id:
-    #                 continue
-    #             encoded_room = urllib.parse.quote(room_id, safe='')
-    #             encoded_user = urllib.parse.quote(mx_user, safe='')
-    #             url = f'{homeserver}/_matrix/client/v3/rooms/{encoded_room}/typing/{encoded_user}'
-    #             try:
-    #                 async with self._session.put(
-    #                     url,
-    #                     json={'typing': True, 'timeout': _MATRIX_TYPING_TIMEOUT_MS},
-    #                     headers=matrix_headers,
-    #                     timeout=aiohttp.ClientTimeout(total=3),
-    #                 ) as _:
-    #                     pass  # best-effort
-    #             except Exception:
-    #                 pass
-    #     except Exception as e:
-    #         logger.debug(f"BridgeCog (Discord): typing relay error: {e}")
+    @commands.Cog.listener()
+    async def on_typing(self, channel, user, when):
+        """Relay Discord typing indicators to Matrix rooms via Matrix HTTP API."""
+        if not MATRIX_ACCESS_TOKEN:
+            return
+        if user.bot:
+            return
+
+        channel_id = str(channel.id)
+        try:
+            if not self._session or self._session.closed:
+                return
+            # Ask hub which Matrix rooms this Discord channel bridges to
+            async with self._session.post(
+                _TYPING_URL,
+                json={'source_platform': 'discord', 'discord_channel_id': channel_id, 'typing_users': [str(user)]},
+                headers=_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=3),
+            ) as resp:
+                if resp.status != 200:
+                    return
+                data = await resp.json()
+
+            mx_user = f'@wardenbot:{MATRIX_HOMESERVER.split("//")[-1].rstrip("/")}'
+            matrix_headers = {
+                'Authorization': f'Bearer {MATRIX_ACCESS_TOKEN}',
+                'Content-Type': 'application/json',
+            }
+            homeserver = MATRIX_HOMESERVER.rstrip('/')
+            for target in data.get('targets', []):
+                if target.get('platform') != 'matrix':
+                    continue
+                room_id = target.get('channel_id', '')
+                if not room_id:
+                    continue
+                encoded_room = urllib.parse.quote(room_id, safe='')
+                encoded_user = urllib.parse.quote(mx_user, safe='')
+                url = f'{homeserver}/_matrix/client/v3/rooms/{encoded_room}/typing/{encoded_user}'
+                try:
+                    async with self._session.put(
+                        url,
+                        json={'typing': True, 'timeout': _MATRIX_TYPING_TIMEOUT_MS},
+                        headers=matrix_headers,
+                        timeout=aiohttp.ClientTimeout(total=3),
+                    ) as _:
+                        pass  # best-effort
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"BridgeCog (Discord): typing relay error: {e}")
 
     async def _poll_loop(self):
         """Poll hub every 3s for messages; every 6s for reactions."""
