@@ -32,12 +32,13 @@
 import asyncio
 import logging
 import re
+import urllib.parse
 
 import aiohttp
 import discord
 from discord.ext import commands
 
-from config import logger, QUESTLOG_INTERNAL_API_URL, QUESTLOG_BOT_SECRET, MATRIX_ACCESS_TOKEN
+from config import logger, QUESTLOG_INTERNAL_API_URL, QUESTLOG_BOT_SECRET, MATRIX_ACCESS_TOKEN, MATRIX_HOMESERVER
 
 _BASE = QUESTLOG_INTERNAL_API_URL.rstrip('/')
 _RELAY_URL              = _BASE + '/api/internal/bridge/relay/'
@@ -50,6 +51,8 @@ _DELETE_URL             = _BASE + '/api/internal/bridge/delete/'
 _PENDING_DELETIONS_URL  = _BASE + '/api/internal/bridge/pending-deletions/discord/'
 
 _HEADERS = {'X-Bot-Secret': QUESTLOG_BOT_SECRET, 'Content-Type': 'application/json'}
+_TYPING_URL = _BASE + '/api/internal/bridge/typing/'
+_MATRIX_TYPING_TIMEOUT_MS = 8000  # Matrix typing indicator expires after 8 seconds
 
 _RELAY_PREFIXES = ('**[D]', '**[F]', '**[M]', '[D]', '[F]', '[M]')
 
@@ -264,6 +267,58 @@ class BridgeCog(commands.Cog):
         except Exception as e:
             logger.debug(f"BridgeCog (Discord): reaction relay error: {e}")
 
+    # DISABLED - typing relay not shipped yet
+    # @commands.Cog.listener()
+    # async def on_typing(self, channel, user, when):
+    #     """Relay Discord typing indicators to Matrix rooms via Matrix HTTP API."""
+    #     if not MATRIX_ACCESS_TOKEN:
+    #         return
+    #     if user.bot:
+    #         return
+    #
+    #     channel_id = str(channel.id)
+    #     try:
+    #         if not self._session or self._session.closed:
+    #             return
+    #         # Ask hub which Matrix rooms this Discord channel bridges to
+    #         async with self._session.post(
+    #             _TYPING_URL,
+    #             json={'source_platform': 'discord', 'discord_channel_id': channel_id, 'typing_users': [str(user)]},
+    #             headers=_HEADERS,
+    #             timeout=aiohttp.ClientTimeout(total=3),
+    #         ) as resp:
+    #             if resp.status != 200:
+    #                 return
+    #             data = await resp.json()
+    #
+    #         mx_user = f'@wardenbot:{MATRIX_HOMESERVER.split("//")[-1].rstrip("/")}'
+    #         matrix_headers = {
+    #             'Authorization': f'Bearer {MATRIX_ACCESS_TOKEN}',
+    #             'Content-Type': 'application/json',
+    #         }
+    #         homeserver = MATRIX_HOMESERVER.rstrip('/')
+    #         for target in data.get('targets', []):
+    #             if target.get('platform') != 'matrix':
+    #                 continue
+    #             room_id = target.get('channel_id', '')
+    #             if not room_id:
+    #                 continue
+    #             encoded_room = urllib.parse.quote(room_id, safe='')
+    #             encoded_user = urllib.parse.quote(mx_user, safe='')
+    #             url = f'{homeserver}/_matrix/client/v3/rooms/{encoded_room}/typing/{encoded_user}'
+    #             try:
+    #                 async with self._session.put(
+    #                     url,
+    #                     json={'typing': True, 'timeout': _MATRIX_TYPING_TIMEOUT_MS},
+    #                     headers=matrix_headers,
+    #                     timeout=aiohttp.ClientTimeout(total=3),
+    #                 ) as _:
+    #                     pass  # best-effort
+    #             except Exception:
+    #                 pass
+    #     except Exception as e:
+    #         logger.debug(f"BridgeCog (Discord): typing relay error: {e}")
+
     async def _poll_loop(self):
         """Poll hub every 3s for messages; every 6s for reactions."""
         await asyncio.sleep(8)  # Wait for bot ready and session init
@@ -323,7 +378,8 @@ class BridgeCog(commands.Cog):
             if not channel_id_str or (not content and not attachments):
                 continue
 
-            if reply_quote:
+            # Only include the blockquote if we can't do a native reply
+            if reply_quote and not reply_to_event_id:
                 formatted = f"> {reply_quote}\n**[{tag}] {author}:** {content}"
             else:
                 formatted = f"**[{tag}] {author}:** {content}".rstrip()

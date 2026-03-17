@@ -1626,6 +1626,7 @@ class LFGGroup(Base):
     dps_needed = Column(Integer, nullable=True)
     support_needed = Column(Integer, nullable=True)
     enforce_role_limits = Column(Boolean, default=True)  # If True, can't exceed role counts
+    recurrence = Column(String(20), nullable=True, default='none')  # none, daily, weekly, monthly
 
     # Status
     is_active = Column(Boolean, default=True)

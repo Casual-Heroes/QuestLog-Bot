@@ -435,10 +435,10 @@ class RolesCog(commands.Cog):
             return
 
         await ctx.defer(ephemeral=True)
-            await ctx.followup.send(
-                f"📊 Processing first **{limit}** members (tier limit). Upgrade for more!",
-                ephemeral=True
-            )
+        await ctx.followup.send(
+            f"📊 Processing first **{limit}** members (tier limit). Upgrade for more!",
+            ephemeral=True
+        )
 
         await ctx.followup.send(f"⏳ Removing **{role.name}** from **{len(members)}** members...", ephemeral=True)
 

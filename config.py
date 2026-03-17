@@ -326,6 +326,7 @@ class DefaultVerificationSettings:
 QUESTLOG_INTERNAL_API_URL = os.getenv("QUESTLOG_INTERNAL_API_URL", "https://casual-heroes.com/ql")
 QUESTLOG_BOT_SECRET = os.getenv("QUESTLOG_BOT_SECRET", "")
 MATRIX_ACCESS_TOKEN = os.getenv("MATRIX_ACCESS_TOKEN", "")
+MATRIX_HOMESERVER = os.getenv("MATRIX_HOMESERVER", "https://matrix.casual-heroes.com")
 
 # Environment
 IS_PRODUCTION = os.getenv("ENVIRONMENT", "development").lower() == "production"

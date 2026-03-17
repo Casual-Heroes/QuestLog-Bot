@@ -106,51 +106,139 @@ class NetworkBroadcastsCog(commands.Cog):
                 )
 
             if ids_to_delete:
+                placeholders = ','.join(str(i) for i in ids_to_delete)
                 session.execute(
-                    text("DELETE FROM discord_pending_broadcasts WHERE id IN :ids"),
-                    {"ids": tuple(ids_to_delete)}
+                    text(f"DELETE FROM discord_pending_broadcasts WHERE id IN ({placeholders})")
                 )
 
+    def _build_embed(self, embed_data: dict) -> discord.Embed:
+        """Build a discord.Embed from a payload dict."""
+        embed = discord.Embed(
+            title=embed_data.get("title", "New LFG Post"),
+            description=embed_data.get("description", ""),
+            url=embed_data.get("url") or None,
+            color=embed_data.get("color", BRAND_COLOR),
+        )
+        for field in embed_data.get("fields", []):
+            embed.add_field(
+                name=field.get("name", ""),
+                value=field.get("value", ""),
+                inline=field.get("inline", True),
+            )
+        if embed_data.get("thumbnail"):
+            embed.set_thumbnail(url=embed_data["thumbnail"])
+        embed.set_footer(text=embed_data.get("footer", "QuestLog Network"))
+        return embed
+
     async def _post_embed(self, row_id, guild_id, channel_id, embed_data):
-        """Build and post a Discord embed from the site payload."""
+        """Build and post a Discord embed from the site payload, creating a thread."""
         try:
             guild = self.bot.get_guild(guild_id)
             if not guild:
                 logger.debug(f"[NetworkBroadcasts] Guild {guild_id} not in cache, skipping row {row_id}")
                 return
 
+            action = embed_data.get("action", "post")
+            track_group_id = embed_data.get("track_group_id")
+            track_group_platform = embed_data.get("track_group_platform", "web")
+
+            # --- Edit existing thread message in-place ---
+            if action == "edit" and track_group_id:
+                try:
+                    with db_session_scope() as session:
+                        existing = session.execute(
+                            text(
+                                "SELECT message_id, thread_id, channel_id FROM web_lfg_channel_messages "
+                                "WHERE group_id=:gid AND group_platform=:gp AND platform='discord' AND guild_id=:guild "
+                                "LIMIT 1"
+                            ),
+                            {"gid": int(track_group_id), "gp": track_group_platform, "guild": str(guild_id)},
+                        ).fetchone()
+                except Exception as db_err:
+                    logger.warning(f"[NetworkBroadcasts] DB lookup failed for edit row {row_id}: {db_err}")
+                    return
+
+                if not existing:
+                    logger.debug(f"[NetworkBroadcasts] No stored message for group {track_group_id} in guild {guild_id}, skipping edit")
+                    return
+
+                stored_msg_id, stored_thread_id, stored_ch_id = existing
+                # Edit happens in the thread if we have one, else the channel
+                target_channel_id = int(stored_thread_id) if stored_thread_id else int(stored_ch_id)
+                target_ch = guild.get_channel(target_channel_id) or await guild.fetch_channel(target_channel_id)
+                if not target_ch:
+                    return
+
+                embed = self._build_embed(embed_data)
+                try:
+                    msg = await target_ch.fetch_message(int(stored_msg_id))
+                    await msg.edit(embed=embed)
+                    pin_state = embed_data.get("pin_state")
+                    if pin_state == "unpin":
+                        await msg.unpin()
+                    elif pin_state == "pin":
+                        await msg.pin()
+                    logger.info(f"[NetworkBroadcasts] Edited embed for group {track_group_id} in guild {guild.name}")
+                except Exception as edit_err:
+                    logger.warning(f"[NetworkBroadcasts] Failed to edit message {stored_msg_id}: {edit_err}")
+                return
+
+            # --- Post new: create thread in the channel, post embed inside, pin it ---
             channel = guild.get_channel(channel_id)
             if not channel or not isinstance(channel, discord.TextChannel):
                 logger.debug(f"[NetworkBroadcasts] Channel {channel_id} not found in guild {guild_id}")
                 return
 
-            embed = discord.Embed(
-                title=embed_data.get("title", "New LFG Post"),
-                description=embed_data.get("description", ""),
-                url=embed_data.get("url") or None,
-                color=embed_data.get("color", BRAND_COLOR),
+            thread_name = embed_data.get("thread_name") or embed_data.get("title", "LFG Group")
+            thread_name = thread_name[:100]  # Discord 100-char limit
+
+            thread = await channel.create_thread(
+                name=thread_name,
+                type=discord.ChannelType.public_thread,
+                auto_archive_duration=10080,  # 7 days
             )
+            logger.info(f"[NetworkBroadcasts] Created thread '{thread.name}' in {guild.name} #{channel.name}")
 
-            for field in embed_data.get("fields", []):
-                embed.add_field(
-                    name=field.get("name", ""),
-                    value=field.get("value", ""),
-                    inline=field.get("inline", True),
-                )
+            embed = self._build_embed(embed_data)
+            sent = await thread.send(embed=embed)
+            await sent.pin()
+            logger.info(f"[NetworkBroadcasts] Posted + pinned embed in thread {thread.id}")
 
-            if embed_data.get("thumbnail"):
-                embed.set_thumbnail(url=embed_data["thumbnail"])
-
-            footer = embed_data.get("footer", "QuestLog Network")
-            embed.set_footer(text=footer)
-
-            await channel.send(embed=embed)
-            logger.info(f"[NetworkBroadcasts] Posted LFG embed to {guild.name} #{channel.name}")
+            # Store thread_id and message_id
+            if track_group_id and sent:
+                now_ts = int(time.time())
+                try:
+                    with db_session_scope() as session:
+                        session.execute(
+                            text(
+                                "DELETE FROM web_lfg_channel_messages "
+                                "WHERE group_id=:gid AND group_platform=:gp AND platform='discord' AND guild_id=:guild"
+                            ),
+                            {"gid": int(track_group_id), "gp": track_group_platform, "guild": str(guild_id)},
+                        )
+                        session.execute(
+                            text(
+                                "INSERT INTO web_lfg_channel_messages "
+                                "(group_id, group_platform, platform, guild_id, channel_id, message_id, thread_id, created_at) "
+                                "VALUES (:gid, :gp, 'discord', :guild, :ch, :mid, :tid, :ts)"
+                            ),
+                            {
+                                "gid": int(track_group_id),
+                                "gp": track_group_platform,
+                                "guild": str(guild_id),
+                                "ch": str(channel_id),
+                                "mid": str(sent.id),
+                                "tid": str(thread.id),
+                                "ts": now_ts,
+                            },
+                        )
+                except Exception as db_err:
+                    logger.warning(f"[NetworkBroadcasts] Failed to store thread/message ID for group {track_group_id}: {db_err}")
 
         except discord.Forbidden:
-            logger.warning(f"[NetworkBroadcasts] No permission to post in channel {channel_id} (guild {guild_id})")
+            logger.warning(f"[NetworkBroadcasts] No permission in channel {channel_id} (guild {guild_id})")
         except discord.HTTPException as e:
-            logger.error(f"[NetworkBroadcasts] HTTP error posting to {channel_id}: {e}")
+            logger.error(f"[NetworkBroadcasts] HTTP error for {channel_id}: {e}")
         except Exception as e:
             logger.error(f"[NetworkBroadcasts] Unexpected error posting row {row_id}: {e}", exc_info=True)
 
