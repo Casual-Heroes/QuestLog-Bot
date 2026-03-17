@@ -305,7 +305,9 @@ class GroupManagementView(discord.ui.View):
 
         # Add generic role dropdown for raids when not using built-in detection
         # (Built-in games like WoW/FFXIV use Class/Spec to determine role)
-        if getattr(self.group, 'is_raid', False):
+        # Skip if custom_options already has a "Role" field (survival games - they use OptionSelect for role)
+        has_custom_role_option = any(o.get("name", "").lower() == "role" for o in self.custom_options)
+        if getattr(self.group, 'is_raid', False) and not has_custom_role_option:
             game_name = self.game.game_name if self.game else ""
             game_type = get_builtin_game_type(game_name)
 
@@ -333,7 +335,7 @@ class GroupManagementView(discord.ui.View):
     def build_embed(self) -> discord.Embed:
         embed = discord.Embed(
             title=f"{self.game.game_emoji or ''} {self.game.game_name} LFG",
-            color=discord.Color.green()
+            color=discord.Color.purple()
         )
 
         # Build description with group info in a clean format
@@ -402,6 +404,31 @@ class GroupManagementView(discord.ui.View):
             duration_text = "—"
         embed.add_field(name="⏱️ Duration", value=duration_text, inline=True)
 
+        # Group-level fields from creator: Platform, Level Range, Experience, Server Type
+        platform_val = creator_options.get("Platform", "")
+        if isinstance(platform_val, list): platform_val = ", ".join(platform_val) if platform_val else ""
+        level_range_val = creator_options.get("Level Range", "")
+        if isinstance(level_range_val, list): level_range_val = ", ".join(level_range_val) if level_range_val else ""
+        experience_val = creator_options.get("Experience", "")
+        if isinstance(experience_val, list): experience_val = ", ".join(experience_val) if experience_val else ""
+        server_type_val = creator_options.get("Server Type", "")
+        if isinstance(server_type_val, list): server_type_val = ", ".join(server_type_val) if server_type_val else ""
+
+        if platform_val:
+            embed.add_field(name="🖥️ Platform", value=platform_val, inline=True)
+        if level_range_val:
+            embed.add_field(name="📊 Level Range", value=level_range_val, inline=True)
+        if experience_val:
+            embed.add_field(name="⭐ Experience", value=experience_val, inline=True)
+        if server_type_val:
+            embed.add_field(name="🌐 Server Type", value=server_type_val, inline=True)
+
+        # Recurrence
+        recurrence = getattr(self.group, 'recurrence', None) or 'none'
+        if recurrence and recurrence != 'none':
+            recurrence_labels = {'daily': '📅 Daily', 'weekly': '🔁 Weekly', 'monthly': '📆 Monthly'}
+            embed.add_field(name="🔁 Recurrence", value=recurrence_labels.get(recurrence, recurrence.title()), inline=True)
+
         # Check if group has role composition
         tanks_needed = getattr(self.group, 'tanks_needed', 0) or 0
         healers_needed = getattr(self.group, 'healers_needed', 0) or 0
@@ -460,13 +487,15 @@ class GroupManagementView(discord.ui.View):
                 else:
                     display_spec = ""
 
-                # For custom games, collect all selections except Activity and Role
-                # (Role is redundant since it's shown by which column you're in)
+                # For custom games, collect all selections except group-level fields and role
+                # Group-level fields (Activity, Role, Platform, Experience, Server Type) are shown
+                # as their own embed fields, not per-member
+                _GROUP_LEVEL_FIELDS = ('activity', 'role', 'platform', 'memberplatform', 'level range', 'experience', 'server type')
                 if not display_spec and options:
                     selection_parts = []
                     for key, value in options.items():
                         key_lower = key.lower()
-                        if key_lower == 'activity' or key_lower == 'role':
+                        if key_lower in _GROUP_LEVEL_FIELDS:
                             continue
                         if isinstance(value, list) and value:
                             selection_parts.append(value[0])
@@ -475,9 +504,18 @@ class GroupManagementView(discord.ui.View):
                     if selection_parts:
                         display_spec = ", ".join(selection_parts)
 
+                # Append per-member platform if set
+                member_platform = options.get("MemberPlatform", "")
+                if isinstance(member_platform, list):
+                    member_platform = member_platform[0] if member_platform else ""
+
                 # Shorter format for role columns
-                if display_spec:
+                if display_spec and member_platform:
+                    member_line = f"<@{uid}> • {display_spec}, {member_platform}"
+                elif display_spec:
                     member_line = f"<@{uid}> • {display_spec}"
+                elif member_platform:
+                    member_line = f"<@{uid}> • {member_platform}"
                 else:
                     member_line = f"<@{uid}>"
 
@@ -673,15 +711,22 @@ class GroupManagementView(discord.ui.View):
                         else:
                             skip_keys = set()
 
-                        # Add remaining options (excluding Activity and Role which are redundant)
+                        # Add remaining options - exclude all group-level fields
+                        _GROUP_LEVEL = ('activity', 'role', 'platform', 'level range', 'experience', 'server type')
+                        member_platform_val = ""
                         for k, v in options.items():
                             if k in skip_keys:
                                 continue
-                            if k.lower() in ('activity', 'role'):
+                            if k.lower() in _GROUP_LEVEL:
+                                continue
+                            if k == 'MemberPlatform':
+                                member_platform_val = v[0] if isinstance(v, list) and v else str(v) if v else ""
                                 continue
                             value = v[0] if isinstance(v, list) and len(v) > 0 else v
                             if value:
                                 formatted_parts.append(str(value))
+                        if member_platform_val:
+                            formatted_parts.append(member_platform_val)
 
                         # Use bullet format to match website: "@user • Class - Spec"
                         if formatted_parts:
@@ -1829,6 +1874,33 @@ class EventDurationSelect(discord.ui.Select):
             asyncio.create_task(_auto_delete_after(interaction))
 
 
+class RecurrenceSelect(discord.ui.Select):
+    """Dropdown for selecting group recurrence schedule."""
+    def __init__(self, view):
+        options = [
+            discord.SelectOption(label="No recurrence (one-time)", value="none", emoji="1️⃣", default=True),
+            discord.SelectOption(label="Daily", value="daily", emoji="📅"),
+            discord.SelectOption(label="Weekly", value="weekly", emoji="🔁"),
+            discord.SelectOption(label="Monthly", value="monthly", emoji="📆"),
+        ]
+        super().__init__(
+            placeholder="Recurrence (optional)",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+        self.parent_view = view
+
+    async def callback(self, interaction: discord.Interaction):
+        self.parent_view.recurrence = self.values[0]
+        label_map = {'none': 'No recurrence', 'daily': 'Daily', 'weekly': 'Weekly', 'monthly': 'Monthly'}
+        await interaction.response.send_message(
+            f"🔁 Recurrence set to **{label_map.get(self.values[0], self.values[0])}**",
+            ephemeral=True
+        )
+        asyncio.create_task(_auto_delete_after(interaction))
+
+
 class CreationView(discord.ui.View):
     """Ephemeral view for creating a new LFG group."""
     def __init__(self, game: LFGGame, custom_options: List[Dict], message=None):
@@ -1842,6 +1914,7 @@ class CreationView(discord.ui.View):
         self.max_size = None  # Custom max size (overrides game default)
         self.thread_duration = None  # Custom thread auto-archive duration (in minutes)
         self.event_duration = None  # Event duration display (in hours)
+        self.recurrence = 'none'  # Recurrence schedule
         self.selections = {}
         self.message = message  # Store message reference for editing
 
@@ -1856,6 +1929,9 @@ class CreationView(discord.ui.View):
 
         # Event duration dropdown
         self.add_item(EventDurationSelect(self))
+
+        # Recurrence dropdown
+        self.add_item(RecurrenceSelect(self))
 
         # Buttons
         if game.require_rank:
@@ -1895,6 +1971,9 @@ class CreationView(discord.ui.View):
 
         # Re-add event duration dropdown
         self.add_item(EventDurationSelect(self))
+
+        # Re-add recurrence dropdown
+        self.add_item(RecurrenceSelect(self))
 
         # Re-add buttons
         if self.game.require_rank:
@@ -2151,6 +2230,7 @@ class SubmitButton(discord.ui.Button):
                     custom_data=json.dumps(view.selections) if view.selections else None,
                     max_group_size=view.max_size,  # Custom size or None (uses game default)
                     event_duration_hours=view.event_duration,  # Custom event duration
+                    recurrence=view.recurrence or 'none',
                 )
                 session.add(group)
                 session.flush()
@@ -3563,6 +3643,115 @@ class LFGCog(commands.Cog):
         except Exception as e:
             logger.error(f"Error posting LFG setup: {e}")
             await ctx.respond("Error posting LFG menu!", ephemeral=True)
+
+    @discord.slash_command(name="lfg_calendar", description="View upcoming LFG events as a calendar")
+    async def lfg_calendar(self, ctx: discord.ApplicationContext):
+        """Show all upcoming active LFG groups in a calendar-style embed."""
+        await ctx.defer(ephemeral=True)
+
+        try:
+            now = int(time.time())
+            # Look 30 days ahead
+            cutoff = now + 30 * 24 * 3600
+
+            with get_db_session() as session:
+                groups = session.query(LFGGroup).filter(
+                    LFGGroup.guild_id == ctx.guild.id,
+                    LFGGroup.is_active == True,
+                    LFGGroup.scheduled_time != None,
+                    LFGGroup.scheduled_time >= now,
+                    LFGGroup.scheduled_time <= cutoff,
+                ).order_by(LFGGroup.scheduled_time).all()
+
+                if not groups:
+                    await ctx.respond(
+                        "No upcoming LFG events in the next 30 days.\n"
+                        "Use `/lfg` to create one!",
+                        ephemeral=True
+                    )
+                    return
+
+                # Build calendar embed
+                embed = discord.Embed(
+                    title="📅 LFG Calendar - Next 30 Days",
+                    color=discord.Color.purple()
+                )
+
+                recurrence_labels = {'daily': ' (Daily)', 'weekly': ' (Weekly)', 'monthly': ' (Monthly)'}
+
+                # Group by date
+                from collections import defaultdict
+                import datetime as dt
+                by_date = defaultdict(list)
+                for g in groups:
+                    day_ts = dt.datetime.utcfromtimestamp(g.scheduled_time).strftime('%Y-%m-%d')
+                    by_date[day_ts].append(g)
+
+                    # Expand recurring events (next 30 days)
+                    recurrence = getattr(g, 'recurrence', None) or 'none'
+                    if recurrence != 'none':
+                        base_dt = dt.datetime.utcfromtimestamp(g.scheduled_time)
+                        for i in range(1, 31):
+                            if recurrence == 'daily':
+                                next_dt = base_dt + dt.timedelta(days=i)
+                            elif recurrence == 'weekly':
+                                next_dt = base_dt + dt.timedelta(weeks=i)
+                            elif recurrence == 'monthly':
+                                month = base_dt.month - 1 + i
+                                year = base_dt.year + month // 12
+                                month = month % 12 + 1
+                                try:
+                                    next_dt = base_dt.replace(year=year, month=month)
+                                except ValueError:
+                                    break
+                            else:
+                                break
+
+                            next_ts = int(next_dt.timestamp())
+                            if next_ts > cutoff:
+                                break
+                            day_key = next_dt.strftime('%Y-%m-%d')
+                            # Virtual occurrence - same group, different day
+                            by_date[day_key].append((g, next_ts))
+
+                # Build embed fields - max 25 fields (Discord limit)
+                field_count = 0
+                for day_key in sorted(by_date.keys())[:8]:  # Show up to 8 days
+                    items = by_date[day_key]
+                    lines = []
+                    for item in items:
+                        # item is either LFGGroup or (LFGGroup, virtual_ts)
+                        if isinstance(item, tuple):
+                            g, ts = item
+                        else:
+                            g, ts = item, item.scheduled_time
+
+                        game = session.query(LFGGame).filter_by(id=g.game_id).first()
+                        game_name = f"{game.game_emoji or ''} {game.game_name}" if game else "Unknown Game"
+                        max_size = g.max_group_size or (game.max_group_size if game else '?')
+                        recurrence = getattr(g, 'recurrence', None) or 'none'
+                        recur_tag = recurrence_labels.get(recurrence, '')
+                        status = '🔴 Full' if g.is_full else '🟢 Open'
+                        lines.append(
+                            f"<t:{ts}:t> {game_name} • {g.member_count}/{max_size} {status}{recur_tag}"
+                        )
+
+                    day_display = dt.datetime.strptime(day_key, '%Y-%m-%d').strftime('%A, %b %-d')
+                    embed.add_field(
+                        name=f"📅 {day_display}",
+                        value="\n".join(lines) if lines else "—",
+                        inline=False
+                    )
+                    field_count += 1
+
+                total = len(groups)
+                embed.set_footer(text=f"{total} upcoming group{'s' if total != 1 else ''} • Use /lfg to create a group")
+
+                await ctx.respond(embed=embed, ephemeral=True)
+
+        except Exception as e:
+            logger.error(f"lfg_calendar error: {e}", exc_info=True)
+            await ctx.respond("Something went wrong loading the calendar!", ephemeral=True)
 
     async def _get_player_counts(self, guild: discord.Guild, games: List[LFGGame]) -> Dict[int, int]:
         """Get the number of members currently playing each game via Discord Activity."""

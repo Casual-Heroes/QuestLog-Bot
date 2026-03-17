@@ -65,12 +65,21 @@ class StreamingMonitorCog(commands.Cog):
         os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'casualsite.settings')
 
         # Import and setup Django
+        # Preserve WardenBot's logging handlers - Django's dictConfig would otherwise
+        # wipe the stdout handler configured by config.py, silencing all subsequent logs.
+        import logging as _logging
         import django
+        _root_handlers = list(_logging.getLogger().handlers)
         try:
             django.setup()
         except RuntimeError:
             # Django already setup, ignore
             pass
+        # Restore handlers Django may have cleared
+        root_log = _logging.getLogger()
+        for h in _root_handlers:
+            if h not in root_log.handlers:
+                root_log.addHandler(h)
 
         # Now we can import Django app services
         from app.services.youtube_service import YouTubeService, YouTubeAPIError
