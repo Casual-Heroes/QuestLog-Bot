@@ -168,6 +168,7 @@ class Guild(Base):
     audit_event_config = Column(Text, nullable=True)  # JSON map of event toggles
     mod_enabled = Column(Boolean, nullable=False, default=False, server_default='0')
     discovery_enabled = Column(Boolean, default=False)
+    flair_sync_enabled = Column(Boolean, nullable=False, default=False, server_default='0')  # Opt-in: sync QuestLog flair -> Discord role
     role_persistence_enabled = Column(Boolean, default=False)  # Restore roles when members rejoin
     role_persistence_excluded = Column(Text, nullable=True)  # JSON array of role IDs to NEVER restore (admin roles, etc.)
 
@@ -1582,6 +1583,9 @@ class LFGGame(Base):
     # Live player count tracking (privacy-focused - just count, no names)
     current_player_count = Column(Integer, default=0)  # How many members are currently playing
     player_count_updated_at = Column(BigInteger, nullable=True)  # When count was last updated
+
+    # QuestLog Network per-game receive opt-in
+    receive_network_lfg = Column(Boolean, default=False)  # Receive QL Network LFG posts for this game
 
     # Timestamps
     created_at = Column(BigInteger, default=lambda: int(time.time()))

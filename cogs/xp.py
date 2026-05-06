@@ -334,12 +334,27 @@ class XPCog(commands.Cog):
         new_level = XPCog.calculate_level(session, db_member.xp, xp_config["max_level"])
         db_member.level = new_level
 
-        # Dual-write: keep web_users.web_xp unified if this Discord user has a linked QuestLog account
+        # Dual-write: keep web_users.web_xp unified if this Discord guild has Unified XP enabled.
+        # Only runs when site_xp_to_guild=1 for this guild's community entry.
         # Also detect if the unified web level went up - if so, surface it so this guild sends a notification.
         notify_old_level = old_level
         try:
             from sqlalchemy import text as sa_text
             import time as _time
+
+            # Check if Unified XP is enabled for this guild before touching web_users
+            _community = session.execute(
+                sa_text(
+                    "SELECT site_xp_to_guild FROM web_communities "
+                    "WHERE platform='discord' AND platform_id=:g AND network_status='approved' AND is_active=1 LIMIT 1"
+                ),
+                {"g": str(guild_id)},
+            ).fetchone()
+            _unified_on = bool(_community and _community[0])
+
+            if not _unified_on:
+                raise Exception("unified_xp_off")  # skip the block cleanly
+
             # Map WardenBot source names to web_xp_events action types
             _source_to_action = {
                 "messages": "discord_message",
@@ -361,13 +376,16 @@ class XPCog(commands.Cog):
                 old_web_level = web_row.web_level or 1
                 new_web_xp = old_web_xp + int(final_xp)
 
-                # Calculate new level using same formula as site
-                web_lv = 1
-                while web_lv < 99:
-                    if new_web_xp < int(7 * ((web_lv + 1) ** 1.5)):
+                # Calculate new level using level_requirements table (authoritative source)
+                _lv_rows = session.execute(
+                    sa_text("SELECT level, xp_required FROM level_requirements ORDER BY level")
+                ).fetchall()
+                new_web_level = 1
+                for _lr in _lv_rows:
+                    if new_web_xp >= _lr.xp_required:
+                        new_web_level = _lr.level
+                    else:
                         break
-                    web_lv += 1
-                new_web_level = web_lv
 
                 # HP: award 10 HP per 50 XP threshold crossed
                 old_thresholds = old_web_xp // 50
@@ -398,13 +416,21 @@ class XPCog(commands.Cog):
                     {"xp": new_web_xp, "lvl": new_web_level, "hp": new_hp, "uid": web_row.id},
                 )
 
-                # If web level went up but guild-local didn't, surface the web level-up so
-                # this guild fires a level-up notification. Each guild handles its own notify.
-                if new_web_level > old_web_level and new_level <= old_level:
+                # User is linked - unified web level is authoritative.
+                # Always use the unified web level for the notification, suppress
+                # the local guild level entirely to prevent double announcements.
+                if new_web_level > old_web_level:
+                    # Unified level went up - announce the unified level
                     new_level = new_web_level
                     notify_old_level = old_web_level
+                elif new_level > old_level:
+                    # Local level went up but unified didn't - suppress it,
+                    # the local level is meaningless once the user is linked
+                    new_level = old_level
+                    notify_old_level = old_level
         except Exception as _e:
-            logger.debug(f"web_xp dual-write skipped for user_id={user_id}: {_e}")
+            if str(_e) != "unified_xp_off":
+                logger.debug(f"web_xp dual-write skipped for user_id={user_id}: {_e}")
 
         logger.debug(
             f"XP Award: guild={guild_id}, user={user_id}, amount={amount}, "

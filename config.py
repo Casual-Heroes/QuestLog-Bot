@@ -214,7 +214,8 @@ intents.presences = True
 intents.guilds = True
 intents.guild_messages = True
 intents.guild_reactions = True
-intents.voice_states = True 
+intents.voice_states = True
+intents.typing = True
 
 
 # start the bot
@@ -323,10 +324,12 @@ class DefaultVerificationSettings:
 
 
 # QuestLog internal API (for bridge relay and other cross-platform features)
-QUESTLOG_INTERNAL_API_URL = os.getenv("QUESTLOG_INTERNAL_API_URL", "https://casual-heroes.com/ql")
+QUESTLOG_INTERNAL_API_URL = os.getenv("QUESTLOG_INTERNAL_API_URL", "https://casual-heroes.com")
 QUESTLOG_BOT_SECRET = os.getenv("QUESTLOG_BOT_SECRET", "")
 MATRIX_ACCESS_TOKEN = os.getenv("MATRIX_ACCESS_TOKEN", "")
 MATRIX_HOMESERVER = os.getenv("MATRIX_HOMESERVER", "https://matrix.casual-heroes.com")
+FLUXER_API_URL = os.getenv("FLUXER_API_URL", "https://api.fluxer.app/v1")
+FLUXER_BOT_TOKEN = os.getenv("FLUXER_BOT_TOKEN", "")
 
 # Environment
 IS_PRODUCTION = os.getenv("ENVIRONMENT", "development").lower() == "production"
