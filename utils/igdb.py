@@ -77,7 +77,7 @@ class IGDBGame:
     websites: List[Dict[str, str]] = field(default_factory=list)  # Website info (category, url)
 
 
-async def get_twitch_token() -> Optional[str]:
+async def get_twitch_token(force_refresh: bool = False) -> Optional[str]:
     """Get or refresh Twitch OAuth token for IGDB API access."""
     global _token_cache
 
@@ -85,9 +85,13 @@ async def get_twitch_token() -> Optional[str]:
         logger.warning("Twitch credentials not configured. IGDB search disabled.")
         return None
 
-    # Check if we have a valid cached token
-    if _token_cache["access_token"] and time.time() < _token_cache["expires_at"]:
+    # Check if we have a valid cached token (skip if force_refresh)
+    if not force_refresh and _token_cache["access_token"] and time.time() < _token_cache["expires_at"]:
         return _token_cache["access_token"]
+
+    # Clear stale token before fetching
+    _token_cache["access_token"] = None
+    _token_cache["expires_at"] = 0
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -114,6 +118,30 @@ async def get_twitch_token() -> Optional[str]:
     except Exception as e:
         logger.error(f"Error getting Twitch token: {e}")
         return None
+
+
+async def _igdb_post(session: aiohttp.ClientSession, endpoint: str, body: str) -> Optional[aiohttp.ClientResponse]:
+    """
+    POST to IGDB with automatic token refresh on 401.
+    Returns the response object on success (200), None on failure.
+    """
+    for attempt in range(2):
+        force = (attempt == 1)
+        token = await get_twitch_token(force_refresh=force)
+        if not token:
+            return None
+        headers = {
+            "Client-ID": TWITCH_CLIENT_ID,
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+        resp = await session.post(f"{IGDB_API_URL}/{endpoint}", headers=headers, data=body)
+        if resp.status == 401 and not force:
+            logger.warning("IGDB 401 - token expired mid-session, forcing refresh")
+            await resp.release()
+            continue
+        return resp
+    return None
 
 
 async def search_games(query: str, limit: int = 10) -> List[IGDBGame]:
@@ -861,15 +889,7 @@ async def search_upcoming_games(
 
         where_clause = " & ".join(required_clauses)
 
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Client-ID": TWITCH_CLIENT_ID,
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json"
-            }
-
-            # Request comprehensive game data including genres, themes, keywords, modes, ratings, hypes, media
-            body = f'''
+        body = f'''
                 fields name, slug, cover.image_id, platforms.name, summary,
                        first_release_date, genres.name, themes.name, keywords.name, game_modes.name, url,
                        rating, hypes,
@@ -880,20 +900,19 @@ async def search_upcoming_games(
                 limit {limit};
             '''
 
-            # Log the query for debugging
-            logger.info(f"IGDB Query: {body.strip()}")
+        # Log the query for debugging
+        logger.info(f"IGDB Query: {body.strip()}")
 
-            async with session.post(
-                f"{IGDB_API_URL}/games",
-                headers=headers,
-                data=body
-            ) as response:
-                if response.status != 200:
+        async with aiohttp.ClientSession() as session:
+            response = await _igdb_post(session, "games", body)
+            if response is None or response.status != 200:
+                if response is not None:
                     logger.error(f"IGDB upcoming games search failed: {response.status}")
                     text = await response.text()
                     logger.error(f"Response: {text}")
-                    return []
+                return []
 
+            async with response:
                 data = await response.json()
                 games = []
 

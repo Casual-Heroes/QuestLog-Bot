@@ -442,11 +442,14 @@ def main():
         "cogs.raffles",  # Raffles integration
         "cogs.scheduled_messages",  # Scheduled message processor
         "cogs.streaming_monitor",  # YouTube/Twitch live stream monitor & notifications
+        "cogs.live_alerts",        # Per-guild streamer subscriptions (web dashboard managed)
         "cogs.site_activity_tracker",  # Site activity tracker - database-driven Discord game tracking
         "cogs.emergency",              # Owner-only emergency kill switch for incident response
         "cogs.bridge_cog",             # Discord <-> Fluxer bidirectional message bridge
         "cogs.network_broadcasts",     # QuestLog Network - receive LFG broadcasts from site
         "cogs.invite",                 # /invite slash command - Discord early access codes
+        "cogs.flair_sync",             # QuestLog flair -> Discord role sync (opt-in per guild)
+        "cogs.gameserver",             # Game server status embeds (Quest Control dashboard)
     ]
 
     loaded_count = 0

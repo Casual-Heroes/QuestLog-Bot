@@ -102,14 +102,34 @@ class NetworkBroadcastsCog(commands.Cog):
 
                 # Post asynchronously - don't block the DB loop
                 asyncio.create_task(
-                    self._post_embed(row_id, guild_id, channel_id, embed_data)
+                    self._post_embed(row_id, int(guild_id), int(channel_id), embed_data)
                 )
 
             if ids_to_delete:
-                placeholders = ','.join(str(i) for i in ids_to_delete)
-                session.execute(
-                    text(f"DELETE FROM discord_pending_broadcasts WHERE id IN ({placeholders})")
-                )
+                for del_id in ids_to_delete:
+                    session.execute(
+                        text("DELETE FROM discord_pending_broadcasts WHERE id = :id"),
+                        {"id": int(del_id)}
+                    )
+
+    def _build_embed(self, embed_data: dict) -> discord.Embed:
+        """Build a discord.Embed from a payload dict."""
+        embed = discord.Embed(
+            title=embed_data.get("title", "New LFG Post"),
+            description=embed_data.get("description", ""),
+            url=embed_data.get("url") or None,
+            color=embed_data.get("color", BRAND_COLOR),
+        )
+        for field in embed_data.get("fields", []):
+            embed.add_field(
+                name=field.get("name", ""),
+                value=field.get("value", ""),
+                inline=field.get("inline", True),
+            )
+        if embed_data.get("thumbnail"):
+            embed.set_thumbnail(url=embed_data["thumbnail"])
+        embed.set_footer(text=embed_data.get("footer", "QuestLog Network"))
+        return embed
 
     def _build_embed(self, embed_data: dict) -> discord.Embed:
         """Build a discord.Embed from a payload dict."""

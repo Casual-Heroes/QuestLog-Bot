@@ -1602,31 +1602,25 @@ class DiscoveryCog(commands.Cog):
 
                     logger.info(f"Game discovery for guild {config.guild_id} complete. Announced {announced_count} new games.")
 
-                    # Update last check time ONLY after successful processing
-                    # (not in finally block, which runs even when skipping via continue)
-                    try:
-                        old_timestamp = config.last_game_check_at
-                        config.last_game_check_at = now
-                        session.commit()
-
-                        # Verify the update stuck by re-querying
-                        verify_config = session.get(DiscoveryConfig, config.guild_id)
-                        if verify_config and verify_config.last_game_check_at == now:
-                            logger.info(f"✅ TIMESTAMP UPDATE VERIFIED for guild {config.guild_id}: {old_timestamp} → {now}")
-                        else:
-                            actual = verify_config.last_game_check_at if verify_config else "NOT FOUND"
-                            logger.error(f"❌ TIMESTAMP UPDATE FAILED for guild {config.guild_id}: expected {now}, got {actual}")
-                    except Exception as update_error:
-                        logger.error(f"Failed to update last_game_check_at for guild {config.guild_id}: {update_error}", exc_info=True)
-
                 except Exception as e:
                     logger.error(f"Error processing game discovery for guild {config.guild_id}: {e}", exc_info=True)
-                    # On error, still update timestamp to prevent rapid retries
+
+                finally:
+                    # Always update last_game_check_at in a FRESH session to avoid
+                    # stale session state from the long-running processing loop causing
+                    # silent commit failures.
                     try:
-                        config.last_game_check_at = now
-                        session.commit()
-                    except:
-                        pass
+                        with db_session_scope() as ts_session:
+                            old_val = ts_session.query(DiscoveryConfig.last_game_check_at).filter(
+                                DiscoveryConfig.guild_id == config.guild_id
+                            ).scalar()
+                            ts_session.query(DiscoveryConfig).filter(
+                                DiscoveryConfig.guild_id == config.guild_id
+                            ).update({'last_game_check_at': now})
+                            ts_session.commit()
+                            logger.info(f"Timestamp updated for guild {config.guild_id}: {old_val} -> {now}")
+                    except Exception as ts_err:
+                        logger.error(f"Failed to update last_game_check_at for guild {config.guild_id}: {ts_err}", exc_info=True)
 
         logger.info("Game discovery task completed")
 
@@ -1702,6 +1696,11 @@ class DiscoveryCog(commands.Cog):
     @tasks.loop(hours=168)  # Weekly (7 days)
     async def creator_of_week_task(self):
         """Select and announce Creator of the Week (runs weekly, PRO feature)."""
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        days_since_sunday = (now.weekday() + 1) % 7
+        week_start = int((now - timedelta(days=days_since_sunday)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+
         logger.info("[COTW] Starting weekly Creator of the Week selection...")
 
         with db_session_scope() as session:
@@ -1718,6 +1717,12 @@ class DiscoveryCog(commands.Cog):
             for config in configs:
                 guild_id = config.guild_id  # Capture guild_id before it might become detached
                 try:
+                    # Skip if already posted this week (prevents double-post with auto_rotation_task)
+                    already_posted_this_week = config.cotw_last_posted_at and config.cotw_last_posted_at >= week_start
+                    if already_posted_this_week:
+                        logger.info(f"[COTW] Guild {guild_id} already posted this week, skipping")
+                        continue
+
                     # Check if guild has Discovery module or Complete tier
                     guild_record = session.query(Guild).filter_by(guild_id=guild_id).first()
                     if not guild_record:
@@ -1735,10 +1740,20 @@ class DiscoveryCog(commands.Cog):
     @creator_of_week_task.before_loop
     async def before_creator_of_week_task(self):
         await self.bot.wait_until_ready()
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        wait_seconds = (midnight - now).total_seconds()
+        logger.info(f"[COTW] Waiting {wait_seconds:.0f}s until midnight UTC before first run")
+        await asyncio.sleep(wait_seconds)
 
     @tasks.loop(hours=720)  # Monthly (30 days)
     async def creator_of_month_task(self):
         """Select and announce Creator of the Month (runs monthly, PREMIUM feature)."""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        month_start = int(now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp())
+
         logger.info("[COTM] Starting monthly Creator of the Month selection...")
 
         with db_session_scope() as session:
@@ -1755,6 +1770,12 @@ class DiscoveryCog(commands.Cog):
             for config in configs:
                 guild_id = config.guild_id  # Capture guild_id before it might become detached
                 try:
+                    # Skip if already posted this month (prevents double-post with auto_rotation_task)
+                    already_posted_this_month = config.cotm_last_posted_at and config.cotm_last_posted_at >= month_start
+                    if already_posted_this_month:
+                        logger.info(f"[COTM] Guild {guild_id} already posted this month, skipping")
+                        continue
+
                     # Check if guild has Discovery module or Complete tier
                     guild_record = session.query(Guild).filter_by(guild_id=guild_id).first()
                     if not guild_record:
@@ -1772,6 +1793,12 @@ class DiscoveryCog(commands.Cog):
     @creator_of_month_task.before_loop
     async def before_creator_of_month_task(self):
         await self.bot.wait_until_ready()
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        wait_seconds = (midnight - now).total_seconds()
+        logger.info(f"[COTM] Waiting {wait_seconds:.0f}s until midnight UTC before first run")
+        await asyncio.sleep(wait_seconds)
 
     @tasks.loop(hours=24)  # Run daily
     async def cleanup_inactive_creators_task(self):
@@ -2264,6 +2291,17 @@ class DiscoveryCog(commands.Cog):
             if not config or not config.cotw_enabled or not config.cotw_channel_id:
                 return
 
+            # Guard: never post twice in the same calendar week (ISO week number)
+            now_dt = datetime.datetime.utcnow()
+            current_week = now_dt.isocalendar()[1]
+            current_year = now_dt.isocalendar()[0]
+            existing_cotw = session.query(CreatorOfTheWeek).filter_by(
+                guild_id=guild_id, week=current_week, year=current_year
+            ).first()
+            if existing_cotw:
+                logger.info(f"[COTW] Guild {guild_id} already has COTW for week {current_week}/{current_year}, skipping")
+                return
+
             # Get all active featured creators
             all_creators = session.query(FeaturedCreator).filter_by(
                 is_active=True
@@ -2395,6 +2433,15 @@ class DiscoveryCog(commands.Cog):
         with db_session_scope() as session:
             config = session.query(DiscoveryConfig).filter_by(guild_id=guild_id).first()
             if not config or not config.cotm_enabled or not config.cotm_channel_id:
+                return
+
+            # Guard: never post twice in the same calendar month
+            now_dt = datetime.datetime.utcnow()
+            existing_cotm = session.query(CreatorOfTheMonth).filter_by(
+                guild_id=guild_id, month=now_dt.month, year=now_dt.year
+            ).first()
+            if existing_cotm:
+                logger.info(f"[COTM] Guild {guild_id} already has COTM for {now_dt.month}/{now_dt.year}, skipping")
                 return
 
             # Get all active featured creators
@@ -4471,29 +4518,47 @@ class DiscoveryCog(commands.Cog):
                     if not guild:
                         continue
 
-                    # Check COTW rotation
-                    if config.cotw_enabled and config.cotw_auto_rotate and config.cotw_rotation_day == current_weekday:
-                        await self._rotate_creator_of_week(session, guild, config)
+                    # Guard: check if already posted this month (COTM) or this week (COTW)
+                    # Use calendar boundaries so restarts never re-fire within the same period
+                    import calendar as _cal
+                    month_start = int(now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp())
+                    # Week start = last Sunday (or Monday depending on rotation day config)
+                    days_since_sunday = (now.weekday() + 1) % 7  # weekday() Mon=0; Sunday = 6 -> days_since = 0
+                    week_start = int((now - __import__('datetime').timedelta(days=days_since_sunday)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
-                    # Check COTM rotation
-                    # If configured day is beyond this month's length, rotate on the last day instead
+                    # Check COTM rotation first - COTM takes priority, skip COTW on same day
+                    cotm_fired = False
                     if config.cotm_enabled and config.cotm_auto_rotate:
                         rotation_day = min(config.cotm_rotation_day, last_day_of_month)
-                        if current_day_of_month == rotation_day:
+                        already_posted_this_month = config.cotm_last_posted_at and config.cotm_last_posted_at >= month_start
+                        if current_day_of_month == rotation_day and not already_posted_this_month:
                             await self._rotate_creator_of_month(session, guild, config)
+                            cotm_fired = True
+
+                    # Check COTW rotation - skip if COTM already fired today to avoid double-post
+                    if not cotm_fired and config.cotw_enabled and config.cotw_auto_rotate and config.cotw_rotation_day == current_weekday:
+                        already_posted_this_week = config.cotw_last_posted_at and config.cotw_last_posted_at >= week_start
+                        if not already_posted_this_week:
+                            await self._rotate_creator_of_week(session, guild, config)
 
                 except Exception as e:
                     logger.error(f"[COTW/COTM Auto-Rotation] Error processing guild {config.guild_id}: {e}", exc_info=True)
 
             # Network-wide COTW/COTM rotation (runs every Sunday for COTW, 1st of month for COTM)
+            # Use calendar period boundaries so restarts never re-fire within the same period
             try:
-                # Rotate Network COTW every Sunday (6=Sunday)
-                if current_weekday == 6:
-                    await self._rotate_network_creator_of_week(session)
+                from models import CreatorProfile as _CP
+                _last_cotm = session.query(_CP.network_cotm_last_featured).filter(
+                    _CP.is_current_network_cotm == True).scalar()
+                _last_cotw = session.query(_CP.network_cotw_last_featured).filter(
+                    _CP.is_current_network_cotw == True).scalar()
 
-                # Rotate Network COTM on the 1st of each month
-                if current_day_of_month == 1:
+                # Rotate Network COTM on the 1st - skip if already ran this month
+                if current_day_of_month == 1 and not (_last_cotm and _last_cotm >= month_start):
                     await self._rotate_network_creator_of_month(session)
+                # Rotate Network COTW every Sunday - skip if already ran this week, skip if COTM ran
+                elif current_weekday == 6 and not (_last_cotw and _last_cotw >= week_start):
+                    await self._rotate_network_creator_of_week(session)
 
             except Exception as e:
                 logger.error(f"[Network COTW/COTM Auto-Rotation] Error during network rotation: {e}", exc_info=True)
@@ -4501,6 +4566,13 @@ class DiscoveryCog(commands.Cog):
     @cotw_cotm_auto_rotation_task.before_loop
     async def before_cotw_cotm_auto_rotation_task(self):
         await self.bot.wait_until_ready()
+        # Wait until midnight UTC before first run so restarts don't trigger rotation
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        wait_seconds = (midnight - now).total_seconds()
+        logger.info(f"[COTW/COTM] Waiting {wait_seconds:.0f}s until midnight UTC before first rotation check")
+        await asyncio.sleep(wait_seconds)
 
     async def _rotate_creator_of_week(self, session, guild: discord.Guild, config: DiscoveryConfig):
         """Rotate Creator of the Week for a guild."""

@@ -38,7 +38,7 @@ import aiohttp
 import discord
 from discord.ext import commands
 
-from config import logger, QUESTLOG_INTERNAL_API_URL, QUESTLOG_BOT_SECRET, MATRIX_ACCESS_TOKEN, MATRIX_HOMESERVER
+from config import logger, QUESTLOG_INTERNAL_API_URL, QUESTLOG_BOT_SECRET, MATRIX_ACCESS_TOKEN, MATRIX_HOMESERVER, FLUXER_API_URL, FLUXER_BOT_TOKEN
 
 _BASE = QUESTLOG_INTERNAL_API_URL.rstrip('/')
 _RELAY_URL              = _BASE + '/api/internal/bridge/relay/'
@@ -49,6 +49,8 @@ _REACTION_URL           = _BASE + '/api/internal/bridge/reaction/'
 _PENDING_REACTIONS_URL  = _BASE + '/api/internal/bridge/pending-reactions/discord/'
 _DELETE_URL             = _BASE + '/api/internal/bridge/delete/'
 _PENDING_DELETIONS_URL  = _BASE + '/api/internal/bridge/pending-deletions/discord/'
+_EDIT_URL               = _BASE + '/api/internal/bridge/edit/'
+_PENDING_EDITS_URL      = _BASE + '/api/internal/bridge/pending-edits/discord/'
 
 _HEADERS = {'X-Bot-Secret': QUESTLOG_BOT_SECRET, 'Content-Type': 'application/json'}
 _TYPING_URL = _BASE + '/api/internal/bridge/typing/'
@@ -57,6 +59,26 @@ _MATRIX_TYPING_TIMEOUT_MS = 8000  # Matrix typing indicator expires after 8 seco
 _RELAY_PREFIXES = ('**[D]', '**[F]', '**[M]', '[D]', '[F]', '[M]')
 
 _CUSTOM_EMOJI_RE = re.compile(r'<a?:(\w+):\d+>')
+
+# Matches a string that is purely one or more URLs (possibly separated by whitespace)
+_URL_ONLY_RE = re.compile(r'^(https?://\S+\s*)+$')
+
+
+def _format_bridged(tag: str, author: str, content: str, reply_quote: str = '') -> str:
+    """
+    Format a bridged message for delivery.
+    If content is a bare URL (or URLs), put them on a new line so the platform
+    can unfurl the link preview. Mixed text+URL stays on one line.
+    """
+    header = f"**[{tag}] {author}:**"
+    body = content.rstrip() if content else ''
+    if reply_quote:
+        prefix = f"> {reply_quote}\n"
+    else:
+        prefix = ''
+    if body and _URL_ONLY_RE.match(body):
+        return f"{prefix}{header}\n{body}"
+    return f"{prefix}{header} {body}".rstrip()
 
 
 def _resolve_discord_content(message: discord.Message) -> tuple[str, list]:
@@ -162,23 +184,96 @@ class BridgeCog(commands.Cog):
                     'content_type': str(att.content_type or '') if att.content_type else '',
                 })
 
-        if not content and not attachments:
-            return
+        # Extract image/GIF URLs from embeds (Tenor, Giphy, direct image embeds).
+        # Skip 'rich' and 'link' embed types - these are auto-generated Discord link previews
+        # from URLs already present in message.content; extracting their thumbnails causes
+        # the link to be double-posted (once as content, once as the preview thumbnail).
+        for emb in (message.embeds or []):
+            img_url = None
+            if emb.type == 'gifv':
+                # Tenor/Giphy gifv embed - generated from a URL the user pasted.
+                # If that source URL is already in message content, skip the embed entirely:
+                # the receiving platform will render the link itself. Only extract the
+                # CDN thumbnail when the GIF has no text representation in the message.
+                emb_source_url = str(emb.url or '')
+                if emb_source_url and emb_source_url in (content or ''):
+                    continue
+                if emb.video and emb.video.url:
+                    img_url = str(emb.thumbnail.proxy_url or emb.thumbnail.url) if emb.thumbnail else str(emb.video.url)
+            elif emb.type == 'image' and emb.url:
+                img_url = str(emb.url)
+            elif emb.image and emb.image.url and emb.type not in ('rich', 'link'):
+                img_url = str(emb.image.url)
+            # Deliberately skip emb.type in ('rich', 'link') thumbnails - those are link previews,
+            # not user-uploaded images. The URL is already in message.content.
+            if img_url and img_url.startswith('https://'):
+                lower = img_url.split('?')[0].lower()
+                if lower.endswith('.gif') or 'tenor.com' in img_url or 'giphy.com' in img_url:
+                    fname, ctype = 'image.gif', 'image/gif'
+                elif lower.endswith('.png'):
+                    fname, ctype = 'image.png', 'image/png'
+                elif lower.endswith(('.jpg', '.jpeg')):
+                    fname, ctype = 'image.jpg', 'image/jpeg'
+                elif lower.endswith('.webp'):
+                    fname, ctype = 'image.webp', 'image/webp'
+                else:
+                    fname, ctype = 'image.gif', 'image/gif'
+                attachments.append({'url': img_url, 'filename': fname, 'content_type': ctype})
 
-        # Reply context
+        # Reply vs forward detection.
+        # Discord "forward" (message_snapshot) = message.flags.is_forwarded or message.message_snapshots
+        # Older forward pattern = message.reference pointing to a DIFFERENT channel.
         reply_quote = None
         reply_to_message_id = None
-        if message.reference and message.reference.message_id:
-            ref_msg = message.reference.resolved
-            if ref_msg is None:
-                try:
-                    ref_msg = await message.channel.fetch_message(message.reference.message_id)
-                except Exception:
-                    pass
-            if ref_msg:
-                if ref_msg.content:
-                    reply_quote = _format_reply_quote(ref_msg.content)
-                reply_to_message_id = str(message.reference.message_id)
+        is_forward = False
+        forward_from_author = None
+        forward_content = None
+
+        # Check for Discord's native forward (message_snapshots, available since 2024)
+        # IMPORTANT: this check must happen before the empty-content bail below,
+        # because native forwards have empty message.content.
+        if hasattr(message, 'message_snapshots') and message.message_snapshots:
+            is_forward = True
+            snap = message.message_snapshots[0]
+            snap_msg = getattr(snap, 'message', snap)
+            forward_content = (getattr(snap_msg, 'content', '') or '').strip()
+            # Forwarded messages don't always carry original author - use generic label
+            forward_from_author = 'forwarded message'
+        elif message.reference and message.reference.message_id:
+            ref_channel_id = message.reference.channel_id
+            if ref_channel_id and ref_channel_id != message.channel.id:
+                # Reference to a different channel = forward
+                is_forward = True
+                ref_msg = message.reference.resolved
+                if ref_msg is None:
+                    try:
+                        channel = self.bot.get_channel(ref_channel_id) or await self.bot.fetch_channel(ref_channel_id)
+                        ref_msg = await channel.fetch_message(message.reference.message_id)
+                    except Exception:
+                        pass
+                if ref_msg:
+                    forward_content = (ref_msg.content or '').strip()
+                    forward_from_author = ref_msg.author.display_name if ref_msg.author else 'Unknown'
+            else:
+                # Same channel = reply
+                ref_msg = message.reference.resolved
+                if ref_msg is None:
+                    try:
+                        ref_msg = await message.channel.fetch_message(message.reference.message_id)
+                    except Exception:
+                        pass
+                if ref_msg:
+                    if ref_msg.content:
+                        reply_quote = _format_reply_quote(ref_msg.content)
+                    reply_to_message_id = str(message.reference.message_id)
+
+        # If this is a forward, prepend the forwarded content
+        if is_forward and forward_content:
+            content = f"[forwarded from {forward_from_author}]\n> {forward_content}" + (f"\n{content}" if content else '')
+
+        # Drop if nothing to relay (check after forward detection - native forwards have empty content)
+        if not content and not attachments:
+            return
 
         # Thread detection: if message is in a thread, use the thread's parent channel for bridge lookup
         # and pass the thread_id so the hub can map it to the Matrix thread
@@ -238,6 +333,34 @@ class BridgeCog(commands.Cog):
             logger.debug(f"BridgeCog (Discord): delete relay error: {e}")
 
     @commands.Cog.listener()
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent):
+        """Relay Discord message edits to Fluxer via hub."""
+        new_content = (payload.data.get('content') or '').strip()
+        if not new_content:
+            return
+        author = payload.data.get('author') or {}
+        if author.get('bot'):
+            return
+        if new_content.startswith(_RELAY_PREFIXES):
+            return
+        try:
+            if self._session and not self._session.closed:
+                async with self._session.post(
+                    _EDIT_URL,
+                    json={
+                        'platform': 'discord',
+                        'message_id': str(payload.message_id),
+                        'channel_id': str(payload.channel_id),
+                        'new_content': new_content,
+                    },
+                    headers=_HEADERS,
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as resp:
+                    pass
+        except Exception as e:
+            logger.debug(f"BridgeCog (Discord): edit relay error: {e}")
+
+    @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         """Relay unicode emoji reactions to Fluxer via hub."""
         # Ignore bot reactions
@@ -267,60 +390,44 @@ class BridgeCog(commands.Cog):
         except Exception as e:
             logger.debug(f"BridgeCog (Discord): reaction relay error: {e}")
 
-    # DISABLED - typing relay not shipped yet
-    # @commands.Cog.listener()
-    # async def on_typing(self, channel, user, when):
-    #     """Relay Discord typing indicators to Matrix rooms via Matrix HTTP API."""
-    #     if not MATRIX_ACCESS_TOKEN:
-    #         return
-    #     if user.bot:
-    #         return
-    #
-    #     channel_id = str(channel.id)
-    #     try:
-    #         if not self._session or self._session.closed:
-    #             return
-    #         # Ask hub which Matrix rooms this Discord channel bridges to
-    #         async with self._session.post(
-    #             _TYPING_URL,
-    #             json={'source_platform': 'discord', 'discord_channel_id': channel_id, 'typing_users': [str(user)]},
-    #             headers=_HEADERS,
-    #             timeout=aiohttp.ClientTimeout(total=3),
-    #         ) as resp:
-    #             if resp.status != 200:
-    #                 return
-    #             data = await resp.json()
-    #
-    #         mx_user = f'@wardenbot:{MATRIX_HOMESERVER.split("//")[-1].rstrip("/")}'
-    #         matrix_headers = {
-    #             'Authorization': f'Bearer {MATRIX_ACCESS_TOKEN}',
-    #             'Content-Type': 'application/json',
-    #         }
-    #         homeserver = MATRIX_HOMESERVER.rstrip('/')
-    #         for target in data.get('targets', []):
-    #             if target.get('platform') != 'matrix':
-    #                 continue
-    #             room_id = target.get('channel_id', '')
-    #             if not room_id:
-    #                 continue
-    #             encoded_room = urllib.parse.quote(room_id, safe='')
-    #             encoded_user = urllib.parse.quote(mx_user, safe='')
-    #             url = f'{homeserver}/_matrix/client/v3/rooms/{encoded_room}/typing/{encoded_user}'
-    #             try:
-    #                 async with self._session.put(
-    #                     url,
-    #                     json={'typing': True, 'timeout': _MATRIX_TYPING_TIMEOUT_MS},
-    #                     headers=matrix_headers,
-    #                     timeout=aiohttp.ClientTimeout(total=3),
-    #                 ) as _:
-    #                     pass  # best-effort
-    #             except Exception:
-    #                 pass
-    #     except Exception as e:
-    #         logger.debug(f"BridgeCog (Discord): typing relay error: {e}")
+    @commands.Cog.listener()
+    async def on_typing(self, channel, user, when):
+        """Relay Discord typing indicators to Fluxer via Fluxer API."""
+        if user.bot:
+            return
+        if not self._session or self._session.closed:
+            return
+        try:
+            async with self._session.post(
+                _TYPING_URL,
+                json={'platform': 'discord', 'channel_id': str(channel.id)},
+                headers=_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=3)
+            ) as resp:
+                if resp.status != 200:
+                    return
+                data = await resp.json()
+        except Exception:
+            return
+
+        for target in data.get('targets', []):
+            if target.get('platform') != 'fluxer':
+                continue
+            fluxer_channel_id = str(target.get('channel_id', ''))
+            if not fluxer_channel_id or not FLUXER_BOT_TOKEN:
+                continue
+            try:
+                async with self._session.post(
+                    f'{FLUXER_API_URL.rstrip("/")}/channels/{fluxer_channel_id}/typing',
+                    headers={'Authorization': f'Bot {FLUXER_BOT_TOKEN}', 'Content-Type': 'application/json'},
+                    timeout=aiohttp.ClientTimeout(total=3)
+                ) as _:
+                    pass  # best-effort, 204 No Content
+            except Exception as e:
+                logger.debug(f"BridgeCog (Discord): Fluxer typing POST error: {e}")
 
     async def _poll_loop(self):
-        """Poll hub every 3s for messages; every 6s for reactions."""
+        """Poll hub every 3s for messages; every 6s for reactions/edits/deletions."""
         await asyncio.sleep(8)  # Wait for bot ready and session init
         tick = 0
         while True:
@@ -338,6 +445,10 @@ class BridgeCog(commands.Cog):
                     await self._deliver_pending_deletions()
                 except Exception as e:
                     logger.warning(f"BridgeCog (Discord): deletion poll error: {e}")
+                try:
+                    await self._deliver_pending_edits()
+                except Exception as e:
+                    logger.warning(f"BridgeCog (Discord): edit poll error: {e}")
 
             tick += 1
             await asyncio.sleep(3)
@@ -352,10 +463,11 @@ class BridgeCog(commands.Cog):
                 timeout=aiohttp.ClientTimeout(total=8)
             ) as resp:
                 if resp.status != 200:
+                    logger.warning(f"BridgeCog (Discord): pending fetch returned {resp.status} from {_PENDING_URL}")
                     return
                 data = await resp.json()
         except Exception as e:
-            logger.debug(f"BridgeCog (Discord): pending fetch error: {e}")
+            logger.warning(f"BridgeCog (Discord): pending fetch error: {e}")
             return
 
         messages = data.get('messages', [])
@@ -379,10 +491,8 @@ class BridgeCog(commands.Cog):
                 continue
 
             # Only include the blockquote if we can't do a native reply
-            if reply_quote and not reply_to_event_id:
-                formatted = f"> {reply_quote}\n**[{tag}] {author}:** {content}"
-            else:
-                formatted = f"**[{tag}] {author}:** {content}".rstrip()
+            rq = reply_quote if (reply_quote and not reply_to_event_id) else ''
+            formatted = _format_bridged(tag, author, content, rq)
 
             # Download Matrix media and re-upload as Discord files so GIFs render inline
             discord_files = []
@@ -406,8 +516,13 @@ class BridgeCog(commands.Cog):
                         ) as resp:
                             if resp.status == 200:
                                 data_bytes = await resp.read()
-                                import io
-                                discord_files.append(discord.File(io.BytesIO(data_bytes), filename=filename))
+                                # Discord limit: 25MB for non-boosted servers
+                                if len(data_bytes) > 25 * 1024 * 1024:
+                                    logger.warning(f"BridgeCog: skipping {filename} ({len(data_bytes)//1024}KB) - exceeds Discord 25MB limit")
+                                    plain_urls.append(att.get('url', url))
+                                else:
+                                    import io
+                                    discord_files.append(discord.File(io.BytesIO(data_bytes), filename=filename))
                             else:
                                 plain_urls.append(att.get('url', url))
                     except Exception as e:
@@ -577,6 +692,42 @@ class BridgeCog(commands.Cog):
                 logger.warning(f"BridgeCog (Discord): no permission to delete in {channel_id}")
             except Exception as e:
                 logger.debug(f"BridgeCog (Discord): delete message {message_id} failed: {e}")
+
+
+    async def _deliver_pending_edits(self):
+        """Fetch pending edits from hub and apply them to Discord messages."""
+        if not self._session or self._session.closed:
+            return
+        try:
+            async with self._session.get(
+                _PENDING_EDITS_URL, headers=_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as resp:
+                if resp.status != 200:
+                    return
+                data = await resp.json()
+        except Exception as e:
+            logger.debug(f"BridgeCog (Discord): pending edits fetch error: {e}")
+            return
+
+        for item in data.get('edits', []):
+            message_id = str(item.get('target_message_id', ''))
+            channel_id = str(item.get('target_channel_id', ''))
+            new_content = item.get('new_content', '')
+            if not message_id or not channel_id or not new_content:
+                continue
+            try:
+                channel = self.bot.get_channel(int(channel_id))
+                if channel is None:
+                    channel = await self.bot.fetch_channel(int(channel_id))
+                message = await channel.fetch_message(int(message_id))
+                await message.edit(content=new_content)
+            except discord.NotFound:
+                pass  # message already deleted, ignore
+            except discord.Forbidden:
+                logger.warning(f"BridgeCog (Discord): no permission to edit in {channel_id}")
+            except Exception as e:
+                logger.debug(f"BridgeCog (Discord): edit message {message_id} failed: {e}")
 
 
 def setup(bot):

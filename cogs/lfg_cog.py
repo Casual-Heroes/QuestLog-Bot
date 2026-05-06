@@ -43,6 +43,65 @@ TIMEZONE_ALIASES = {
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 
+def _sync_web_lfg_mirror(session, discord_group_id: int, new_member_count: int, is_full: bool):
+    """
+    Sync the web mirror group's member count when a Discord LFG join/leave happens,
+    and queue embed updates for all cross-platform embeds (Fluxer, etc.).
+
+    Called inside an existing DB session after committing the Discord-side changes.
+    """
+    try:
+        from sqlalchemy import text as _swt
+        import json as _swj, time as _swtime
+
+        # Find the web mirror group (if any)
+        web_row = session.execute(_swt(
+            "SELECT id FROM web_lfg_groups "
+            "WHERE origin_platform='discord' AND origin_group_id=:did LIMIT 1"
+        ), {"did": discord_group_id}).fetchone()
+
+        if not web_row:
+            return  # No web mirror - nothing to sync
+
+        web_group_id = web_row[0]
+
+        # Update web group member count + status to match Discord
+        _status = 'full' if is_full else 'open'
+        session.execute(_swt(
+            "UPDATE web_lfg_groups SET current_size=:mc, status=:st WHERE id=:wid"
+        ), {"mc": new_member_count, "st": _status, "wid": web_group_id})
+
+        # Queue embed updates for ALL platforms that have stored embeds for this web group
+        msg_rows = session.execute(_swt(
+            "SELECT platform, guild_id, channel_id, message_id, thread_id "
+            "FROM web_lfg_channel_messages WHERE group_id=:wid AND group_platform='web'"
+        ), {"wid": web_group_id}).fetchall()
+
+        _now = int(_swtime.time())
+        _payload = _swj.dumps({
+            "action": "edit",
+            "track_group_id": web_group_id,
+            "track_group_platform": "web",
+            "fields": [],
+        })
+
+        for _plat, _gid, _cid, _mid, _tid in msg_rows:
+            if _plat == 'discord':
+                session.execute(_swt(
+                    "INSERT INTO discord_pending_broadcasts (guild_id, channel_id, payload, created_at) "
+                    "VALUES (:g, :c, :p, :t)"
+                ), {"g": int(_gid), "c": int(_tid or _cid), "p": _payload, "t": _now})
+            else:
+                session.execute(_swt(
+                    "INSERT INTO fluxer_pending_broadcasts (guild_id, channel_id, payload, created_at) "
+                    "VALUES (:g, :c, :p, :t)"
+                ), {"g": str(_gid), "c": str(_tid or _cid), "p": _payload, "t": _now})
+
+        session.commit()
+    except Exception as _e:
+        logger.warning(f"_sync_web_lfg_mirror failed for discord group {discord_group_id}: {_e}")
+
+
 async def _auto_delete_after(interaction_or_message, delay: int = 5):
     """
     Auto-delete an ephemeral message after a delay.
@@ -165,6 +224,20 @@ async def _delete_thread_system_message(thread: discord.Thread, user_id: int, de
         logger.warning(f"Missing permissions to delete system message in thread {thread.id}")
     except Exception as e:
         logger.error(f"Error deleting thread system message: {e}", exc_info=True)
+
+
+def _sel_str(value) -> str:
+    """Convert a selection value (list, JSON string list, or plain string) to a human-readable string."""
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value if v)
+    if isinstance(value, str) and value.startswith('['):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return ", ".join(str(v) for v in parsed if v)
+        except (ValueError, TypeError):
+            pass
+    return str(value) if value else ""
 
 
 def local_time_to_timestamp(time_str: str, tz_str: str, day_name: str = None) -> int:
@@ -351,34 +424,17 @@ class GroupManagementView(discord.ui.View):
         creator_data = self.member_data.get(self.group.creator_id) or self.member_data.get(str(self.group.creator_id)) or self.member_data.get(int(self.group.creator_id)) or {}
         creator_options = creator_data.get("options", {})
         activity_value = creator_options.get("Activity")
-        activity_text = None
-        is_raid = False
-        if activity_value:
-            activity_list = []
-            if isinstance(activity_value, list):
-                activity_list = [str(a) for a in activity_value]
-                activity_text = ", ".join(activity_list)
-            elif isinstance(activity_value, str):
-                if activity_value.startswith('[') and activity_value.endswith(']'):
-                    try:
-                        import json
-                        parsed = json.loads(activity_value)
-                        if isinstance(parsed, list):
-                            activity_list = [str(a) for a in parsed]
-                            activity_text = ", ".join(activity_list)
-                        else:
-                            activity_text = str(activity_value)
-                            activity_list = [activity_text]
-                    except:
-                        activity_text = str(activity_value)
-                        activity_list = [activity_text]
-                else:
-                    activity_text = str(activity_value)
-                    activity_list = [activity_text]
-            else:
-                activity_text = str(activity_value)
-                activity_list = [activity_text]
-            is_raid = any("Raid" in a for a in activity_list)
+        activity_text = _sel_str(activity_value) if activity_value else None
+        is_raid = bool(activity_text and "Raid" in activity_text)
+
+        # Group-level fields from creator: Platform, Level Range, Experience, Server Type
+        platform_val = _sel_str(creator_options.get("Platform", ""))
+        level_range_val = _sel_str(creator_options.get("Level Range", ""))
+        experience_val = _sel_str(creator_options.get("Experience", ""))
+        server_type_val = _sel_str(creator_options.get("Server Type", ""))
+
+        # Survival detection: these games have Server Type (no When/Duration concept - servers are always-on)
+        is_survival_game = bool(server_type_val)
 
         # ─────────────────────────────────────────────────────────────────────
         # INFO ROW: Activity | Scheduled | Duration (all inline, single row)
@@ -386,23 +442,38 @@ class GroupManagementView(discord.ui.View):
         if activity_text:
             embed.add_field(name="🎮 Activity", value=activity_text, inline=True)
 
-        # Scheduled Time
-        if self.group.scheduled_time:
-            scheduled_text = f"<t:{self.group.scheduled_time}:f>"
-        else:
-            scheduled_text = "Now / Flexible"
-        embed.add_field(name="📅 When", value=scheduled_text, inline=True)
-
-        # Duration
-        if self.group.event_duration_hours:
-            duration = self.group.event_duration_hours
-            if duration == int(duration):
-                duration_text = f"{int(duration)}h"
+        # When and Duration - skip for survival games (servers are always-on, no session concept)
+        if not is_survival_game:
+            if self.group.scheduled_time:
+                scheduled_text = f"<t:{self.group.scheduled_time}:f>"
             else:
-                duration_text = f"{duration}h"
-        else:
-            duration_text = "—"
-        embed.add_field(name="⏱️ Duration", value=duration_text, inline=True)
+                scheduled_text = "Now / Flexible"
+            embed.add_field(name="📅 When", value=scheduled_text, inline=True)
+
+            if self.group.event_duration_hours:
+                duration = self.group.event_duration_hours
+                if duration == int(duration):
+                    duration_text = f"{int(duration)}h"
+                else:
+                    duration_text = f"{duration}h"
+            else:
+                duration_text = "-"
+            embed.add_field(name="⏱️ Duration", value=duration_text, inline=True)
+
+        if platform_val:
+            embed.add_field(name="🖥️ Platform", value=platform_val, inline=True)
+        if level_range_val:
+            embed.add_field(name="📊 Level Range", value=level_range_val, inline=True)
+        if experience_val:
+            embed.add_field(name="⭐ Experience", value=experience_val, inline=True)
+        if server_type_val:
+            embed.add_field(name="🌐 Server Type", value=server_type_val, inline=True)
+
+        # Recurrence
+        recurrence = getattr(self.group, 'recurrence', None) or 'none'
+        if recurrence and recurrence != 'none':
+            recurrence_labels = {'daily': '📅 Daily', 'weekly': '🔁 Weekly', 'monthly': '📆 Monthly'}
+            embed.add_field(name="🔁 Recurrence", value=recurrence_labels.get(recurrence, recurrence.title()), inline=True)
 
         # Group-level fields from creator: Platform, Level Range, Experience, Server Type
         platform_val = creator_options.get("Platform", "")
@@ -497,10 +568,9 @@ class GroupManagementView(discord.ui.View):
                         key_lower = key.lower()
                         if key_lower in _GROUP_LEVEL_FIELDS:
                             continue
-                        if isinstance(value, list) and value:
-                            selection_parts.append(value[0])
-                        elif value and not isinstance(value, list):
-                            selection_parts.append(str(value))
+                        s = _sel_str(value)
+                        if s:
+                            selection_parts.append(s)
                     if selection_parts:
                         display_spec = ", ".join(selection_parts)
 
@@ -720,11 +790,11 @@ class GroupManagementView(discord.ui.View):
                             if k.lower() in _GROUP_LEVEL:
                                 continue
                             if k == 'MemberPlatform':
-                                member_platform_val = v[0] if isinstance(v, list) and v else str(v) if v else ""
+                                member_platform_val = _sel_str(v)
                                 continue
-                            value = v[0] if isinstance(v, list) and len(v) > 0 else v
-                            if value:
-                                formatted_parts.append(str(value))
+                            s = _sel_str(v)
+                            if s:
+                                formatted_parts.append(s)
                         if member_platform_val:
                             formatted_parts.append(member_platform_val)
 
@@ -1458,12 +1528,56 @@ class JoinGroupButton(discord.ui.Button):
 
                     # Update group member count
                     group = session.query(LFGGroup).filter_by(id=self.parent_view.group.id).first()
+                    now_full = False
                     if group:
                         group.member_count += 1
                         if group.member_count >= group.max_group_size:
                             group.is_full = True
+                            now_full = True
 
                     session.commit()
+
+                    # Sync web mirror group member count + queue cross-platform embed updates
+                    if group:
+                        _sync_web_lfg_mirror(
+                            session,
+                            discord_group_id=self.parent_view.group.id,
+                            new_member_count=group.member_count,
+                            is_full=group.is_full,
+                        )
+
+                    # Unpin network broadcast embed if group is now full - propagate to all platforms
+                    if now_full and group:
+                        try:
+                            from sqlalchemy import text as _text2
+                            import json as _json3, time as _time3
+                            rows = session.execute(_text2(
+                                "SELECT platform, guild_id, channel_id, message_id, thread_id FROM web_lfg_channel_messages "
+                                "WHERE group_id=:gid AND group_platform='discord'"
+                            ), {"gid": self.parent_view.group.id}).fetchall()
+                            _now3 = int(_time3.time())
+                            for _plat, _gid, _cid, _mid, _tid in rows:
+                                _payload = _json3.dumps({
+                                    "action": "edit",
+                                    "track_group_id": self.parent_view.group.id,
+                                    "track_group_platform": "discord",
+                                    "pin_state": "unpin",
+                                    "title": f"FULL - {self.parent_view.group.thread_name}",
+                                    "fields": [],
+                                })
+                                if _plat == 'discord':
+                                    session.execute(_text2(
+                                        "INSERT INTO discord_pending_broadcasts (guild_id, channel_id, payload, created_at) "
+                                        "VALUES (:g, :c, :p, :t)"
+                                    ), {"g": int(_gid), "c": int(_tid or _cid), "p": _payload, "t": _now3})
+                                else:
+                                    session.execute(_text2(
+                                        "INSERT INTO fluxer_pending_broadcasts (guild_id, channel_id, payload, created_at) "
+                                        "VALUES (:g, :c, :p, :t)"
+                                    ), {"g": str(_gid), "c": str(_tid or _cid), "p": _payload, "t": _now3})
+                            session.commit()
+                        except Exception as _pe:
+                            logger.warning(f"Failed to queue unpin for group {self.parent_view.group.id}: {_pe}")
 
                 # Auto-confirm attendance if tracking is enabled
                 config = session.query(LFGConfig).filter_by(
@@ -1521,12 +1635,56 @@ class LeaveGroupButton(discord.ui.Button):
 
                     # Update group member count
                     group = session.query(LFGGroup).filter_by(id=self.parent_view.group.id).first()
+                    was_full = False
                     if group and group.member_count > 0:
+                        was_full = group.is_full
                         group.member_count -= 1
                         group.is_full = False  # No longer full if someone left
 
                     session.commit()
                     logger.info(f"User {interaction.user.id} left group {self.parent_view.group.id} - removed from DB")
+
+                    # Sync web mirror group member count + queue cross-platform embed updates
+                    if group:
+                        _sync_web_lfg_mirror(
+                            session,
+                            discord_group_id=self.parent_view.group.id,
+                            new_member_count=group.member_count,
+                            is_full=group.is_full,
+                        )
+
+                    # Re-pin network broadcast embed if group was full and now has space - propagate to all platforms
+                    if was_full:
+                        try:
+                            from sqlalchemy import text as _text3
+                            import json as _json4, time as _time4
+                            rows = session.execute(_text3(
+                                "SELECT platform, guild_id, channel_id, message_id, thread_id FROM web_lfg_channel_messages "
+                                "WHERE group_id=:gid AND group_platform='discord'"
+                            ), {"gid": self.parent_view.group.id}).fetchall()
+                            _now4 = int(_time4.time())
+                            for _plat, _gid, _cid, _mid, _tid in rows:
+                                _payload = _json4.dumps({
+                                    "action": "edit",
+                                    "track_group_id": self.parent_view.group.id,
+                                    "track_group_platform": "discord",
+                                    "pin_state": "pin",
+                                    "title": f"LFG: {self.parent_view.group.thread_name}",
+                                    "fields": [],
+                                })
+                                if _plat == 'discord':
+                                    session.execute(_text3(
+                                        "INSERT INTO discord_pending_broadcasts (guild_id, channel_id, payload, created_at) "
+                                        "VALUES (:g, :c, :p, :t)"
+                                    ), {"g": int(_gid), "c": int(_tid or _cid), "p": _payload, "t": _now4})
+                                else:
+                                    session.execute(_text3(
+                                        "INSERT INTO fluxer_pending_broadcasts (guild_id, channel_id, payload, created_at) "
+                                        "VALUES (:g, :c, :p, :t)"
+                                    ), {"g": str(_gid), "c": str(_tid or _cid), "p": _payload, "t": _now4})
+                            session.commit()
+                        except Exception as _pe2:
+                            logger.warning(f"Failed to queue re-pin for group {self.parent_view.group.id}: {_pe2}")
 
             except Exception as e:
                 logger.error(f"Failed to remove user from database: {e}")
@@ -1674,23 +1832,48 @@ class TimezoneSelectView(discord.ui.View):
 
 class TimeModal(discord.ui.Modal):
     def __init__(self, view):
-        super().__init__(title="Enter Play Time")
+        super().__init__(title="Set Time & Schedule")
         self.parent_view = view
         self.add_item(discord.ui.InputText(
             label="Time in YOUR local time",
             placeholder="e.g., 8:30pm or 10:00am",
             required=True
         ))
+        self.add_item(discord.ui.InputText(
+            label="Event duration (optional)",
+            placeholder="e.g., 2 or 2h or 90m (leave blank to skip)",
+            required=False
+        ))
+        self.add_item(discord.ui.InputText(
+            label="Recurrence (optional)",
+            placeholder="none, daily, weekly, or monthly",
+            required=False
+        ))
 
     async def callback(self, interaction: discord.Interaction):
         time_str = self.children[0].value.strip()
+        duration_raw = self.children[1].value.strip() if len(self.children) > 1 else ""
+        recurrence_raw = self.children[2].value.strip().lower() if len(self.children) > 2 else ""
 
-        # Validate time format (supports both 12-hour and 24-hour)
-        # Check if format looks valid before showing timezone selector
-        time_lower = time_str.lower()
-        has_ampm = 'am' in time_lower or 'pm' in time_lower
+        # Parse event duration
+        if duration_raw:
+            try:
+                dur_str = duration_raw.lower().replace('h', '').replace('hours', '').replace('hour', '').strip()
+                if 'm' in duration_raw.lower():
+                    dur_str = duration_raw.lower().replace('min', '').replace('m', '').strip()
+                    self.parent_view.event_duration = float(dur_str) / 60
+                else:
+                    self.parent_view.event_duration = float(dur_str)
+            except (ValueError, TypeError):
+                pass  # Invalid duration - ignore
+
+        # Parse recurrence
+        valid_recurrences = ('none', 'daily', 'weekly', 'monthly')
+        if recurrence_raw and recurrence_raw in valid_recurrences:
+            self.parent_view.recurrence = recurrence_raw
+
+        # Validate time format
         has_colon = ':' in time_str
-
         if not has_colon:
             await interaction.response.send_message(
                 "❌ Invalid time format. Please use 12-hour format (e.g., 8:30pm, 10:00am) or 24-hour format (e.g., 20:00)",
@@ -1927,12 +2110,6 @@ class CreationView(discord.ui.View):
         # Time selector (dropdown)
         self.add_item(TimeSelect(self))
 
-        # Event duration dropdown
-        self.add_item(EventDurationSelect(self))
-
-        # Recurrence dropdown
-        self.add_item(RecurrenceSelect(self))
-
         # Buttons
         if game.require_rank:
             self.add_item(SetRankCreationButton(self, game))
@@ -1942,8 +2119,10 @@ class CreationView(discord.ui.View):
         self.add_item(SubmitButton(self))
 
     def _add_custom_options(self):
-        """Add custom option dropdowns, respecting dependencies."""
-        for i, option in enumerate(self.custom_options[:3]):
+        """Add custom option dropdowns, respecting dependencies.
+        Discord Views are capped at 5 rows: DaySelect + up to 2 custom + TimeSelect + buttons.
+        """
+        for i, option in enumerate(self.custom_options[:2]):
             depends_on = option.get("depends_on")
 
             # If this field depends on another, only add it if parent has been selected
@@ -1968,12 +2147,6 @@ class CreationView(discord.ui.View):
 
         # Re-add time selector
         self.add_item(TimeSelect(self))
-
-        # Re-add event duration dropdown
-        self.add_item(EventDurationSelect(self))
-
-        # Re-add recurrence dropdown
-        self.add_item(RecurrenceSelect(self))
 
         # Re-add buttons
         if self.game.require_rank:
@@ -2293,6 +2466,165 @@ class SubmitButton(discord.ui.Button):
             pass
 
         # No success message needed - "started a thread" notification already shows this
+
+        # Post to QL Network site if user has a linked QuestLog account
+        _web_group_id = None
+        _ql_group_url = ''
+        try:
+            from sqlalchemy import text as _wt
+            _now_wt = int(time.time())
+            with get_db_session() as _ws:
+                _web_user = _ws.execute(
+                    _wt("SELECT id, username, display_name FROM web_users WHERE discord_id=:did LIMIT 1"),
+                    {"did": str(interaction.user.id)},
+                ).fetchone()
+                if _web_user:
+                    _max_sz = view.max_size or game.max_group_size or 4
+                    _title = thread_name
+                    _ws.execute(_wt(
+                        "INSERT INTO web_lfg_groups "
+                        "(creator_id, title, description, game_name, game_image_url, "
+                        " group_size, current_size, use_roles, tanks_needed, healers_needed, "
+                        " dps_needed, support_needed, scheduled_time, status, allow_network_discovery, "
+                        " origin_platform, origin_group_id, origin_guild_id, origin_guild_name, "
+                        " created_at, updated_at) "
+                        "VALUES (:cid, :title, :desc, :gname, :gimg, "
+                        " :gsz, 1, 0, 0, 0, 0, 0, :sched, 'open', 1, "
+                        " 'discord', :ogid, :oguild, :oname, :now, :now)"
+                    ), {
+                        "cid": _web_user.id,
+                        "title": _title[:200],
+                        "desc": (view.description or '')[:2000] or None,
+                        "gname": game.game_name[:200],
+                        "gimg": (game.cover_url or '')[:500] or None,
+                        "gsz": _max_sz,
+                        "sched": view.scheduled_time,
+                        "ogid": group_id,
+                        "oguild": str(interaction.guild.id),
+                        "oname": (interaction.guild.name or '')[:200],
+                        "now": _now_wt,
+                    })
+                    _web_group_row = _ws.execute(
+                        _wt("SELECT LAST_INSERT_ID() AS id")
+                    ).fetchone()
+                    _web_group_id = _web_group_row[0] if _web_group_row else None
+                    if _web_group_id:
+                        _ws.execute(_wt(
+                            "INSERT INTO web_lfg_members "
+                            "(group_id, user_id, is_creator, status, joined_at) "
+                            "VALUES (:gid, :uid, 1, 'joined', :now)"
+                        ), {"gid": _web_group_id, "uid": _web_user.id, "now": _now_wt})
+                        _ql_group_url = f"https://casual-heroes.com/ql/lfg/{_web_group_id}/"
+                    _ws.commit()
+        except Exception as _we:
+            logger.warning(f"QL Network site post failed for discord group {group_id}: {_we}")
+
+        # Broadcast to QuestLog Network (per-game filter)
+        try:
+            game_name_lower = (game.game_name or '').lower().strip()
+            now_ts = int(time.time())
+            # Survival detection: these games use Server Type instead of Activity/When/Duration
+            _is_survival_bcast = bool(view.selections.get("Server Type"))
+            _size_field_bcast = "Server Size" if _is_survival_bcast else "Group Size"
+            _bcast_fields = [
+                {"name": "Game", "value": game.game_name, "inline": True},
+                {"name": _size_field_bcast, "value": f"1/{view.max_size or game.max_group_size}", "inline": True},
+                {"name": "Posted via", "value": "Discord", "inline": True},
+            ]
+            # Add Activity if present (may be a list, JSON string list, or plain string)
+            _activity_val = view.selections.get("Activity")
+            if _activity_val:
+                if isinstance(_activity_val, list):
+                    _activity_val = ", ".join(str(a) for a in _activity_val if a)
+                elif isinstance(_activity_val, str) and _activity_val.startswith('['):
+                    try:
+                        import json as _json2
+                        _parsed = _json2.loads(_activity_val)
+                        if isinstance(_parsed, list):
+                            _activity_val = ", ".join(str(a) for a in _parsed if a)
+                    except Exception:
+                        pass
+                if _activity_val:
+                    _bcast_fields.insert(0, {"name": "🎮 Activity", "value": str(_activity_val), "inline": True})
+            # Add Platform, Experience, Server Type, Server Info from creator selections
+            _platform_bcast = _sel_str(view.selections.get("Platform", ""))
+            _experience_bcast = _sel_str(view.selections.get("Experience", ""))
+            _server_type_bcast = _sel_str(view.selections.get("Server Type", ""))
+            _server_info_bcast = (view.selections.get("Server Info", "") or "").strip()
+            if _platform_bcast:
+                _bcast_fields.append({"name": "🖥️ Platform", "value": _platform_bcast, "inline": True})
+            if _experience_bcast:
+                _bcast_fields.append({"name": "⭐ Experience", "value": _experience_bcast, "inline": True})
+            if _server_type_bcast:
+                _bcast_fields.append({"name": "🌐 Server Type", "value": _server_type_bcast, "inline": True})
+            if _server_info_bcast:
+                _bcast_fields.append({"name": "🔗 Server Info", "value": _server_info_bcast, "inline": False})
+            # Join link - prefer QL Network group page, fall back to Discord dashboard
+            _join_url = _ql_group_url or f"https://dashboard.casual-heroes.com/questlog/guild/{interaction.guild.id}/lfg/browser/"
+            _join_label = "View on QuestLog Network" if _ql_group_url else "Join via Discord Dashboard"
+            _bcast_fields.append({"name": "🎮 Join", "value": f"[{_join_label}]({_join_url})", "inline": False})
+            embed_data = {
+                "title": thread_name,
+                "description": view.description or '',
+                "color": 0xFEE75C,
+                "fields": _bcast_fields,
+                "footer": "QuestLog Network - casual-heroes.com/ql/lfg/",
+                "thread_name": thread_name,
+                "url": _join_url,
+                "track_group_id": _web_group_id or group_id,
+                "track_group_platform": "web" if _web_group_id else "discord",
+            }
+            payload_json = json.dumps(embed_data)
+            with get_db_session() as session:
+                from sqlalchemy import text as _text
+                configs = session.execute(_text(
+                    "SELECT guild_id, platform, channel_id, is_enabled FROM web_community_bot_configs "
+                    "WHERE event_type='lfg_announce'"
+                )).fetchall()
+                for cfg in configs:
+                    _guild_id_str = str(cfg[0])
+                    _platform = cfg[1]
+                    _master_channel = cfg[2]
+                    _master_enabled = cfg[3]
+                    if _platform == 'discord':
+                        _game_opted = session.execute(_text(
+                            "SELECT id, lfg_channel_id FROM lfg_games WHERE guild_id=:gid "
+                            "AND LOWER(game_name)=:gname AND receive_network_lfg=1 LIMIT 1"
+                        ), {"gid": int(_guild_id_str), "gname": game_name_lower}).fetchone()
+                        if _game_opted:
+                            _cid = _game_opted[1] or _master_channel
+                            if not _cid:
+                                continue
+                            session.execute(_text(
+                                "INSERT INTO discord_pending_broadcasts (guild_id, channel_id, payload, created_at) "
+                                "VALUES (:gid, :cid, :payload, :now)"
+                            ), {"gid": int(cfg[0]), "cid": int(_cid), "payload": payload_json, "now": now_ts})
+                        elif _master_enabled and _master_channel:
+                            session.execute(_text(
+                                "INSERT INTO discord_pending_broadcasts (guild_id, channel_id, payload, created_at) "
+                                "VALUES (:gid, :cid, :payload, :now)"
+                            ), {"gid": int(cfg[0]), "cid": int(_master_channel), "payload": payload_json, "now": now_ts})
+                    else:
+                        _game_opted = session.execute(_text(
+                            "SELECT id, channel_id FROM web_fluxer_lfg_games WHERE guild_id=:gid "
+                            "AND LOWER(name)=:gname AND receive_network_lfg=1 AND is_active=1 LIMIT 1"
+                        ), {"gid": _guild_id_str, "gname": game_name_lower}).fetchone()
+                        if _game_opted:
+                            _cid = _game_opted[1] or _master_channel
+                            if not _cid:
+                                continue
+                            session.execute(_text(
+                                "INSERT INTO fluxer_pending_broadcasts (guild_id, channel_id, payload, created_at) "
+                                "VALUES (:gid, :cid, :payload, :now)"
+                            ), {"gid": _guild_id_str, "cid": _cid, "payload": payload_json, "now": now_ts})
+                        elif _master_enabled and _master_channel:
+                            session.execute(_text(
+                                "INSERT INTO fluxer_pending_broadcasts (guild_id, channel_id, payload, created_at) "
+                                "VALUES (:gid, :cid, :payload, :now)"
+                            ), {"gid": _guild_id_str, "cid": _master_channel, "payload": payload_json, "now": now_ts})
+                session.commit()
+        except Exception as _be:
+            logger.warning(f"LFG network broadcast failed for group {group_id}: {_be}")
 
         # Auto-archive after timeout
         async def archive_thread():
@@ -3752,6 +4084,230 @@ class LFGCog(commands.Cog):
         except Exception as e:
             logger.error(f"lfg_calendar error: {e}", exc_info=True)
             await ctx.respond("Something went wrong loading the calendar!", ephemeral=True)
+
+    # =============================================================================
+    # MEMBER COMMANDS: groups, join, leave, delete, discord, ql
+    # =============================================================================
+
+    @discord.slash_command(name="lfg_groups", description="List active LFG groups for this server")
+    async def lfg_groups(self, ctx: discord.ApplicationContext):
+        """Show active LFG groups in this server."""
+        await ctx.defer(ephemeral=True)
+        try:
+            now = int(time.time())
+            with get_db_session() as session:
+                groups = session.query(LFGGroup).filter(
+                    LFGGroup.guild_id == ctx.guild.id,
+                    LFGGroup.is_active == True,
+                ).order_by(LFGGroup.created_at.desc()).limit(10).all()
+
+                if not groups:
+                    await ctx.respond(
+                        "No active LFG groups right now.\nUse `/lfg <game>` to create one!",
+                        ephemeral=True
+                    )
+                    return
+
+                embed = discord.Embed(
+                    title=f"Active LFG Groups ({len(groups)})",
+                    color=discord.Color.blurple()
+                )
+
+                for g in groups:
+                    game = session.query(LFGGame).filter_by(id=g.game_id).first()
+                    game_label = f"{game.game_emoji or ''} {game.game_name}".strip() if game else "Unknown"
+                    max_size = g.max_group_size or (game.max_group_size if game else "?")
+                    status = "Full" if g.is_full else "Open"
+                    when = f" | <t:{g.scheduled_time}:f>" if g.scheduled_time else ""
+                    thread_link = f"<#{g.thread_id}>" if g.thread_id else ""
+                    embed.add_field(
+                        name=f"#{g.id} - {game_label}",
+                        value=f"by **{g.creator_name or 'Unknown'}** | {g.member_count}/{max_size} {status}{when}\n{thread_link}",
+                        inline=False
+                    )
+
+                embed.set_footer(text="Use /lfg_join <id> to join | /lfg <game> to create")
+                await ctx.respond(embed=embed, ephemeral=True)
+
+        except Exception as e:
+            logger.error(f"lfg_groups error: {e}", exc_info=True)
+            await ctx.respond("Something went wrong!", ephemeral=True)
+
+    @discord.slash_command(name="lfg_join", description="Join an LFG group by ID")
+    @discord.option("group_id", description="Group ID (from /lfg_groups)", type=int)
+    async def lfg_join(self, ctx: discord.ApplicationContext, group_id: int):
+        """Join an existing LFG group."""
+        await ctx.defer(ephemeral=True)
+        try:
+            with get_db_session() as session:
+                group = session.query(LFGGroup).filter(
+                    LFGGroup.id == group_id,
+                    LFGGroup.guild_id == ctx.guild.id,
+                    LFGGroup.is_active == True,
+                ).first()
+
+                if not group:
+                    await ctx.respond(f"Group #{group_id} not found or no longer active.", ephemeral=True)
+                    return
+
+                if group.is_full:
+                    await ctx.respond(f"Group #{group_id} is full.", ephemeral=True)
+                    return
+
+                existing = session.query(LFGMember).filter_by(
+                    group_id=group_id,
+                    user_id=ctx.author.id
+                ).first()
+                if existing and existing.left_at is None:
+                    thread_link = f" <#{group.thread_id}>" if group.thread_id else ""
+                    await ctx.respond(f"You're already in Group #{group_id}.{thread_link}", ephemeral=True)
+                    return
+
+                # Add member
+                new_member = LFGMember(
+                    group_id=group_id,
+                    user_id=ctx.author.id,
+                    display_name=ctx.author.display_name,
+                    is_creator=False,
+                    joined_at=int(time.time()),
+                    left_at=None,
+                )
+                if existing:
+                    # Rejoin
+                    existing.left_at = None
+                    existing.joined_at = int(time.time())
+                else:
+                    session.add(new_member)
+
+                group.member_count += 1
+                game = session.query(LFGGame).filter_by(id=group.game_id).first()
+                max_size = group.max_group_size or (game.max_group_size if game else 0)
+                if max_size and group.member_count >= max_size:
+                    group.is_full = True
+
+                _sync_web_lfg_mirror(session, group.id, group.member_count, group.is_full)
+
+                game_label = f"{game.game_emoji or ''} {game.game_name}".strip() if game else "Unknown"
+                thread_link = f"\n<#{group.thread_id}>" if group.thread_id else ""
+                await ctx.respond(
+                    f"Joined **{game_label}** Group #{group_id}! ({group.member_count}/{max_size or '?'}){thread_link}",
+                    ephemeral=True
+                )
+
+        except Exception as e:
+            logger.error(f"lfg_join error: {e}", exc_info=True)
+            await ctx.respond("Something went wrong joining the group!", ephemeral=True)
+
+    @discord.slash_command(name="lfg_leave", description="Leave an LFG group you joined")
+    @discord.option("group_id", description="Group ID (from /lfg_groups)", type=int)
+    async def lfg_leave(self, ctx: discord.ApplicationContext, group_id: int):
+        """Leave an LFG group."""
+        await ctx.defer(ephemeral=True)
+        try:
+            with get_db_session() as session:
+                group = session.query(LFGGroup).filter(
+                    LFGGroup.id == group_id,
+                    LFGGroup.guild_id == ctx.guild.id,
+                    LFGGroup.is_active == True,
+                ).first()
+
+                if not group:
+                    await ctx.respond(f"Group #{group_id} not found or no longer active.", ephemeral=True)
+                    return
+
+                member = session.query(LFGMember).filter_by(
+                    group_id=group_id,
+                    user_id=ctx.author.id,
+                    left_at=None,
+                ).first()
+                if not member:
+                    await ctx.respond(f"You are not in Group #{group_id}.", ephemeral=True)
+                    return
+
+                if member.is_creator:
+                    await ctx.respond(
+                        f"You created Group #{group_id} - use `/lfg_delete {group_id}` to disband it.",
+                        ephemeral=True
+                    )
+                    return
+
+                member.left_at = int(time.time())
+                group.member_count = max(0, group.member_count - 1)
+                if group.is_full:
+                    group.is_full = False
+
+                _sync_web_lfg_mirror(session, group.id, group.member_count, group.is_full)
+
+                await ctx.respond(f"Left Group #{group_id}.", ephemeral=True)
+
+        except Exception as e:
+            logger.error(f"lfg_leave error: {e}", exc_info=True)
+            await ctx.respond("Something went wrong!", ephemeral=True)
+
+    @discord.slash_command(name="lfg_delete", description="Delete an LFG group you created")
+    @discord.option("group_id", description="Group ID to delete", type=int)
+    async def lfg_delete(self, ctx: discord.ApplicationContext, group_id: int):
+        """Delete (archive) an LFG group. Creator or admin only."""
+        await ctx.defer(ephemeral=True)
+        try:
+            with get_db_session() as session:
+                group = session.query(LFGGroup).filter(
+                    LFGGroup.id == group_id,
+                    LFGGroup.guild_id == ctx.guild.id,
+                    LFGGroup.is_active == True,
+                ).first()
+
+                if not group:
+                    await ctx.respond(f"Group #{group_id} not found or already deleted.", ephemeral=True)
+                    return
+
+                is_admin = ctx.author.guild_permissions.administrator or ctx.author.guild_permissions.manage_guild
+                if group.creator_id != ctx.author.id and not is_admin:
+                    await ctx.respond("You can only delete your own groups.", ephemeral=True)
+                    return
+
+                group.is_active = False
+                group.archived_at = int(time.time())
+
+                await ctx.respond(f"Group #{group_id} has been deleted.", ephemeral=True)
+
+        except Exception as e:
+            logger.error(f"lfg_delete error: {e}", exc_info=True)
+            await ctx.respond("Something went wrong!", ephemeral=True)
+
+    @discord.slash_command(name="lfg_discord", description="Open the Discord LFG browser for this server on QuestLog")
+    async def lfg_discord(self, ctx: discord.ApplicationContext):
+        """Link to the Discord guild's LFG browser on QuestLog."""
+        await ctx.defer(ephemeral=True)
+        portal_url = f"https://dashboard.casual-heroes.com/questlog/guild/{ctx.guild.id}/lfg/browser/"
+        embed = discord.Embed(
+            title="Discord LFG Browser",
+            description=(
+                f"Browse and manage LFG groups for **{ctx.guild.name}** on QuestLog.\n\n"
+                f"[Open LFG Browser]({portal_url})"
+            ),
+            color=discord.Color.blurple(),
+            url=portal_url,
+        )
+        embed.set_footer(text="casual-heroes.com/ql/")
+        await ctx.respond(embed=embed, ephemeral=True)
+
+    @discord.slash_command(name="lfg_ql", description="Browse the public QuestLog Network LFG")
+    async def lfg_ql(self, ctx: discord.ApplicationContext):
+        """Link to the public QuestLog Network LFG."""
+        await ctx.defer(ephemeral=True)
+        ql_url = "https://casual-heroes.com/ql/lfg/"
+        embed = discord.Embed(
+            title="QuestLog LFG Network",
+            description=(
+                "Find players from across the QuestLog Network.\n\n"
+                f"[Browse & Create Groups]({ql_url})"
+            ),
+            color=discord.Color.purple(),
+            url=ql_url,
+        )
+        embed.set_footer(text="casual-heroes.com/ql/lfg/")
+        await ctx.respond(embed=embed, ephemeral=True)
 
     async def _get_player_counts(self, guild: discord.Guild, games: List[LFGGame]) -> Dict[int, int]:
         """Get the number of members currently playing each game via Discord Activity."""

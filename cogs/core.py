@@ -191,6 +191,18 @@ class CoreCog(commands.Cog):
 
         await ctx.respond(embed=embed, ephemeral=True)
 
+    @questlog.command(name="dashboard", description="Get a link to this server's QuestLog dashboard")
+    async def dashboard(self, ctx: discord.ApplicationContext):
+        """Send an ephemeral link to this server's dashboard."""
+        guild_dashboard_url = f"{DASHBOARD_URL}guild/{ctx.guild.id}/"
+        embed = discord.Embed(
+            title="📊 QuestLog Dashboard",
+            description=f"[Open {ctx.guild.name}'s Dashboard]({guild_dashboard_url})",
+            color=discord.Color.blurple()
+        )
+        embed.set_footer(text="Only admins can make changes - members can view their profile and LFG groups.")
+        await ctx.respond(embed=embed, ephemeral=True)
+
     # Guild setup command
     @questlog.command(name="setup", description="Quick setup wizard for QuestLog")
     @discord.default_permissions(administrator=True)
