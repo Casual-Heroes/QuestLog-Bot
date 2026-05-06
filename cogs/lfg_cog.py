@@ -475,6 +475,31 @@ class GroupManagementView(discord.ui.View):
             recurrence_labels = {'daily': '📅 Daily', 'weekly': '🔁 Weekly', 'monthly': '📆 Monthly'}
             embed.add_field(name="🔁 Recurrence", value=recurrence_labels.get(recurrence, recurrence.title()), inline=True)
 
+        # Group-level fields from creator: Platform, Level Range, Experience, Server Type
+        platform_val = creator_options.get("Platform", "")
+        if isinstance(platform_val, list): platform_val = ", ".join(platform_val) if platform_val else ""
+        level_range_val = creator_options.get("Level Range", "")
+        if isinstance(level_range_val, list): level_range_val = ", ".join(level_range_val) if level_range_val else ""
+        experience_val = creator_options.get("Experience", "")
+        if isinstance(experience_val, list): experience_val = ", ".join(experience_val) if experience_val else ""
+        server_type_val = creator_options.get("Server Type", "")
+        if isinstance(server_type_val, list): server_type_val = ", ".join(server_type_val) if server_type_val else ""
+
+        if platform_val:
+            embed.add_field(name="🖥️ Platform", value=platform_val, inline=True)
+        if level_range_val:
+            embed.add_field(name="📊 Level Range", value=level_range_val, inline=True)
+        if experience_val:
+            embed.add_field(name="⭐ Experience", value=experience_val, inline=True)
+        if server_type_val:
+            embed.add_field(name="🌐 Server Type", value=server_type_val, inline=True)
+
+        # Recurrence
+        recurrence = getattr(self.group, 'recurrence', None) or 'none'
+        if recurrence and recurrence != 'none':
+            recurrence_labels = {'daily': '📅 Daily', 'weekly': '🔁 Weekly', 'monthly': '📆 Monthly'}
+            embed.add_field(name="🔁 Recurrence", value=recurrence_labels.get(recurrence, recurrence.title()), inline=True)
+
         # Check if group has role composition
         tanks_needed = getattr(self.group, 'tanks_needed', 0) or 0
         healers_needed = getattr(self.group, 'healers_needed', 0) or 0
