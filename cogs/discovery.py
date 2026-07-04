@@ -311,6 +311,29 @@ class DiscoveryCog(commands.Cog):
                 if not config.selfpromo_channel_id or message.channel.id != config.selfpromo_channel_id:
                     return
 
+                # Only process messages that contain a live streaming link
+                # Ignore regular messages, images, text-only posts etc.
+                STREAMING_DOMAINS = (
+                    'twitch.tv/',
+                    'youtube.com/live',
+                    'youtu.be/',
+                    'youtube.com/watch',
+                    'tiktok.com/live',
+                    'tiktok.com/@',
+                    'kick.com/',
+                    'instagram.com/live',
+                    'instagram.com/stories',
+                    'facebook.com/live',
+                    'facebook.com/gaming',
+                    'trovo.live/',
+                    'rumble.com/',
+                )
+                content_lower = message.content.lower()
+                has_streaming_link = any(domain in content_lower for domain in STREAMING_DOMAINS)
+                if not has_streaming_link:
+                    # Regular message with no streaming link - ignore silently
+                    return
+
                 # Get user's XP/token data
                 member = session.query(GuildMember).filter_by(
                     guild_id=message.guild.id,
