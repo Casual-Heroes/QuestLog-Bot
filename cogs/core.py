@@ -91,8 +91,14 @@ class CoreCog(commands.Cog):
 
         # Admin
         embed.add_field(
-            name="⚙️ Admin",
-            value=f"[Web Dashboard]({DASHBOARD_URL}) - Manage settings",
+            name="⚙️ Administration",
+            value=(
+                "`/welcome config` - Welcome messages\n"
+                "`/verify config` - Account verification\n"
+                "`/tracker add` - Channel trackers\n"
+                "`/lfg_search` - Add an IGDB-backed LFG game\n"
+                f"[Web Dashboard]({DASHBOARD_URL}) - Supported web controls"
+            ),
             inline=False
         )
 
@@ -116,7 +122,9 @@ class CoreCog(commands.Cog):
         embed.add_field(
             name="📊 Stats",
             value=(
-                f"Servers: **{len(self.bot.guilds)}**\n"
+                f"Installed communities: **{len(self.bot.guilds)}**\n"
+                "Discord's Mutual Servers tab only shows communities you "
+                "personally share with the bot.\n"
                 f"Uptime: **{hours}h {minutes}m {seconds}s**\n"
                 f"Latency: **{round(self.bot.latency * 1000)}ms**"
             ),
@@ -220,18 +228,26 @@ class CoreCog(commands.Cog):
         )
 
         embed.add_field(
-            name="📊 Step 1: Configure from Dashboard",
+            name="🤖 Step 1: Configure Discord Features",
             value=(
-                f"Visit the [Dashboard]({DASHBOARD_URL}guild/{ctx.guild.id}) to:\n"
-                "• Set up notification channels\n"
-                "• Configure verification settings\n"
-                "• Enable/disable modules"
+                "Use these bot commands:\n"
+                "• `/welcome config` - Welcome messages\n"
+                "• `/verify config` - Verification settings\n"
+                "• `/tracker add` - Channel topic trackers\n"
+                "• `/lfg_search` - Add an IGDB-backed game\n"
+                "• `/settings view` - Review bot configuration"
             ),
             inline=False
         )
 
         embed.add_field(
-            name="🎮 Step 2: Test Features",
+            name="🌐 Step 2: Optional Web Features",
+            value=f"Use the [Dashboard]({DASHBOARD_URL}guild/{ctx.guild.id}/) only for controls that are available there.",
+            inline=False
+        )
+
+        embed.add_field(
+            name="🎮 Step 3: Test Features",
             value=(
                 "Try these commands:\n"
                 "• `/xp profile` - Check XP system\n"
@@ -242,7 +258,7 @@ class CoreCog(commands.Cog):
         )
 
         embed.add_field(
-            name="🔒 Step 3: Security (Moderators)",
+            name="🔒 Step 4: Security (Moderators)",
             value=(
                 "Configure security:\n"
                 "• `/raid config` - Anti-raid settings\n"

@@ -132,6 +132,23 @@ mysql -u root -e "GRANT ALL PRIVILEGES ON warden.* TO 'warden'@'localhost';"
 python bot.py
 ```
 
+### Discord installation permissions
+
+The standard installation uses named permissions rather than Administrator:
+
+```text
+https://discord.com/oauth2/authorize?client_id=YOUR_ID&scope=bot+applications.commands&permissions=1426197966070
+```
+
+This covers moderation, role/channel management, audit-log access, messages,
+embeds, attachments, reactions, and public threads. Discord channel overwrites
+can still hide private channels from the bot. Grant the bot role access only in
+private channels that should use QuestLog features.
+
+An Administrator invite may be offered separately as an explicit **full channel
+coverage** option for guild owners who accept the larger blast radius. No bot
+operation in this repository intrinsically requires the Administrator bit.
+
 Tables are created automatically on first run.
 
 ---
@@ -183,6 +200,20 @@ Copy `.env.example` for the full list. Key variables:
 | `ENVIRONMENT` | `production` or `development` |
 | `DEBUG_GUILD_ID` | Restrict slash command sync to one guild (faster iteration) |
 | `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+
+### Log rotation
+
+The systemd service appends to the repository-local `log` file. Install the
+provided logrotate policy and validate it before enabling production rotation:
+
+```bash
+sudo install -o root -g root -m 0644 deploy/logrotate/wardenbot /etc/logrotate.d/wardenbot
+sudo logrotate --debug /etc/logrotate.d/wardenbot
+```
+
+The policy rotates daily or once the log exceeds 50 MiB, retains 14 rotations,
+compresses old logs, and uses `copytruncate` because systemd keeps the append
+file descriptor open.
 
 ---
 

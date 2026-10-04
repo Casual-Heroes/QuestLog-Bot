@@ -16,6 +16,7 @@ ARCHITECTURE:
 """
 
 import json
+import os
 import time
 import asyncio
 import discord
@@ -29,6 +30,7 @@ from models import (
     GuildMember, Guild, Warning, WarningType,
     BulkImportJob, DiscoveryConfig
 )
+from utils.action_policy import ActionPolicyError, authorize_legacy_action
 
 
 class ActionProcessorCog(commands.Cog):
@@ -157,10 +159,19 @@ class ActionProcessorCog(commands.Cog):
             import os
 
             bot_api_port = int(os.getenv('BOT_API_PORT', 8001))
+            api_token = os.getenv('DISCORD_BOT_API_TOKEN', '')
+            if not api_token:
+                logger.error("Cannot trigger immediate sync without DISCORD_BOT_API_TOKEN")
+                return
             url = f"http://localhost:{bot_api_port}/api/sync/{guild_id}"
+            headers = {'Authorization': f'Bearer {api_token}'}
 
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                async with session.post(
+                    url,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as response:
                     if response.status == 200:
                         data = await response.json()
                         if data.get('success'):
@@ -188,69 +199,141 @@ class ActionProcessorCog(commands.Cog):
     async def before_process_loop(self):
         """Wait for bot to be ready before starting."""
         await self.bot.wait_until_ready()
+        self._quarantine_stale_processing_actions()
         logger.info("ActionProcessor: Bot ready, starting action queue processor")
 
-    async def _process_pending_actions(self):
-        """Fetch and process all pending actions."""
+    def _quarantine_stale_processing_actions(self):
+        """Fail closed on abandoned jobs instead of ever replaying them."""
+        stale_after = max(
+            300,
+            int(os.getenv("LEGACY_ACTION_QUARANTINE_AFTER_SECONDS", "3600")),
+        )
+        now = int(time.time())
+        cutoff = now - stale_after
+        reason = (
+            "QUARANTINED: execution outcome is ambiguous after the worker lease "
+            "expired; this action must not be replayed automatically"
+        )
         with db_session_scope() as session:
-            # Get pending actions ordered by priority and creation time
             actions = session.query(PendingAction).filter(
+                PendingAction.status == ActionStatus.PROCESSING,
+                PendingAction.created_at < cutoff,
+            ).all()
+            for action in actions:
+                action.status = ActionStatus.FAILED
+                action.completed_at = now
+                action.error_message = reason
+            if actions:
+                logger.warning(
+                    "ActionProcessor: Quarantined %s stale processing actions; "
+                    "none were replayed",
+                    len(actions),
+                )
+
+    async def _process_pending_actions(self):
+        """Fetch action IDs without holding a database session across awaits."""
+        with db_session_scope() as session:
+            action_ids = [row[0] for row in session.query(PendingAction.id).filter(
                 PendingAction.status == ActionStatus.PENDING
             ).order_by(
                 PendingAction.priority,
                 PendingAction.created_at
-            ).limit(10).all()  # Process up to 10 at a time
+            ).limit(10).all()]
 
-            for action in actions:
-                await self._process_single_action(session, action)
+        for action_id in action_ids:
+            await self._process_single_action(action_id)
 
-    async def _process_single_action(self, session, action: PendingAction):
-        """Process a single pending action."""
+    async def _process_single_action(self, action_id: int):
+        """Atomically claim, authorize, and process a single pending action."""
+        action_type = None
+        guild_id = None
         try:
-            # Mark as processing
-            action.status = ActionStatus.PROCESSING
-            action.started_at = int(time.time())
-            session.commit()
+            with db_session_scope() as session:
+                claimed = session.query(PendingAction).filter(
+                    PendingAction.id == action_id,
+                    PendingAction.status == ActionStatus.PENDING,
+                ).update({
+                    PendingAction.status: ActionStatus.PROCESSING,
+                    PendingAction.started_at: int(time.time()),
+                }, synchronize_session=False)
+                if claimed != 1:
+                    return
+
+                action = session.get(PendingAction, action_id)
+                action_type = action.action_type
+                guild_id = int(action.guild_id)
+                payload_text = action.payload
+                actor_id = action.triggered_by
+                created_at = action.created_at
+
+                db_guild = session.get(Guild, guild_id)
+                try:
+                    custom_admin_role_ids = json.loads(db_guild.admin_roles or "[]") if db_guild else []
+                except (TypeError, ValueError):
+                    custom_admin_role_ids = []
 
             # Parse payload
-            payload = json.loads(action.payload) if action.payload else {}
+            payload = json.loads(payload_text) if payload_text else {}
 
             # Get the guild
-            guild = self.bot.get_guild(action.guild_id)
+            guild = self.bot.get_guild(guild_id)
             if not guild:
-                raise ValueError(f"Guild {action.guild_id} not found (bot may not be in guild)")
+                raise ValueError(f"Guild {guild_id} not found (bot may not be in guild)")
+
+            authorize_legacy_action(
+                guild=guild,
+                action_type=action_type,
+                payload=payload,
+                actor_id=actor_id,
+                created_at=created_at,
+                custom_admin_role_ids=custom_admin_role_ids,
+            )
 
             # Process based on action type
-            result = await self._execute_action(guild, action.action_type, payload)
+            result = await self._execute_action(guild, action_type, payload)
 
-            # Mark as completed
-            action.status = ActionStatus.COMPLETED
-            action.completed_at = int(time.time())
-            action.result = json.dumps(result) if result else None
+            with db_session_scope() as session:
+                action = session.get(PendingAction, action_id)
+                if not action or action.status != ActionStatus.PROCESSING:
+                    raise RuntimeError("Claimed action changed state during execution")
+                action.status = ActionStatus.COMPLETED
+                action.completed_at = int(time.time())
+                action.result = json.dumps(result) if result else None
 
-            logger.info(f"ActionProcessor: Completed {action.action_type.value} for guild {action.guild_id}")
+            logger.info(f"ActionProcessor: Completed {action_type.value} for guild {guild_id}")
 
             # Trigger immediate sync for actions that modify Discord resources
             # This ensures the database cache is updated immediately
-            if action.action_type in [ActionType.FLAIR_SEED_ROLES]:
-                await self._trigger_immediate_sync(action.guild_id)
+            if action_type in [ActionType.FLAIR_SEED_ROLES]:
+                await self._trigger_immediate_sync(guild_id)
 
         except Exception as e:
-            # Handle failure
-            action.retry_count += 1
-            action.error_message = str(e)
+            with db_session_scope() as session:
+                action = session.get(PendingAction, action_id)
+                if not action:
+                    logger.error("ActionProcessor: Action %s disappeared: %s", action_id, e)
+                    return
+                action.retry_count += 1
+                action.error_message = str(e)[:2000]
 
-            if action.retry_count >= action.max_retries:
-                action.status = ActionStatus.FAILED
-                action.completed_at = int(time.time())
-                logger.error(f"ActionProcessor: Failed {action.action_type.value} for guild {action.guild_id}: {e}")
-            else:
-                # Reset to pending for retry
-                action.status = ActionStatus.PENDING
-                logger.warning(f"ActionProcessor: Retrying {action.action_type.value} (attempt {action.retry_count})")
-
-        finally:
-            session.commit()
+                # Authorization and validation failures are permanent. Retrying
+                # cannot make an unsafe request acceptable and creates noise.
+                if isinstance(e, (ActionPolicyError, json.JSONDecodeError)) or action.retry_count >= action.max_retries:
+                    action.status = ActionStatus.FAILED
+                    action.completed_at = int(time.time())
+                    logger.error(
+                        "ActionProcessor: Failed %s for guild %s: %s",
+                        getattr(action_type, "value", action_type or "unknown"),
+                        guild_id or action.guild_id,
+                        e,
+                    )
+                else:
+                    action.status = ActionStatus.PENDING
+                    logger.warning(
+                        "ActionProcessor: Retrying %s (attempt %s)",
+                        getattr(action_type, "value", action_type or "unknown"),
+                        action.retry_count,
+                    )
 
     async def _execute_action(self, guild: discord.Guild, action_type: ActionType, payload: dict) -> dict:
         """Execute the action and return result."""
@@ -715,8 +798,9 @@ class ActionProcessorCog(commands.Cog):
         if message_type in ("test_welcome", "test_goodbye"):
             return await self._send_test_message(guild, message_type, payload)
 
-        # Safe default: allow user/role mentions but NOT @everyone/@here (prevent abuse)
-        allowed_mentions = discord.AllowedMentions.none() if payload.get("silent") else discord.AllowedMentions(everyone=False, roles=True, users=True)
+        # Web-authored text never creates pings. Purpose-built actions such as a
+        # configured boost announcement handle their intended mention directly.
+        allowed_mentions = discord.AllowedMentions.none()
         silent = payload.get("silent", False)
 
         # Send message
@@ -1509,7 +1593,7 @@ class ActionProcessorCog(commands.Cog):
                     # Show most anticipated (always prefer hype over ratings)
                     if len(most_hyped) >= 1:
                         # Show up to 3 most hyped games
-                        hyped_games = "\n".join([f"**{name}** — {int(hypes)} follows" for name, hypes in most_hyped[:3]])
+                        hyped_games = "\n".join([f"**{name}** - {int(hypes)} follows" for name, hypes in most_hyped[:3]])
                         summary_embed.add_field(
                             name="Most Anticipated",
                             value=hyped_games,
@@ -1603,14 +1687,7 @@ class ActionProcessorCog(commands.Cog):
     # ═══════════════════════════════════════════════════════════════
 
     async def _action_flair_assign(self, guild: discord.Guild, payload: dict) -> dict:
-        """
-        Assign a flair role to a member.
-        Removes old flair roles and assigns the new one.
-
-        Payload:
-            target_user_id: ID of the user
-            flair_name: Name of the flair (e.g., "[🎮 Casual Legend]")
-        """
+        """Compatibility adapter for a QuestLog user's equipped flair."""
         user_id = payload.get("target_user_id")
         flair_name = payload.get("flair_name")
         remove_flag = payload.get("remove_flair")
@@ -1618,55 +1695,22 @@ class ActionProcessorCog(commands.Cog):
         if not user_id:
             raise ValueError("Missing target_user_id in payload")
 
-        # Removal: handle when flair_name is falsy OR explicit remove flag is sent
-        if not flair_name or remove_flag:
-            member = guild.get_member(user_id)
-            if not member:
-                raise ValueError(f"Member {user_id} not found in guild")
-            old_flair_roles = [r for r in member.roles if r.name.startswith("Flair: ")]
-            if old_flair_roles:
-                await member.remove_roles(*old_flair_roles, reason="Removing flair (requested)")
-                logger.info(f"Removed flair roles from {member.display_name}: {[r.name for r in old_flair_roles]}")
-            else:
-                logger.info(f"No flair roles to remove for {member.display_name}")
-            return {
-                "success": True,
-                "message": f"Removed flair from {member.display_name}"
-            }
+        flair_sync = self.bot.get_cog("FlairSyncCog")
+        if flair_sync is None:
+            raise RuntimeError("Scoped flair delivery adapter is unavailable")
 
-        # Get member
-        member = guild.get_member(user_id)
-        if not member:
-            raise ValueError(f"Member {user_id} not found in guild")
-
-        # Construct role name: "Flair: {flair_name}"
-        role_name = f"Flair: {flair_name}"
-
-        # Find the flair role
-        flair_role = discord.utils.get(guild.roles, name=role_name)
-        if not flair_role:
-            # If role doesn't exist, log warning but don't fail
-            # The role should be created manually by admins
-            logger.warning(f"Flair role '{role_name}' not found in guild {guild.name}. Role must be created manually.")
-            return {
-                "success": True,
-                "message": f"Flair updated to {flair_name}, but role '{role_name}' needs to be created in Discord",
-                "warning": f"Role not found: {role_name}"
-            }
-
-        # Remove any existing flair roles (roles that start with "Flair: ")
-        old_flair_roles = [r for r in member.roles if r.name.startswith("Flair: ")]
-        if old_flair_roles:
-            await member.remove_roles(*old_flair_roles, reason="Removing old flair roles")
-            logger.info(f"Removed old flair roles from {member.display_name}: {[r.name for r in old_flair_roles]}")
-
-        # Assign new flair role
-        await member.add_roles(flair_role, reason=f"Assigned flair: {flair_name}")
-        logger.info(f"Assigned flair role '{role_name}' to {member.display_name} in {guild.name}")
-
+        action = "clear_flair" if remove_flag or not flair_name else "set_flair"
+        status, role_id = await flair_sync._sync_guild_flair(
+            guild,
+            int(user_id),
+            action,
+            "",
+            flair_name or "",
+        )
         return {
             "success": True,
-            "message": f"Assigned flair '{flair_name}' to {member.display_name}"
+            "status": status,
+            "role_id": role_id,
         }
 
     async def _action_flair_seed_roles(self, guild: discord.Guild, payload: dict) -> dict:

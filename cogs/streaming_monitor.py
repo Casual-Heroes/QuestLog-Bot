@@ -156,7 +156,7 @@ class StreamingMonitorCog(commands.Cog):
             guild_id: Guild ID to check
 
         Returns:
-            True if guild has Discovery module, Complete tier, or VIP status
+            True when the guild is installed and available.
         """
         guild = db.query(Guild).filter(Guild.guild_id == guild_id).first()
         if not guild:

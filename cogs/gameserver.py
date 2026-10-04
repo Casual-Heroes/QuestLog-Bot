@@ -12,7 +12,10 @@
 
 import asyncio
 import datetime
+import json
 import os
+import time
+from glob import glob
 
 import discord
 from discord.ext import commands, tasks
@@ -28,6 +31,7 @@ logging.getLogger('ampapi').setLevel(logging.CRITICAL)
 AMP_URL      = os.getenv('AMP_URL', '')
 AMP_USER     = os.getenv('AMP_USER', '')
 AMP_PASSWORD = os.getenv('AMP_PASSWORD', '')
+AMP_SERVER_PASSWORD_NODE = 'Meta.GenericModule.ServerPassword'
 
 # ---- AMP instance paths (same as Fluxer bot) ----
 from pathlib import Path
@@ -86,6 +90,58 @@ async def _get_amp_instance(instance_name: str):
         return None
 
 
+def _extract_amp_server_password(setting) -> tuple[bool, str]:
+    """Extract AMP's authoritative password without confusing missing with empty."""
+    missing = object()
+    if isinstance(setting, dict):
+        node = setting.get('node', setting.get('Node'))
+        input_type = setting.get('input_type', setting.get('InputType'))
+        value = setting.get(
+            'current_value',
+            setting.get('CurrentValue', missing),
+        )
+    else:
+        node = getattr(setting, 'node', None)
+        input_type = getattr(setting, 'input_type', None)
+        value = getattr(setting, 'current_value', missing)
+
+    if node != AMP_SERVER_PASSWORD_NODE:
+        return False, ''
+    if input_type and str(input_type).lower() != 'password':
+        return False, ''
+    if value is missing:
+        return False, ''
+    return True, '' if value is None else str(value)
+
+
+async def _get_amp_server_password(instance_name: str) -> str | None:
+    """Read the player password directly from AMP.
+
+    None means AMP did not make the setting available. An empty string means
+    AMP explicitly has no password configured.
+    """
+    instance = await _get_amp_instance(instance_name)
+    if not instance:
+        return None
+    try:
+        setting = await asyncio.wait_for(
+            instance.get_config(
+                AMP_SERVER_PASSWORD_NODE,
+                format_data=False,
+            ),
+            timeout=5,
+        )
+        found, password = _extract_amp_server_password(setting)
+        return password if found else None
+    except Exception as e:
+        logger.warning(
+            '[gameserver] AMP password lookup failed for %s: %s',
+            instance_name,
+            e,
+        )
+        return None
+
+
 async def _get_server_status(instance_name: str, public_ip: str | None = None) -> dict:
     result = {
         'state': 'Unknown', 'is_running': False, 'uptime': None,
@@ -137,14 +193,19 @@ async def _get_server_status(instance_name: str, public_ip: str | None = None) -
         if not game_port and valid_ports:
             game_port = valid_ports[0]
         if game_port:
-            raw_ip = (
-                game_port.get('ip') or game_port.get('hostname')
-                or game_port.get('address') or game_port.get('Address')
-            )
-            if not raw_ip or raw_ip in ('0.0.0.0', '::'):
-                if public_ip:
-                    raw_ip = public_ip
-                else:
+            # Admin-configured public_ip always wins when set - AMP reports the
+            # NATed/internal address regardless of what's actually reachable from
+            # outside, so there's no reliable way to auto-detect the right IP for
+            # a server behind port-forwarding. Only fall back to AMP's own value
+            # (then ifconfig.me) when the admin hasn't set an override.
+            if public_ip:
+                raw_ip = public_ip
+            else:
+                raw_ip = (
+                    game_port.get('ip') or game_port.get('hostname')
+                    or game_port.get('address') or game_port.get('Address')
+                )
+                if not raw_ip or raw_ip in ('0.0.0.0', '::'):
                     try:
                         raw_ip = _requests.get('https://ifconfig.me', timeout=5).text.strip()
                     except Exception:
@@ -164,7 +225,7 @@ def _load_all_configs() -> list[dict]:
     try:
         with db_session_scope() as db:
             rows = db.execute(text(
-                "SELECT * FROM gamebot_configs WHERE configured = 1 AND guild_id IS NOT NULL"
+                "SELECT * FROM gamebot_configs WHERE configured = 1 AND discord_guild_id IS NOT NULL"
             )).fetchall()
             return [dict(r._mapping) for r in rows]
     except Exception as e:
@@ -183,15 +244,168 @@ def _get_online_players(instance_name: str) -> list[str]:
         return []
 
 
-def _update_discord_message_id(instance_name: str, msg_id: str | None):
-    """Store the Discord stats message ID so we can edit it in-place next cycle."""
+# ---------------------------------------------------------------------------
+# Live log forwarding - ported from questlogfluxer/cogs/gameserver.py so a
+# Discord-linked instance can forward its AMP console log the same way a
+# Fluxer-linked one already does. Discord-only: this cog has no join/leave
+# regex processing (that's a separate, not-yet-built feature) - purely tails
+# the log and forwards filtered lines to live_log_discord_channel_id.
+# ---------------------------------------------------------------------------
+
+class LogWatcher:
+    """Tails the latest AMPLOG_*.log file in the given directory."""
+
+    def __init__(self, log_dir: str):
+        self.log_dir = log_dir
+        self.glob_pattern = os.path.join(log_dir, 'AMPLOG_*.log')
+        self.current_file: str | None = None
+        self.file_handle = None
+        self.file_position: int = 0
+        self._update_latest()
+
+    def _update_latest(self):
+        files = sorted(glob(self.glob_pattern))
+        if not files:
+            return
+        latest = files[-1]
+        if latest != self.current_file:
+            if self.file_handle:
+                self.file_handle.close()
+            self.current_file = latest
+            self.file_handle = open(latest, 'rb')
+            # Seek to end on first open so we only read NEW lines
+            self.file_handle.seek(0, 2)
+            self.file_position = self.file_handle.tell()
+
+    def read_new_lines(self) -> list[str]:
+        self._update_latest()
+        if not self.file_handle:
+            return []
+        self.file_handle.seek(self.file_position)
+        raw = self.file_handle.readlines()
+        self.file_position = self.file_handle.tell()
+        lines = []
+        for l in raw:
+            try:
+                lines.append(l.decode('utf-8', errors='replace').strip())
+            except Exception:
+                pass
+        return [l for l in lines if l]
+
+    def close(self):
+        if self.file_handle:
+            self.file_handle.close()
+            self.file_handle = None
+
+
+# Lines to suppress from live log - AMP internal noise generated by our own polling
+_LIVE_LOG_BLOCKLIST = [
+    'Authentication attempt for user SVC-AMP-SITEOPS',
+    'Authentication success',
+    'Authentication attempt for user SVC-AMP',
+]
+
+
+def _filter_live_log_lines(lines: list[str]) -> list[str]:
+    """Filter out AMP internal noise, return only meaningful game server output."""
+    out = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if any(blocked in line for blocked in _LIVE_LOG_BLOCKLIST):
+            continue
+        out.append(line)
+    return out
+
+
+def _chunk_log_lines(lines: list[str], max_chars: int = 1900) -> list[str]:
+    """Batch filtered log lines into chunks under Discord's message length limit."""
+    chunks = []
+    chunk = ''
+    for line in lines:
+        if len(chunk) + len(line) + 1 > max_chars:
+            chunks.append(chunk)
+            chunk = ''
+        chunk += line + '\n'
+    if chunk:
+        chunks.append(chunk)
+    return chunks
+
+
+def _parse_stats_channel_ids(raw) -> list[str]:
+    """discord_stats_channel_id is a JSON array of channel IDs, e.g. '["123","456"]'.
+    Falls back to treating a bare numeric string as a single-item list, in case any
+    row was written before the multi-channel migration."""
+    if not raw:
+        return []
+    raw = raw.strip()
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return [str(c) for c in parsed if c]
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return [raw] if raw else []
+
+
+def _parse_stats_message_map(raw) -> dict:
+    """discord_stats_message_id is a JSON object mapping channel_id -> message_id."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return {str(k): str(v) for k, v in parsed.items() if v}
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return {}
+
+
+def _update_discord_message_id(instance_name: str, channel_id: str, msg_id: str | None):
+    """Update just this channel's entry in the per-channel message-id map, so
+    other channels' tracked messages are left untouched."""
+    try:
+        with db_session_scope() as db:
+            row = db.execute(text(
+                "SELECT discord_stats_message_id FROM gamebot_configs WHERE instance_name=:n"
+            ), {'n': instance_name}).fetchone()
+            msg_map = _parse_stats_message_map(row[0] if row else None)
+            if msg_id:
+                msg_map[channel_id] = msg_id
+            else:
+                msg_map.pop(channel_id, None)
+            db.execute(text(
+                "UPDATE gamebot_configs SET discord_stats_message_id=:mid WHERE instance_name=:n"
+            ), {'mid': json.dumps(msg_map), 'n': instance_name})
+    except Exception as e:
+        logger.error(f'[gameserver] _update_discord_message_id: {e}')
+
+
+def _update_server_password(instance_name: str, password: str):
+    """Persist an authoritative AMP password in the shared bot config."""
     try:
         with db_session_scope() as db:
             db.execute(text(
-                "UPDATE gamebot_configs SET discord_stats_message_id=:mid WHERE instance_name=:n"
-            ), {'mid': msg_id, 'n': instance_name})
+                "UPDATE gamebot_configs SET server_password=:pw WHERE instance_name=:n"
+            ), {'pw': password, 'n': instance_name})
     except Exception as e:
-        logger.error(f'[gameserver] _update_discord_message_id: {e}')
+        logger.error(f'[gameserver] _update_server_password: {e}')
+
+
+async def _resolve_server_password(cfg: dict) -> str | None:
+    """Return the cached password, or self-heal it directly from AMP."""
+    cached = cfg.get('server_password')
+    if cached:
+        return str(cached)
+    if not cfg.get('show_password'):
+        return None
+
+    password = await _get_amp_server_password(cfg['instance_name'])
+    if password is not None:
+        _update_server_password(cfg['instance_name'], password)
+        cfg['server_password'] = password
+    return password
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +414,7 @@ def _update_discord_message_id(instance_name: str, msg_id: str | None):
 
 def read_ingame_server_name(instance_name: str, game_type: str) -> str | None:
     """Read the in-game server name from the game's config file on disk."""
-    import xml.etree.ElementTree as ET
+    from defusedxml import ElementTree as ET
     import configparser
     import json as _json
 
@@ -224,13 +438,26 @@ def read_ingame_server_name(instance_name: str, game_type: str) -> str | None:
     name_keys = ['ServerName', 'server_name', 'Name', 'hostname', 'ServerHostName', 'DisplayName']
 
     for glob_pattern in config_globs:
-        matches = sorted(instance_dir.glob(glob_pattern))
+        try:
+            # Recursive glob walks the whole instance tree, including game-managed
+            # save/temp dirs (e.g. Palworld's world_save_temp) that can be created
+            # and removed mid-save - a dir vanishing between listdir and stat during
+            # that walk raises FileNotFoundError here, not inside the parse below.
+            matches = sorted(instance_dir.glob(glob_pattern))
+        except (FileNotFoundError, OSError) as e:
+            logger.debug(f'read_ingame_server_name glob {glob_pattern} for {instance_name}: {e}')
+            continue
         if not matches:
             continue
         config_file = matches[0]
         ext = config_file.suffix.lower()
         try:
             if ext == '.xml':
+                if config_file.stat().st_size > 2 * 1024 * 1024:
+                    logger.warning(
+                        'Skipping oversized XML server config: %s', config_file
+                    )
+                    continue
                 tree = ET.parse(config_file)
                 root = tree.getroot()
                 for key in name_keys:
@@ -321,9 +548,11 @@ async def build_serverinfo_embed(cfg: dict) -> discord.Embed:
         connect = f"{status['ip']}:{status['port']}" if status.get('port') else status['ip']
         embed.add_field(name='IP Address', value=f"```{connect}```", inline=False)
 
-    # Password
-    if cfg.get('show_password') and cfg.get('server_password'):
-        embed.add_field(name='Server Password', value=f"```{cfg['server_password']}```", inline=False)
+    # Password. If the DB cache is blank, recover directly from AMP and
+    # self-heal the shared cache used by both Discord and Fluxer.
+    server_password = await _resolve_server_password(cfg)
+    if server_password:
+        embed.add_field(name='Server Password', value=f"```{server_password}```", inline=False)
 
     # Stats
     if status['cpu'] is not None:
@@ -377,27 +606,49 @@ async def build_serverinfo_embed(cfg: dict) -> discord.Embed:
 # Cog
 # ---------------------------------------------------------------------------
 
+def _embed_fingerprint(embed: discord.Embed) -> tuple:
+    """Content-only signature for change detection - excludes embed.timestamp,
+    which is set to "now" on every build and would otherwise always differ."""
+    data = embed.to_dict()
+    data.pop('timestamp', None)
+    return json.dumps(data, sort_keys=True)
+
+
 class GameServerCog(commands.Cog):
     """Keeps a server-info embed edited in-place in the configured Discord channel."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._last_fingerprint = {}  # (instance_name, channel_id) -> content fingerprint
+        self._log_watchers: dict[str, LogWatcher] = {}
         self.refresh_embeds.start()
+        self.watch_logs.start()
 
     def cog_unload(self):
         self.refresh_embeds.cancel()
+        self.watch_logs.cancel()
+        for watcher in self._log_watchers.values():
+            watcher.close()
 
-    @tasks.loop(seconds=30)
+    @tasks.loop(seconds=35)
     async def refresh_embeds(self):
         try:
             configs = _load_all_configs()
-            for cfg in configs:
+            for i, cfg in enumerate(configs):
                 if not cfg.get('discord_stats_channel_id'):
                     continue
                 try:
                     await self._refresh_one(cfg)
                 except Exception as e:
                     logger.error(f"[gameserver] refresh {cfg['instance_name']}: {e}")
+                # Multiple configs can share the same Discord channel (e.g. a shared
+                # status board) - space out edits so a burst of configs doesn't blow
+                # through Discord's per-channel edit rate limit in one instant. 5s
+                # gives more headroom than 3s did (still occasionally hit the limit)
+                # - a 6-config shared channel now spreads over ~25s, still comfortably
+                # under the 35s loop interval.
+                if i < len(configs) - 1:
+                    await asyncio.sleep(5)
         except Exception as e:
             logger.error(f'[gameserver] refresh_embeds loop error: {e}')
 
@@ -405,53 +656,129 @@ class GameServerCog(commands.Cog):
     async def before_refresh(self):
         await self.bot.wait_until_ready()
         await asyncio.sleep(20)
-        logger.info('[gameserver] status monitor started (30s interval)')
+        logger.info('[gameserver] status monitor started (35s interval)')
+
+    @tasks.loop(seconds=3)
+    async def watch_logs(self):
+        """Tails each Discord-linked instance's AMP log and forwards filtered lines
+        to live_log_discord_channel_id, when alert_live_logs is on. Mirrors
+        questlogfluxer's log watcher - same glob pattern, same filter/chunk logic -
+        but Discord-only and forwarding-only (no join/leave regex processing here)."""
+        try:
+            configs = _load_all_configs()
+            for cfg in configs:
+                if not cfg.get('alert_live_logs') or not cfg.get('live_log_discord_channel_id'):
+                    continue
+                instance_name = cfg['instance_name']
+                log_dir = cfg.get('amp_log_dir', '')
+                try:
+                    log_dir_exists = bool(log_dir) and Path(log_dir).exists()
+                except PermissionError:
+                    logger.warning(f'[gameserver] watch_logs: permission denied on {log_dir} - fix with: sudo chmod o+rx {log_dir}')
+                    continue
+                if not log_dir_exists:
+                    continue
+                if instance_name not in self._log_watchers:
+                    try:
+                        self._log_watchers[instance_name] = LogWatcher(log_dir)
+                        logger.info(f'[gameserver] LogWatcher started for {instance_name}')
+                    except Exception as e:
+                        logger.error(f'[gameserver] LogWatcher init {instance_name}: {e}')
+                        continue
+                watcher = self._log_watchers[instance_name]
+                try:
+                    lines = watcher.read_new_lines()
+                except Exception as e:
+                    logger.error(f'[gameserver] watch_logs read {instance_name}: {e}')
+                    continue
+                if not lines:
+                    continue
+                filtered = _filter_live_log_lines(lines)
+                if not filtered:
+                    continue
+                channel_id = cfg['live_log_discord_channel_id']
+                try:
+                    channel = self.bot.get_channel(int(channel_id))
+                    if channel is None:
+                        channel = await self.bot.fetch_channel(int(channel_id))
+                except Exception as e:
+                    logger.warning(f'[gameserver] watch_logs channel {channel_id} not found for {instance_name}: {e}')
+                    continue
+                for chunk in _chunk_log_lines(filtered):
+                    try:
+                        await channel.send(f'```\n{chunk}\n```')
+                    except Exception as e:
+                        logger.error(f'[gameserver] watch_logs send {instance_name}: {e}')
+        except Exception as e:
+            logger.error(f'[gameserver] watch_logs loop error: {e}')
+
+    @watch_logs.before_loop
+    async def before_watch_logs(self):
+        await self.bot.wait_until_ready()
+        await asyncio.sleep(20)
+        logger.info('[gameserver] live log watcher started (3s poll interval)')
 
     async def _refresh_one(self, cfg: dict):
         instance_name = cfg['instance_name']
-        channel_id    = cfg.get('discord_stats_channel_id')
-        if not channel_id:
+        channel_ids   = _parse_stats_channel_ids(cfg.get('discord_stats_channel_id'))
+        if not channel_ids:
             return
 
-        # Resolve channel
+        msg_map = _parse_stats_message_map(cfg.get('discord_stats_message_id'))
+        embed = await build_serverinfo_embed(cfg)
+        fingerprint = _embed_fingerprint(embed)
+
+        # Each selected channel gets its own live-edited message, tracked independently -
+        # one channel's permission/404 failure must not stop the others from updating.
+        for channel_id in channel_ids:
+            cache_key = (instance_name, channel_id)
+            if self._last_fingerprint.get(cache_key) == fingerprint:
+                continue  # content unchanged since last edit - skip the API call entirely
+            ok = await self._refresh_one_channel(instance_name, channel_id, msg_map.get(channel_id), embed)
+            if ok:
+                self._last_fingerprint[cache_key] = fingerprint
+            # else: leave the cached fingerprint as-is, so a real content change is
+            # retried next cycle instead of being silently swallowed by the cache.
+
+    async def _refresh_one_channel(self, instance_name: str, channel_id: str, old_msg_id: str | None, embed) -> bool:
         channel = self.bot.get_channel(int(channel_id))
         if channel is None:
             try:
                 channel = await self.bot.fetch_channel(int(channel_id))
             except Exception as e:
                 logger.warning(f'[gameserver] channel {channel_id} not found for {instance_name}: {e}')
-                return
+                return False
 
-        embed = await build_serverinfo_embed(cfg)
-
-        old_msg_id = cfg.get('discord_stats_message_id')
         if old_msg_id:
             try:
                 msg = await channel.fetch_message(int(old_msg_id))
                 await msg.edit(embed=embed)
-                logger.debug(f'[gameserver] edited embed for {instance_name} msg={old_msg_id}')
-                return
+                logger.debug(f'[gameserver] edited embed for {instance_name} channel={channel_id} msg={old_msg_id}')
+                return True
             except discord.NotFound:
-                logger.warning(f'[gameserver] message {old_msg_id} not found for {instance_name} - posting fresh')
-                _update_discord_message_id(instance_name, None)
+                logger.warning(f'[gameserver] message {old_msg_id} not found for {instance_name} channel={channel_id} - posting fresh')
+                _update_discord_message_id(instance_name, channel_id, None)
                 old_msg_id = None
             except discord.Forbidden as e:
-                logger.warning(f'[gameserver] no permission to edit msg {old_msg_id} for {instance_name}: {e}')
-                return
+                logger.warning(f'[gameserver] no permission to edit msg {old_msg_id} for {instance_name} channel={channel_id}: {e}')
+                return False
             except Exception as e:
-                logger.warning(f'[gameserver] edit failed for {instance_name} msg={old_msg_id}: {e!r}')
+                logger.warning(f'[gameserver] edit failed for {instance_name} channel={channel_id} msg={old_msg_id}: {e!r}')
                 # Non-404 error (rate limit, server error) - skip this cycle, do NOT post new
-                return
+                return False
 
         # No existing message (first run or 404 cleared it) - post a new one
         try:
             msg = await channel.send(embed=embed)
-            _update_discord_message_id(instance_name, str(msg.id))
+            _update_discord_message_id(instance_name, channel_id, str(msg.id))
             logger.info(f'[gameserver] posted new embed for {instance_name} msg={msg.id} channel={channel_id}')
+            return True
         except discord.Forbidden as e:
             logger.error(f'[gameserver] no permission to send to channel {channel_id} for {instance_name}: {e}')
+            return False
         except Exception as e:
             logger.error(f'[gameserver] send failed for {instance_name}: {e}')
+            return False
 
 
 def setup(bot: commands.Bot):

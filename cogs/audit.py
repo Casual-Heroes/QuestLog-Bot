@@ -3,10 +3,8 @@
 Complete audit system for QuestLog.
 Tracks and logs all server events for accountability and security.
 
-RETENTION BY TIER:
-- FREE: 7 days
-- PREMIUM: 30 days
-- PRO: 90 days
+RETENTION:
+- Audit history is retained uniformly for every community.
 
 TRACKED EVENTS:
 - Member: join, leave, ban, unban, kick, timeout, nickname change
@@ -22,13 +20,39 @@ import io
 import csv
 import asyncio
 import json
+import os
+from collections import defaultdict
 import discord
 from discord.ext import commands, tasks
 from discord import SlashCommandGroup
 from datetime import datetime, timedelta
 
-from config import db_session_scope, logger, get_debug_guilds
+from config import (
+    db_session_scope,
+    logger,
+    get_debug_guilds,
+)
 from models import Guild, GuildMember, AuditLog, AuditAction
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s; using %s", name, default)
+        return default
+
+
+AUDIT_RETENTION_DAYS = _positive_env_int("AUDIT_RETENTION_DAYS", 90)
+AUDIT_RETENTION_ENFORCEMENT_ENABLED = (
+    os.getenv("AUDIT_RETENTION_ENFORCEMENT_ENABLED", "true").lower() == "true"
+)
+AUDIT_DELETED_CONTENT_ENABLED = (
+    os.getenv("AUDIT_DELETED_CONTENT_ENABLED", "false").lower() == "true"
+)
+AUDIT_DELETED_CONTENT_RETENTION_DAYS = _positive_env_int(
+    "AUDIT_DELETED_CONTENT_RETENTION_DAYS", 7
+)
 
 
 # Action type to emoji mapping for display
@@ -87,10 +111,19 @@ class AuditCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        # Discord does not include the invite code in a member-join event. Keep
+        # a snapshot of invite use counts so a join can be matched to the code
+        # whose count increased.
+        self.invite_cache = {}
+        self.invite_locks = defaultdict(asyncio.Lock)
+        self.pending_invite_uses = defaultdict(list)
+        self.invite_cache_task = None
         self.cleanup_old_logs_task.start()
 
     def cog_unload(self):
         self.cleanup_old_logs_task.cancel()
+        if self.invite_cache_task:
+            self.invite_cache_task.cancel()
 
     # ==================== HELPER METHODS ====================
 
@@ -150,6 +183,178 @@ class AuditCog(commands.Cog):
             return cfg.get(action.value, True)
         except Exception:
             return True
+
+    def _member_join_logging_enabled(self, guild_id: int) -> bool:
+        """Check whether this guild needs invite attribution."""
+        with db_session_scope() as session:
+            db_guild = session.get(Guild, guild_id)
+            return bool(
+                db_guild
+                and self._event_allowed(db_guild, AuditAction.MEMBER_JOIN)
+            )
+
+    @staticmethod
+    def _invite_snapshot(invite: discord.Invite) -> dict:
+        """Return the invite fields needed to attribute a future join."""
+        inviter = invite.inviter
+        return {
+            "code": invite.code,
+            "uses": invite.uses or 0,
+            "max_uses": invite.max_uses or 0,
+            "inviter_id": inviter.id if inviter else None,
+            "inviter_name": str(inviter) if inviter else None,
+            "deleted_at": None,
+        }
+
+    async def _fetch_invite_snapshot(self, guild: discord.Guild):
+        """Fetch normal and vanity invites, returning None without access."""
+        bot_member = guild.me
+        if bot_member and not bot_member.guild_permissions.manage_guild:
+            # VIEW_AUDIT_LOG can list invites, but Discord only includes the
+            # use-count metadata needed for attribution with MANAGE_GUILD.
+            return None
+
+        try:
+            invites = await guild.invites()
+            snapshots = {
+                invite.code: self._invite_snapshot(invite)
+                for invite in invites
+            }
+
+            # Vanity invites are not guaranteed to be included in guild.invites().
+            if "VANITY_URL" in guild.features:
+                try:
+                    vanity = await guild.vanity_invite()
+                    if vanity:
+                        snapshots[vanity.code] = self._invite_snapshot(vanity)
+                except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                    pass
+
+            return snapshots
+        except (discord.Forbidden, discord.NotFound):
+            return None
+        except discord.HTTPException as exc:
+            logger.warning(f"Could not fetch invites for {guild.id}: {exc}")
+            return None
+
+    async def _cache_guild_invites(self, guild: discord.Guild):
+        """Populate a guild's baseline invite use counts."""
+        async with self.invite_locks[guild.id]:
+            snapshots = await self._fetch_invite_snapshot(guild)
+            if snapshots is not None:
+                self.invite_cache[guild.id] = snapshots
+
+    async def _initialize_invite_caches(self):
+        """Prime invite counts for guilds that log member joins."""
+        try:
+            with db_session_scope() as session:
+                guild_ids = {
+                    db_guild.guild_id
+                    for db_guild in session.query(Guild).filter(
+                        Guild.audit_logging_enabled.is_(True)
+                    ).all()
+                    if self._event_allowed(db_guild, AuditAction.MEMBER_JOIN)
+                }
+
+            semaphore = asyncio.Semaphore(5)
+
+            async def cache_one(guild):
+                async with semaphore:
+                    await self._cache_guild_invites(guild)
+
+            await asyncio.gather(*(
+                cache_one(guild)
+                for guild in self.bot.guilds
+                if guild.id in guild_ids
+            ))
+            logger.info(f"Audit invite cache initialized for {len(guild_ids)} guilds")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(f"Could not initialize audit invite cache: {exc}")
+
+    async def _find_used_invite(self, guild: discord.Guild):
+        """Find the invite whose use count changed since the last snapshot."""
+        async with self.invite_locks[guild.id]:
+            if self.pending_invite_uses[guild.id]:
+                return self.pending_invite_uses[guild.id].pop(0), "matched"
+
+            previous = self.invite_cache.get(guild.id)
+            current = await self._fetch_invite_snapshot(guild)
+
+            if current is None:
+                return None, "unavailable"
+
+            # The first fetch establishes a baseline but cannot identify the
+            # invite used for the join that triggered it.
+            if previous is None:
+                self.invite_cache[guild.id] = current
+                return None, "not_ready"
+
+            candidates = []
+            for code, invite in current.items():
+                old_invite = previous.get(code)
+                if old_invite and invite["uses"] > old_invite["uses"]:
+                    candidates.append((invite["uses"] - old_invite["uses"], invite))
+
+            # A limited-use invite can disappear immediately after its last
+            # use. Infer it only when exactly one additional use would have
+            # exhausted it.
+            if not candidates:
+                for code, old_invite in previous.items():
+                    if code in current:
+                        continue
+                    deleted_at = old_invite.get("deleted_at")
+                    recently_deleted = (
+                        deleted_at is None
+                        or time.monotonic() - deleted_at <= 15
+                    )
+                    if (
+                        recently_deleted
+                        and old_invite["max_uses"] > 0
+                        and old_invite["uses"] + 1 == old_invite["max_uses"]
+                    ):
+                        consumed = old_invite.copy()
+                        consumed["uses"] += 1
+                        candidates.append((1, consumed))
+
+            self.invite_cache[guild.id] = current
+
+            if not candidates:
+                return None, "unknown"
+
+            # Queue extra matches so near-simultaneous joins using the same
+            # invite are attributed instead of only matching the first event.
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            matches = []
+            for use_increase, invite in candidates:
+                matches.extend(invite.copy() for _ in range(use_increase))
+            self.pending_invite_uses[guild.id].extend(matches[1:])
+            return matches[0], "matched"
+
+    @staticmethod
+    def _format_invite_details(invite: dict, status: str) -> str:
+        """Format invite attribution for the member-join details field."""
+        if not invite:
+            if status == "unavailable":
+                return "Invite used: Unavailable (bot cannot read invite use counts)"
+            if status == "not_ready":
+                return "Invite used: Unknown (invite cache was not ready)"
+            return "Invite used: Unknown (vanity, discovery, or an untracked invite)"
+
+        invite_url = f"https://discord.gg/{invite['code']}"
+        inviter_id = invite.get("inviter_id")
+        inviter_name = invite.get("inviter_name")
+        if inviter_id:
+            inviter = f"{inviter_name or 'Unknown'} (<@{inviter_id}>)"
+        else:
+            inviter = "Unknown"
+
+        return (
+            f"Invite used: {invite_url}\n"
+            f"Inviter: {inviter}\n"
+            f"Invite uses: {invite['uses']}"
+        )
 
     async def _send_log_embed(
         self,
@@ -232,8 +437,41 @@ class AuditCog(commands.Cog):
 
     @tasks.loop(hours=24)
     async def cleanup_old_logs_task(self):
-        """Audit logs are retained indefinitely — no cleanup needed."""
-        logger.debug("Audit log cleanup task running — retention is unlimited, nothing to delete")
+        """Enforce bounded audit and optional message-content retention."""
+        if not AUDIT_RETENTION_ENFORCEMENT_ENABLED:
+            logger.info(
+                "Audit retention enforcement is pending explicit approval; "
+                "no historical rows were deleted"
+            )
+            return
+
+        now = int(time.time())
+        audit_cutoff = now - (AUDIT_RETENTION_DAYS * 86400)
+        content_cutoff = now - (AUDIT_DELETED_CONTENT_RETENTION_DAYS * 86400)
+
+        with db_session_scope() as session:
+            deleted = session.query(AuditLog).filter(
+                AuditLog.timestamp < audit_cutoff
+            ).delete(synchronize_session=False)
+
+            redacted = 0
+            if AUDIT_DELETED_CONTENT_ENABLED:
+                content_logs = session.query(AuditLog).filter(
+                    AuditLog.action == AuditAction.MESSAGE_DELETE,
+                    AuditLog.timestamp < content_cutoff,
+                    AuditLog.details.like("%\nContent:%"),
+                ).all()
+                for log in content_logs:
+                    log.details = log.details.split("\nContent:", 1)[0] + "\nContent: [expired]"
+                    redacted += 1
+
+        if deleted or redacted:
+            logger.info(
+                "Audit retention removed %s expired records and redacted %s "
+                "expired message bodies",
+                deleted,
+                redacted,
+            )
 
     @cleanup_old_logs_task.before_loop
     async def before_cleanup(self):
@@ -242,10 +480,46 @@ class AuditCog(commands.Cog):
     # ==================== EVENT LISTENERS ====================
 
     @commands.Cog.listener()
+    async def on_ready(self):
+        """Initialize invite baselines without blocking the ready event."""
+        if not self.invite_cache_task or self.invite_cache_task.done():
+            self.invite_cache_task = asyncio.create_task(
+                self._initialize_invite_caches()
+            )
+
+    @commands.Cog.listener()
+    async def on_invite_create(self, invite: discord.Invite):
+        """Add a newly created invite to the attribution cache."""
+        if not invite.guild:
+            return
+        async with self.invite_locks[invite.guild.id]:
+            guild_cache = self.invite_cache.setdefault(invite.guild.id, {})
+            guild_cache[invite.code] = self._invite_snapshot(invite)
+
+    @commands.Cog.listener()
+    async def on_invite_delete(self, invite: discord.Invite):
+        """Keep cached data briefly so consumed one-use invites can match."""
+        if not invite.guild:
+            return
+        async with self.invite_locks[invite.guild.id]:
+            cached = self.invite_cache.get(invite.guild.id, {}).get(invite.code)
+            if cached:
+                cached["deleted_at"] = time.monotonic()
+
+    @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         """Log member join."""
-        if member.bot:
+        if not self._member_join_logging_enabled(member.guild.id):
             return
+
+        invite, invite_status = await self._find_used_invite(member.guild)
+        if member.bot:
+            # Advance invite counts so a bot installation is not attributed to
+            # the next human member who joins.
+            return
+
+        account_created = f"Account created: <t:{int(member.created_at.timestamp())}:R>"
+        invite_details = self._format_invite_details(invite, invite_status)
 
         await self.log_event(
             guild_id=member.guild.id,
@@ -253,7 +527,7 @@ class AuditCog(commands.Cog):
             target_id=member.id,
             target_name=str(member),
             target_type="user",
-            details=f"Account created: <t:{int(member.created_at.timestamp())}:R>",
+            details=f"{account_created}\n{invite_details}",
             category="member"
         )
 
@@ -665,8 +939,10 @@ class AuditCog(commands.Cog):
         except (discord.Forbidden, discord.NotFound):
             pass
 
-        # Truncate content for storage
-        content = message.content[:500] + "..." if len(message.content) > 500 else message.content
+        details = f"Channel: <#{message.channel.id}>"
+        if AUDIT_DELETED_CONTENT_ENABLED:
+            content = message.content[:500] + "..." if len(message.content) > 500 else message.content
+            details += f"\nContent: {content}"
 
         await self.log_event(
             guild_id=message.guild.id,
@@ -676,7 +952,7 @@ class AuditCog(commands.Cog):
             target_id=message.author.id,
             target_name=str(message.author),
             target_type="user",
-            details=f"Channel: <#{message.channel.id}>\nContent: {content}",
+            details=details,
             category="message"
         )
 
@@ -1134,7 +1410,20 @@ class AuditCog(commands.Cog):
                 )
                 embed.add_field(
                     name="Retention",
-                    value="Unlimited",
+                    value=(
+                        f"{AUDIT_RETENTION_DAYS} days"
+                        if AUDIT_RETENTION_ENFORCEMENT_ENABLED
+                        else f"{AUDIT_RETENTION_DAYS} days (pending enforcement)"
+                    ),
+                    inline=True
+                )
+                embed.add_field(
+                    name="Deleted Message Content",
+                    value=(
+                        f"Enabled for {AUDIT_DELETED_CONTENT_RETENTION_DAYS} days"
+                        if AUDIT_DELETED_CONTENT_ENABLED
+                        else "Metadata only"
+                    ),
                     inline=True
                 )
                 await ctx.respond(embed=embed, ephemeral=True)
@@ -1143,6 +1432,9 @@ class AuditCog(commands.Cog):
                     "**Audit settings updated:**\n" + "\n".join(changes),
                     ephemeral=True
                 )
+
+        if enabled:
+            await self._cache_guild_invites(ctx.guild)
 
 
 def setup(bot: commands.Bot):

@@ -248,7 +248,7 @@ class ActivityTrackerCog(commands.Cog):
             # Build preview
             preview = f"{emoji} " if emoji else ""
             if game_name:
-                preview += f"{label}: X members — Y currently playing"
+                preview += f"{label}: X members - Y currently playing"
             else:
                 preview += f"{label}: X members"
 

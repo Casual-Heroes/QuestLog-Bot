@@ -30,6 +30,8 @@
 #   - Never relay messages starting with "**[D]" or "**[F]"
 
 import asyncio
+import io
+import ipaddress
 import logging
 import re
 import urllib.parse
@@ -38,7 +40,16 @@ import aiohttp
 import discord
 from discord.ext import commands
 
-from config import logger, QUESTLOG_INTERNAL_API_URL, QUESTLOG_BOT_SECRET, MATRIX_ACCESS_TOKEN, MATRIX_HOMESERVER, FLUXER_API_URL, FLUXER_BOT_TOKEN
+from config import (
+    BRIDGE_MEDIA_ALLOWED_HOSTS,
+    FLUXER_API_URL,
+    FLUXER_BOT_TOKEN,
+    MATRIX_ACCESS_TOKEN,
+    MATRIX_HOMESERVER,
+    QUESTLOG_BOT_SECRET,
+    QUESTLOG_INTERNAL_API_URL,
+    logger,
+)
 
 _BASE = QUESTLOG_INTERNAL_API_URL.rstrip('/')
 _RELAY_URL              = _BASE + '/api/internal/bridge/relay/'
@@ -62,6 +73,100 @@ _CUSTOM_EMOJI_RE = re.compile(r'<a?:(\w+):\d+>')
 
 # Matches a string that is purely one or more URLs (possibly separated by whitespace)
 _URL_ONLY_RE = re.compile(r'^(https?://\S+\s*)+$')
+_MAX_MEDIA_BYTES = 25 * 1024 * 1024
+
+
+def _url_hostname(url: str) -> str:
+    try:
+        return (urllib.parse.urlsplit(url).hostname or '').lower().rstrip('.')
+    except (TypeError, ValueError):
+        return ''
+
+
+_TRUSTED_MEDIA_HOSTS = {
+    host
+    for host in (
+        'cdn.discordapp.com',
+        'media.discordapp.net',
+        _url_hostname(QUESTLOG_INTERNAL_API_URL),
+        _url_hostname(MATRIX_HOMESERVER),
+        _url_hostname(FLUXER_API_URL),
+        *BRIDGE_MEDIA_ALLOWED_HOSTS,
+    )
+    if host
+}
+
+
+def _bridge_media_url_allowed(url: str) -> bool:
+    """Allow HTTPS media only from explicitly trusted bridge services."""
+    if not isinstance(url, str) or not url:
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme.lower() != 'https' or not parsed.hostname:
+            return False
+        if parsed.username or parsed.password or parsed.port not in (None, 443):
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    hostname = parsed.hostname.lower().rstrip('.')
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        address = None
+    if address and not address.is_global:
+        return False
+    return hostname in _TRUSTED_MEDIA_HOSTS
+
+
+def _safe_attachment_filename(value: object) -> str:
+    """Return a short display filename without paths or control characters."""
+    filename = str(value or 'file').replace('\\', '/').rsplit('/', 1)[-1]
+    filename = ''.join(ch for ch in filename if ch.isprintable() and ch not in '\r\n')
+    return filename[:100] or 'file'
+
+# Channel mention maps built from web_bridge_configs - loaded lazily, refreshed every 5 min
+import time as _time
+from config import db_session_scope
+from sqlalchemy import text as _sa_text
+
+_channel_map_cache: dict = {
+    'fluxer_to_discord': {},
+    'discord_to_fluxer': {},
+    'bridge_to_discord': {},
+    'ts': 0,
+}
+_CHANNEL_MAP_TTL = 300
+
+def _get_channel_maps() -> tuple[dict, dict]:
+    """Return (fluxer_to_discord, discord_to_fluxer) channel ID maps, refreshed every 5 min."""
+    now = _time.time()
+    if now - _channel_map_cache['ts'] < _CHANNEL_MAP_TTL:
+        return _channel_map_cache['fluxer_to_discord'], _channel_map_cache['discord_to_fluxer']
+    try:
+        with db_session_scope() as db:
+            rows = db.execute(_sa_text(
+                "SELECT id, fluxer_channel_id, discord_channel_id FROM web_bridge_configs "
+                "WHERE enabled=1 AND fluxer_channel_id IS NOT NULL AND discord_channel_id IS NOT NULL"
+            )).fetchall()
+        f2d = {str(r[1]): str(r[2]) for r in rows}
+        d2f = {str(r[2]): str(r[1]) for r in rows}
+        b2d = {str(r[0]): str(r[2]) for r in rows}
+        _channel_map_cache.update({
+            'fluxer_to_discord': f2d,
+            'discord_to_fluxer': d2f,
+            'bridge_to_discord': b2d,
+            'ts': now,
+        })
+    except Exception as e:
+        logger.warning(f"bridge: failed to load channel maps: {e}")
+    return _channel_map_cache['fluxer_to_discord'], _channel_map_cache['discord_to_fluxer']
+
+
+def _bridge_discord_channel_id(bridge_id: object) -> str | None:
+    _get_channel_maps()
+    return _channel_map_cache['bridge_to_discord'].get(str(bridge_id))
 
 
 def _format_bridged(tag: str, author: str, content: str, reply_quote: str = '') -> str:
@@ -104,10 +209,25 @@ def _resolve_discord_content(message: discord.Message) -> tuple[str, list]:
     # Normalise <@!userid> -> <@userid> so hub regex matches consistently
     content = re.sub(r'<@!(\d+)>', r'<@\1>', content)
 
-    # <@&roleid> -> @RoleName (roles don't cross platforms)
+    # Cross-platform role ID map: Discord role ID -> Fluxer role ID
+    _DISCORD_TO_FLUXER_ROLE = {
+        '1498930201684607079': '1499018775998290211',  # FFXIV
+        '1498930285872676965': '1499018948065409470',  # FFXIV LFG
+        '1455616176129314908': '1499021843552864734',  # ESO
+        '1456330068665303121': '1499021905674721756',  # ESO LFG
+    }
+    # <@&roleid> -> Fluxer <@&roleid> if mapped, else @RoleName text
     content = re.sub(
         r'<@&(\d+)>',
-        lambda m: f'@{role_map.get(m.group(1), "role")}',
+        lambda m: f'<@&{_DISCORD_TO_FLUXER_ROLE[m.group(1)]}>' if m.group(1) in _DISCORD_TO_FLUXER_ROLE else f'@{role_map.get(m.group(1), "role")}',
+        content,
+    )
+    # <#channelid> -> Fluxer <#channelid> if mapped, else #channel-name text
+    _, d2f = _get_channel_maps()
+    channel_map = {str(ch.id): ch.name for ch in message.channel_mentions} if message.channel_mentions else {}
+    content = re.sub(
+        r'<#(\d+)>',
+        lambda m: f'<#{d2f[m.group(1)]}>' if m.group(1) in d2f else f'#{channel_map.get(m.group(1), "channel")}',
         content,
     )
     # <:name:id> and <a:name:id> (custom / animated emoji) -> :name:
@@ -152,6 +272,70 @@ class BridgeCog(commands.Cog):
         if self._session and not self._session.closed:
             asyncio.create_task(self._session.close())
 
+    async def _resolve_configured_discord_channel(
+        self,
+        channel_id: object,
+        *,
+        expected_parent_id: object | None = None,
+    ):
+        """Resolve only configured bridge channels or their verified threads."""
+        channel_id_str = str(channel_id or '')
+        if not channel_id_str.isdigit():
+            return None
+
+        _, discord_to_fluxer = _get_channel_maps()
+        configured_ids = set(discord_to_fluxer)
+        expected_parent = str(expected_parent_id or '')
+        if expected_parent and expected_parent not in configured_ids:
+            return None
+
+        channel = self.bot.get_channel(int(channel_id_str))
+        if channel is None and (channel_id_str in configured_ids or expected_parent):
+            try:
+                channel = await self.bot.fetch_channel(int(channel_id_str))
+            except Exception:
+                return None
+        if channel is None:
+            return None
+
+        parent_id = str(getattr(channel, 'parent_id', '') or '')
+        if expected_parent:
+            return channel if parent_id == expected_parent else None
+        if channel_id_str in configured_ids or parent_id in configured_ids:
+            return channel
+        return None
+
+    async def _download_bridge_media(self, url: str) -> bytes:
+        """Download trusted bridge media with redirect and memory limits."""
+        if not _bridge_media_url_allowed(url):
+            raise ValueError("media URL host is not allowlisted")
+        if not self._session or self._session.closed:
+            raise RuntimeError("bridge HTTP session is unavailable")
+
+        async with self._session.get(
+            url,
+            allow_redirects=False,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status != 200:
+                raise ValueError(f"media server returned HTTP {resp.status}")
+            content_length = resp.headers.get('Content-Length')
+            if content_length:
+                try:
+                    if int(content_length) > _MAX_MEDIA_BYTES:
+                        raise ValueError("media exceeds the 25 MiB limit")
+                except ValueError as exc:
+                    if "exceeds" in str(exc):
+                        raise
+                    raise ValueError("invalid media Content-Length") from exc
+
+            body = bytearray()
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                body.extend(chunk)
+                if len(body) > _MAX_MEDIA_BYTES:
+                    raise ValueError("media exceeds the 25 MiB limit")
+            return bytes(body)
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         """Relay Discord messages to Fluxer via hub queue."""
@@ -163,11 +347,19 @@ class BridgeCog(commands.Cog):
         if message.content and message.content.lstrip().startswith(('!', '/')):
             return
 
+        bridge_channel_id = str(
+            message.channel.parent_id
+            if isinstance(message.channel, discord.Thread)
+            else message.channel.id
+        )
+        _, discord_to_fluxer = _get_channel_maps()
+        if bridge_channel_id not in discord_to_fluxer:
+            return
+
         # Resolve mentions and custom emoji - keeps raw <@id> tokens for hub cross-platform resolution
         content, mentions = _resolve_discord_content(message)
 
-        # Convert @everyone/@here to @room for Matrix
-        content = content.replace('@everyone', '@room').replace('@here', '@room')
+        # @here and @everyone are native on both platforms - pass through as-is
 
         # If no text, check for stickers and relay them as image URLs
         if not content and message.stickers:
@@ -278,10 +470,8 @@ class BridgeCog(commands.Cog):
         # Thread detection: if message is in a thread, use the thread's parent channel for bridge lookup
         # and pass the thread_id so the hub can map it to the Matrix thread
         thread_id = None
-        bridge_channel_id = str(message.channel.id)
         if isinstance(message.channel, discord.Thread):
             thread_id = str(message.channel.id)
-            bridge_channel_id = str(message.channel.parent_id)
 
         avatar_url = str(message.author.display_avatar.url) if message.author.display_avatar else None
         payload = {
@@ -316,6 +506,8 @@ class BridgeCog(commands.Cog):
     @commands.Cog.listener()
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
         """Relay message deletions to Fluxer via hub."""
+        if await self._resolve_configured_discord_channel(payload.channel_id) is None:
+            return
         try:
             if self._session and not self._session.closed:
                 async with self._session.post(
@@ -335,6 +527,8 @@ class BridgeCog(commands.Cog):
     @commands.Cog.listener()
     async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent):
         """Relay Discord message edits to Fluxer via hub."""
+        if await self._resolve_configured_discord_channel(payload.channel_id) is None:
+            return
         new_content = (payload.data.get('content') or '').strip()
         if not new_content:
             return
@@ -372,6 +566,8 @@ class BridgeCog(commands.Cog):
         emoji_str = str(payload.emoji)
         if not emoji_str:
             return
+        if await self._resolve_configured_discord_channel(payload.channel_id) is None:
+            return
 
         try:
             if self._session and not self._session.closed:
@@ -397,10 +593,14 @@ class BridgeCog(commands.Cog):
             return
         if not self._session or self._session.closed:
             return
+        source_channel_id = str(getattr(channel, 'parent_id', None) or channel.id)
+        _, discord_to_fluxer = _get_channel_maps()
+        if source_channel_id not in discord_to_fluxer:
+            return
         try:
             async with self._session.post(
                 _TYPING_URL,
-                json={'platform': 'discord', 'channel_id': str(channel.id)},
+                json={'platform': 'discord', 'channel_id': source_channel_id},
                 headers=_HEADERS,
                 timeout=aiohttp.ClientTimeout(total=3)
             ) as resp:
@@ -490,6 +690,23 @@ class BridgeCog(commands.Cog):
             if not channel_id_str or (not content and not attachments):
                 continue
 
+            expected_channel_id = _bridge_discord_channel_id(bridge_id)
+            if expected_channel_id != channel_id_str:
+                logger.warning(
+                    "BridgeCog: rejected relay %s with channel %s outside bridge %s",
+                    relay_id,
+                    channel_id_str,
+                    bridge_id,
+                )
+                continue
+            channel = await self._resolve_configured_discord_channel(channel_id_str)
+            if channel is None:
+                logger.warning(
+                    "BridgeCog: configured Discord channel %s is unavailable",
+                    channel_id_str,
+                )
+                continue
+
             # Only include the blockquote if we can't do a native reply
             rq = reply_quote if (reply_quote and not reply_to_event_id) else ''
             formatted = _format_bridged(tag, author, content, rq)
@@ -500,7 +717,7 @@ class BridgeCog(commands.Cog):
             for att in attachments:
                 # Prefer discord_url (direct Matrix URL) over the public proxy url
                 url = att.get('discord_url') or att.get('url', '')
-                filename = att.get('filename') or 'file'
+                filename = _safe_attachment_filename(att.get('filename'))
                 content_type = att.get('content_type', '')
                 if not url:
                     continue
@@ -510,42 +727,37 @@ class BridgeCog(commands.Cog):
                 )
                 if is_image:
                     try:
-                        async with self._session.get(
-                            url,
-                            timeout=aiohttp.ClientTimeout(total=15)
-                        ) as resp:
-                            if resp.status == 200:
-                                data_bytes = await resp.read()
-                                # Discord limit: 25MB for non-boosted servers
-                                if len(data_bytes) > 25 * 1024 * 1024:
-                                    logger.warning(f"BridgeCog: skipping {filename} ({len(data_bytes)//1024}KB) - exceeds Discord 25MB limit")
-                                    plain_urls.append(att.get('url', url))
-                                else:
-                                    import io
-                                    discord_files.append(discord.File(io.BytesIO(data_bytes), filename=filename))
-                            else:
-                                plain_urls.append(att.get('url', url))
+                        data_bytes = await self._download_bridge_media(url)
+                        discord_files.append(
+                            discord.File(io.BytesIO(data_bytes), filename=filename)
+                        )
                     except Exception as e:
                         logger.warning(f"BridgeCog: media download failed: {e}")
-                        plain_urls.append(att.get('url', url))
+                        public_url = att.get('url', '')
+                        if _bridge_media_url_allowed(public_url):
+                            plain_urls.append(public_url)
                 else:
-                    plain_urls.append(att.get('url', url))
+                    public_url = att.get('url', '')
+                    if _bridge_media_url_allowed(public_url):
+                        plain_urls.append(public_url)
 
             if plain_urls:
                 formatted = (formatted + '\n' + '\n'.join(plain_urls)).strip()
 
             try:
-                channel = self.bot.get_channel(int(channel_id_str))
-                if channel is None:
-                    channel = await self.bot.fetch_channel(int(channel_id_str))
-
                 # Thread handling: route into existing thread or create new one
                 send_channel = channel
                 if source_thread_id:
                     if target_thread_id:
                         # Already mapped - send into existing Discord thread
                         try:
-                            send_channel = await self.bot.fetch_channel(int(target_thread_id))
+                            resolved_thread = await self._resolve_configured_discord_channel(
+                                target_thread_id,
+                                expected_parent_id=channel_id_str,
+                            )
+                            if resolved_thread is None:
+                                raise ValueError("thread is outside the configured bridge channel")
+                            send_channel = resolved_thread
                         except Exception:
                             send_channel = channel  # Thread gone, fall back to main channel
                     else:
@@ -648,9 +860,10 @@ class BridgeCog(commands.Cog):
             if not message_id or not channel_id or not emoji:
                 continue
             try:
-                channel = self.bot.get_channel(int(channel_id))
+                channel = await self._resolve_configured_discord_channel(channel_id)
                 if channel is None:
-                    channel = await self.bot.fetch_channel(int(channel_id))
+                    logger.warning("BridgeCog: rejected reaction target channel %s", channel_id)
+                    continue
                 message = await channel.fetch_message(int(message_id))
                 await message.add_reaction(emoji)
             except discord.Forbidden:
@@ -681,9 +894,10 @@ class BridgeCog(commands.Cog):
             if not message_id or not channel_id:
                 continue
             try:
-                channel = self.bot.get_channel(int(channel_id))
+                channel = await self._resolve_configured_discord_channel(channel_id)
                 if channel is None:
-                    channel = await self.bot.fetch_channel(int(channel_id))
+                    logger.warning("BridgeCog: rejected deletion target channel %s", channel_id)
+                    continue
                 message = await channel.fetch_message(int(message_id))
                 await message.delete()
             except discord.NotFound:
@@ -717,9 +931,10 @@ class BridgeCog(commands.Cog):
             if not message_id or not channel_id or not new_content:
                 continue
             try:
-                channel = self.bot.get_channel(int(channel_id))
+                channel = await self._resolve_configured_discord_channel(channel_id)
                 if channel is None:
-                    channel = await self.bot.fetch_channel(int(channel_id))
+                    logger.warning("BridgeCog: rejected edit target channel %s", channel_id)
+                    continue
                 message = await channel.fetch_message(int(message_id))
                 await message.edit(content=new_content)
             except discord.NotFound:

@@ -1,7 +1,6 @@
 # lfg_cog.py - Generic LFG (Looking For Group) System
 # Works with any game configured in the dashboard
-# FREE: IGDB search, custom games, custom options (weapons/classes/ranks), groups, threads
-# PREMIUM/PRO: Attendance tracking, no-show reporting, reliability scores, member stats, flake detection
+# Includes IGDB search, custom games and options, groups, attendance, and reliability tools.
 
 import asyncio
 import json
@@ -20,7 +19,9 @@ from models import (
     LFGGame, LFGGroup, LFGMember, Guild,
     LFGAttendance, LFGMemberStats, LFGConfig, AttendanceStatus
 )
+from config import LFG_CANONICAL_API_ENABLED, LFG_LEGACY_WRITES_ENABLED
 from utils import igdb
+from utils.lfg_api import LFGAPIError
 from cogs.lfg_role_mappings import (
     detect_role, get_builtin_game_type, get_role_emoji, get_role_label,
     GENERIC_ROLE_CHOICES
@@ -41,6 +42,205 @@ TIMEZONE_ALIASES = {
 }
 
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+class _LegacyWriteDisabled(Exception):
+    """Internal control flow used while local compatibility writes are off."""
+
+
+def _lfg_api_client(bot):
+    api_cog = bot.get_cog("LFGAPICog")
+    return api_cog.client if api_cog else None
+
+
+def _canonical_group_ref(group):
+    return getattr(group, "canonical_group_id", None) or getattr(
+        group, "canonical_share_token", None
+    )
+
+
+def _uses_canonical_api(group) -> bool:
+    return LFG_CANONICAL_API_ENABLED and bool(_canonical_group_ref(group))
+
+
+def _resolve_questlog_context(discord_user_id: int, guild_id: int):
+    """Resolve a Discord actor and community to canonical QuestLog IDs."""
+    from sqlalchemy import text as sql_text
+
+    with get_db_session() as session:
+        actor = session.execute(
+            sql_text(
+                "SELECT id FROM web_users "
+                "WHERE discord_id=:discord_id AND is_banned=0 LIMIT 1"
+            ),
+            {"discord_id": str(discord_user_id)},
+        ).fetchone()
+        community = session.execute(
+            sql_text(
+                "SELECT id FROM web_communities "
+                "WHERE platform='discord' AND platform_id=:guild_id "
+                "AND is_active=1 LIMIT 1"
+            ),
+            {"guild_id": str(guild_id)},
+        ).fetchone()
+    return (
+        int(actor[0]) if actor else None,
+        int(community[0]) if community else None,
+    )
+
+
+def _canonical_error_message(error: LFGAPIError) -> str:
+    messages = {
+        "lfg_full": "This group is full.",
+        "already_member": "You're already in this group.",
+        "not_a_member": "You are not in this group.",
+        "not_found": "This LFG group no longer exists.",
+        "permission_denied": "QuestLog did not authorize this LFG action.",
+        "forbidden": "QuestLog did not authorize this LFG action.",
+        "client_not_configured": "The QuestLog LFG connection is not configured.",
+        "transport_error": "QuestLog is temporarily unavailable. Please try again.",
+    }
+    return messages.get(error.code, error.message or "The LFG action failed.")
+
+
+async def _send_interaction_error(interaction: discord.Interaction, message: str):
+    if interaction.response.is_done():
+        response = await interaction.followup.send(message, ephemeral=True)
+        asyncio.create_task(_auto_delete_after(response))
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+        asyncio.create_task(_auto_delete_after(interaction))
+
+
+async def _canonical_join(interaction, group, payload=None) -> bool:
+    canonical_ref = _canonical_group_ref(group)
+    if not _uses_canonical_api(group):
+        return True
+
+    actor_id, _ = _resolve_questlog_context(
+        interaction.user.id, interaction.guild.id
+    )
+    if not actor_id:
+        await _send_interaction_error(
+            interaction,
+            "Link your Discord account to QuestLog before joining this group.",
+        )
+        return False
+
+    client = _lfg_api_client(interaction.client)
+    if not client:
+        await _send_interaction_error(
+            interaction, "The QuestLog LFG connection is unavailable."
+        )
+        return False
+    try:
+        await client.join_group(
+            canonical_ref,
+            payload or {},
+            actor_user_id=actor_id,
+            idempotency_key=f"discord:{interaction.id}:lfg:join",
+        )
+        return True
+    except LFGAPIError as error:
+        await _send_interaction_error(interaction, _canonical_error_message(error))
+        return False
+
+
+async def _canonical_leave(interaction, group) -> bool:
+    canonical_ref = _canonical_group_ref(group)
+    if not _uses_canonical_api(group):
+        return True
+
+    actor_id, _ = _resolve_questlog_context(
+        interaction.user.id, interaction.guild.id
+    )
+    if not actor_id:
+        await _send_interaction_error(
+            interaction,
+            "Link your Discord account to QuestLog before leaving this group.",
+        )
+        return False
+
+    client = _lfg_api_client(interaction.client)
+    if not client:
+        await _send_interaction_error(
+            interaction, "The QuestLog LFG connection is unavailable."
+        )
+        return False
+    try:
+        await client.leave_group(
+            canonical_ref,
+            actor_user_id=actor_id,
+            idempotency_key=f"discord:{interaction.id}:lfg:leave",
+        )
+        return True
+    except LFGAPIError as error:
+        await _send_interaction_error(interaction, _canonical_error_message(error))
+        return False
+
+
+async def _canonical_update_member(interaction, group, payload) -> bool:
+    canonical_ref = _canonical_group_ref(group)
+    if not _uses_canonical_api(group):
+        return True
+
+    actor_id, _ = _resolve_questlog_context(
+        interaction.user.id, interaction.guild.id
+    )
+    if not actor_id:
+        await _send_interaction_error(
+            interaction,
+            "Link your Discord account to QuestLog before updating your LFG role.",
+        )
+        return False
+    client = _lfg_api_client(interaction.client)
+    try:
+        await client.update_member(
+            canonical_ref,
+            payload,
+            actor_user_id=actor_id,
+            idempotency_key=f"discord:{interaction.id}:lfg:member-update",
+        )
+        return True
+    except (AttributeError, LFGAPIError) as error:
+        if isinstance(error, LFGAPIError):
+            message = _canonical_error_message(error)
+        else:
+            message = "The QuestLog LFG connection is unavailable."
+        await _send_interaction_error(interaction, message)
+        return False
+
+
+async def _canonical_update_group(interaction, group, payload) -> bool:
+    canonical_ref = _canonical_group_ref(group)
+    if not _uses_canonical_api(group):
+        return True
+
+    actor_id, _ = _resolve_questlog_context(
+        interaction.user.id, interaction.guild.id
+    )
+    if not actor_id:
+        await _send_interaction_error(
+            interaction,
+            "Link your Discord account to QuestLog before editing this group.",
+        )
+        return False
+    client = _lfg_api_client(interaction.client)
+    try:
+        await client.update_group(
+            canonical_ref,
+            payload,
+            actor_user_id=actor_id,
+            idempotency_key=f"discord:{interaction.id}:lfg:group-update",
+        )
+        return True
+    except (AttributeError, LFGAPIError) as error:
+        if isinstance(error, LFGAPIError):
+            message = _canonical_error_message(error)
+        else:
+            message = "The QuestLog LFG connection is unavailable."
+        await _send_interaction_error(interaction, message)
+        return False
 
 
 def _sync_web_lfg_mirror(session, discord_group_id: int, new_member_count: int, is_full: bool):
@@ -594,7 +794,7 @@ class GroupManagementView(discord.ui.View):
             # ─────────────────────────────────────────────────────────────────
             # ROLE ROW 1: Tank | Healer | DPS (always 3 columns)
             # ─────────────────────────────────────────────────────────────────
-            tank_value = "\n".join(tanks_list[:8]) if tanks_list else "—"
+            tank_value = "\n".join(tanks_list[:8]) if tanks_list else "None"
             if len(tanks_list) > 8:
                 tank_value += f"\n*+{len(tanks_list) - 8} more*"
             embed.add_field(
@@ -603,7 +803,7 @@ class GroupManagementView(discord.ui.View):
                 inline=True
             )
 
-            healer_value = "\n".join(healers_list[:8]) if healers_list else "—"
+            healer_value = "\n".join(healers_list[:8]) if healers_list else "None"
             if len(healers_list) > 8:
                 healer_value += f"\n*+{len(healers_list) - 8} more*"
             embed.add_field(
@@ -612,7 +812,7 @@ class GroupManagementView(discord.ui.View):
                 inline=True
             )
 
-            dps_value = "\n".join(dps_list[:8]) if dps_list else "—"
+            dps_value = "\n".join(dps_list[:8]) if dps_list else "None"
             if len(dps_list) > 8:
                 dps_value += f"\n*+{len(dps_list) - 8} more*"
             embed.add_field(
@@ -631,7 +831,7 @@ class GroupManagementView(discord.ui.View):
             if has_support or has_flex or has_unassigned:
                 # Support column
                 if has_support:
-                    support_value = "\n".join(support_list[:8]) if support_list else "—"
+                    support_value = "\n".join(support_list[:8]) if support_list else "None"
                     if len(support_list) > 8:
                         support_value += f"\n*+{len(support_list) - 8} more*"
                     embed.add_field(
@@ -915,7 +1115,10 @@ class OptionSelect(discord.ui.Select):
         selected_value = self.values[0]
 
         # Activity can only be changed by the leader or co-leader
-        if self.option_name.lower() == "activity":
+        if (
+            self.option_name.lower() == "activity"
+            and not _uses_canonical_api(self.parent_view.group)
+        ):
             is_leader_or_co_leader = False
             if interaction.user.id == self.parent_view.group.creator_id:
                 is_leader_or_co_leader = True
@@ -947,7 +1150,10 @@ class OptionSelect(discord.ui.Select):
         if interaction.user.id not in self.parent_view.member_data:
             # Check if group is full
             max_size = self.parent_view.group.max_group_size or self.parent_view.game.max_group_size
-            if len(self.parent_view.member_data) >= max_size:
+            if (
+                not _uses_canonical_api(self.parent_view.group)
+                and len(self.parent_view.member_data) >= max_size
+            ):
                 await interaction.response.send_message("❌ This group is full!", ephemeral=True)
                 asyncio.create_task(_auto_delete_after(interaction))
                 return
@@ -961,7 +1167,11 @@ class OptionSelect(discord.ui.Select):
             has_role_composition = any([tanks_needed, healers_needed, dps_needed, support_needed])
             enforce_role_limits = getattr(group, 'enforce_role_limits', True)
 
-            if has_role_composition and enforce_role_limits:
+            if (
+                has_role_composition
+                and enforce_role_limits
+                and not _uses_canonical_api(group)
+            ):
                 # Create temporary options dict with the new selection
                 temp_options = {self.option_name: selected_value}
 
@@ -1011,11 +1221,20 @@ class OptionSelect(discord.ui.Select):
                         asyncio.create_task(_auto_delete_after(interaction))
                         return
 
+            if not await _canonical_join(
+                interaction,
+                self.parent_view.group,
+                {"selections": {self.option_name: selected_value}},
+            ):
+                return
+
             # Add to group
             self.parent_view.member_data[interaction.user.id] = {"options": {}}
 
             # Add to database
             try:
+                if not LFG_LEGACY_WRITES_ENABLED:
+                    raise _LegacyWriteDisabled()
                 with get_db_session() as session:
                     import json as json_lib
                     from models import LFGMember, LFGGroup, LFGConfig
@@ -1055,6 +1274,8 @@ class OptionSelect(discord.ui.Select):
 
                     if config and config.attendance_tracking_enabled:
                         await _auto_confirm_attendance(session, self.parent_view.group.id, interaction.user.id)
+            except _LegacyWriteDisabled:
+                pass
             except Exception as e:
                 logger.error(f"Error during auto-join on role selection: {e}")
 
@@ -1121,7 +1342,11 @@ class OptionSelect(discord.ui.Select):
             has_role_composition = any([tanks_needed, healers_needed, dps_needed, support_needed])
             enforce_role_limits = getattr(group, 'enforce_role_limits', True)
 
-            if has_role_composition and enforce_role_limits:
+            if (
+                has_role_composition
+                and enforce_role_limits
+                and not _uses_canonical_api(group)
+            ):
                 # Create temp options with the NEW selection to detect NEW role
                 temp_options = dict(self.parent_view.member_data[interaction.user.id].get("options", {}))
                 temp_options[self.option_name] = selected_value
@@ -1183,11 +1408,27 @@ class OptionSelect(discord.ui.Select):
                         asyncio.create_task(_auto_delete_after(interaction))
                         return
 
+        updated_options = dict(
+            self.parent_view.member_data[interaction.user.id].get("options", {})
+        )
+        updated_options[self.option_name] = selected_value
+        canonical_update = (
+            _canonical_update_group
+            if self.option_name.lower() == "activity"
+            else _canonical_update_member
+        )
+        if not await canonical_update(
+            interaction, self.parent_view.group, {"selections": updated_options}
+        ):
+            return
+
         # Validation passed - save the selection
         self.parent_view.member_data[interaction.user.id]["options"][self.option_name] = selected_value
 
         # Save selection to database
         try:
+            if not LFG_LEGACY_WRITES_ENABLED:
+                raise _LegacyWriteDisabled()
             with get_db_session() as session:
                 import json as json_lib
                 from models import LFGMember
@@ -1204,6 +1445,8 @@ class OptionSelect(discord.ui.Select):
                     member.selections = json_lib.dumps(self.parent_view.member_data[interaction.user.id]["options"])
                     session.commit()
                     logger.info(f"Updated role selection for user {interaction.user.id}: {selected_value}")
+        except _LegacyWriteDisabled:
+            pass
         except Exception as e:
             logger.error(f"Error saving role selection to database: {e}")
 
@@ -1268,7 +1511,10 @@ class RoleSelect(discord.ui.Select):
         if interaction.user.id not in self.parent_view.member_data:
             # Check if group is full
             max_size = self.parent_view.group.max_group_size or self.parent_view.game.max_group_size
-            if len(self.parent_view.member_data) >= max_size:
+            if (
+                not _uses_canonical_api(self.parent_view.group)
+                and len(self.parent_view.member_data) >= max_size
+            ):
                 await interaction.response.send_message("❌ This group is full!", ephemeral=True)
                 asyncio.create_task(_auto_delete_after(interaction))
                 return
@@ -1282,7 +1528,13 @@ class RoleSelect(discord.ui.Select):
             has_role_composition = any([tanks_needed, healers_needed, dps_needed, support_needed])
             enforce_role_limits = getattr(group, 'enforce_role_limits', True)
 
-            if has_role_composition and enforce_role_limits and selected_role and selected_role != 'flex':
+            if (
+                has_role_composition
+                and enforce_role_limits
+                and selected_role
+                and selected_role != 'flex'
+                and not _uses_canonical_api(group)
+            ):
                 # Count current members by role
                 role_counts = {'tank': 0, 'healer': 0, 'dps': 0, 'support': 0}
                 for uid, data in self.parent_view.member_data.items():
@@ -1307,11 +1559,20 @@ class RoleSelect(discord.ui.Select):
                     asyncio.create_task(_auto_delete_after(interaction))
                     return
 
+            if not await _canonical_join(
+                interaction,
+                self.parent_view.group,
+                {"selected_role": selected_role, "selections": {}},
+            ):
+                return
+
             # Add to group
             self.parent_view.member_data[interaction.user.id] = {"options": {}, "selected_role": selected_role}
 
             # Add to database
             try:
+                if not LFG_LEGACY_WRITES_ENABLED:
+                    raise _LegacyWriteDisabled()
                 with get_db_session() as session:
                     from models import LFGMember, LFGGroup, LFGConfig
 
@@ -1349,6 +1610,8 @@ class RoleSelect(discord.ui.Select):
 
                     if config and config.attendance_tracking_enabled:
                         await _auto_confirm_attendance(session, self.parent_view.group.id, interaction.user.id)
+            except _LegacyWriteDisabled:
+                pass
             except Exception as e:
                 logger.error(f"Error adding member to database with role: {e}")
 
@@ -1373,7 +1636,13 @@ class RoleSelect(discord.ui.Select):
             current_role = self.parent_view.member_data[interaction.user.id].get('selected_role')
 
             # Check role limits if changing to a different role
-            if has_role_composition and enforce_role_limits and selected_role != 'flex' and selected_role != current_role:
+            if (
+                has_role_composition
+                and enforce_role_limits
+                and selected_role != 'flex'
+                and selected_role != current_role
+                and not _uses_canonical_api(group)
+            ):
                 # Count current members by role (excluding this user)
                 role_counts = {'tank': 0, 'healer': 0, 'dps': 0, 'support': 0}
                 for uid, data in self.parent_view.member_data.items():
@@ -1399,11 +1668,25 @@ class RoleSelect(discord.ui.Select):
                     asyncio.create_task(_auto_delete_after(interaction))
                     return
 
+            if not await _canonical_update_member(
+                interaction,
+                self.parent_view.group,
+                {
+                    "selected_role": selected_role,
+                    "selections": self.parent_view.member_data[
+                        interaction.user.id
+                    ].get("options", {}),
+                },
+            ):
+                return
+
             # Limits check passed - update the role
             self.parent_view.member_data[interaction.user.id]["selected_role"] = selected_role
 
             # Update in database
             try:
+                if not LFG_LEGACY_WRITES_ENABLED:
+                    raise _LegacyWriteDisabled()
                 with get_db_session() as session:
                     member = session.query(LFGMember).filter(
                         LFGMember.group_id == self.parent_view.group.id,
@@ -1415,6 +1698,8 @@ class RoleSelect(discord.ui.Select):
                         member.selected_role = selected_role
                         session.commit()
                         logger.info(f"Updated selected_role for user {interaction.user.id}: {selected_role}")
+            except _LegacyWriteDisabled:
+                pass
             except Exception as e:
                 logger.error(f"Error updating selected_role in database: {e}")
 
@@ -1443,7 +1728,10 @@ class JoinGroupButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         # Check if group is full
         max_size = self.parent_view.group.max_group_size or self.parent_view.game.max_group_size
-        if len(self.parent_view.member_data) >= max_size:
+        if (
+            not _uses_canonical_api(self.parent_view.group)
+            and len(self.parent_view.member_data) >= max_size
+        ):
             await interaction.response.send_message("❌ This group is full!", ephemeral=True)
             asyncio.create_task(_auto_delete_after(interaction))
             return
@@ -1454,31 +1742,40 @@ class JoinGroupButton(discord.ui.Button):
             asyncio.create_task(_auto_delete_after(interaction))
             return
 
-        # Check if user is blacklisted
-        try:
-            with get_db_session() as session:
-                from models import LFGMemberStats
-                stats = session.query(LFGMemberStats).filter_by(
-                    guild_id=self.parent_view.group.guild_id,
-                    user_id=interaction.user.id
-                ).first()
+        # Legacy-only policy check. Canonical groups delegate authorization and
+        # roster policy to QuestLog.
+        if not _uses_canonical_api(self.parent_view.group):
+            try:
+                with get_db_session() as session:
+                    from models import LFGMemberStats
+                    stats = session.query(LFGMemberStats).filter_by(
+                        guild_id=self.parent_view.group.guild_id,
+                        user_id=interaction.user.id
+                    ).first()
 
-                if stats and stats.is_blacklisted:
-                    blacklist_reason = stats.blacklist_reason or "Too many no-shows"
-                    await interaction.response.send_message(
-                        f"❌ You are blacklisted and cannot join groups.\nReason: {blacklist_reason}",
-                        ephemeral=True
-                    )
-                    asyncio.create_task(_auto_delete_after(interaction))
-                    return
-        except Exception as e:
-            logger.error(f"Error checking blacklist status: {e}")
+                    if stats and stats.is_blacklisted:
+                        blacklist_reason = stats.blacklist_reason or "Too many no-shows"
+                        await interaction.response.send_message(
+                            f"❌ You are blacklisted and cannot join groups.\nReason: {blacklist_reason}",
+                            ephemeral=True
+                        )
+                        asyncio.create_task(_auto_delete_after(interaction))
+                        return
+            except Exception as e:
+                logger.error(f"Error checking blacklist status: {e}")
+
+        if not await _canonical_join(
+            interaction, self.parent_view.group, {"selections": {}}
+        ):
+            return
 
         # Add to group (in-memory)
         self.parent_view.member_data[interaction.user.id] = {"options": {}}
 
         # Add to database
         try:
+            if not LFG_LEGACY_WRITES_ENABLED:
+                raise _LegacyWriteDisabled()
             with get_db_session() as session:
                 from models import LFGMember, LFGGroup, LFGConfig
                 import json as json_lib
@@ -1513,7 +1810,7 @@ class JoinGroupButton(discord.ui.Button):
                     session.commit()
 
                     # Sync web mirror group member count + queue cross-platform embed updates
-                    if group:
+                    if group and not _canonical_group_ref(group):
                         _sync_web_lfg_mirror(
                             session,
                             discord_group_id=self.parent_view.group.id,
@@ -1522,7 +1819,7 @@ class JoinGroupButton(discord.ui.Button):
                         )
 
                     # Unpin network broadcast embed if group is now full - propagate to all platforms
-                    if now_full and group:
+                    if now_full and group and not _canonical_group_ref(group):
                         try:
                             from sqlalchemy import text as _text2
                             import json as _json3, time as _time3
@@ -1561,6 +1858,8 @@ class JoinGroupButton(discord.ui.Button):
 
                 if config and config.attendance_tracking_enabled:
                     await _auto_confirm_attendance(session, self.parent_view.group.id, interaction.user.id)
+        except _LegacyWriteDisabled:
+            pass
         except Exception as e:
             logger.error(f"Error adding member to database: {e}")
 
@@ -1588,11 +1887,16 @@ class LeaveGroupButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id in self.parent_view.member_data:
+            if not await _canonical_leave(interaction, self.parent_view.group):
+                return
+
             # Remove from in-memory group data
             del self.parent_view.member_data[interaction.user.id]
 
             # Remove from database
             try:
+                if not LFG_LEGACY_WRITES_ENABLED:
+                    raise _LegacyWriteDisabled()
                 with get_db_session() as session:
                     from models import LFGGroup, LFGAttendance
 
@@ -1620,7 +1924,7 @@ class LeaveGroupButton(discord.ui.Button):
                     logger.info(f"User {interaction.user.id} left group {self.parent_view.group.id} - removed from DB")
 
                     # Sync web mirror group member count + queue cross-platform embed updates
-                    if group:
+                    if group and not _canonical_group_ref(group):
                         _sync_web_lfg_mirror(
                             session,
                             discord_group_id=self.parent_view.group.id,
@@ -1629,7 +1933,7 @@ class LeaveGroupButton(discord.ui.Button):
                         )
 
                     # Re-pin network broadcast embed if group was full and now has space - propagate to all platforms
-                    if was_full:
+                    if was_full and group and not _canonical_group_ref(group):
                         try:
                             from sqlalchemy import text as _text3
                             import json as _json4, time as _time4
@@ -1661,6 +1965,8 @@ class LeaveGroupButton(discord.ui.Button):
                         except Exception as _pe2:
                             logger.warning(f"Failed to queue re-pin for group {self.parent_view.group.id}: {_pe2}")
 
+            except _LegacyWriteDisabled:
+                pass
             except Exception as e:
                 logger.error(f"Failed to remove user from database: {e}")
 
@@ -1681,7 +1987,7 @@ class LeaveGroupButton(discord.ui.Button):
 
 
 class ConfirmAttendanceButton(discord.ui.Button):
-    """Button to confirm attendance for LFG group (Premium feature)."""
+    """Button to confirm attendance for an LFG group."""
     def __init__(self, view):
         super().__init__(
             label="Confirm Attendance",
@@ -2349,6 +2655,84 @@ class SubmitButton(discord.ui.Button):
         elif view.rank:
             thread_name += f" - {game.rank_label} {view.rank}"
 
+        canonical_group_id = None
+        canonical_share_token = None
+        canonical_actor_id = None
+        if LFG_CANONICAL_API_ENABLED:
+            canonical_actor_id, community_id = _resolve_questlog_context(
+                interaction.user.id, interaction.guild.id
+            )
+            if not canonical_actor_id:
+                msg = await interaction.followup.send(
+                    "Link your Discord account to QuestLog before creating an LFG group.",
+                    ephemeral=True,
+                )
+                asyncio.create_task(_auto_delete_after(msg))
+                return
+
+            client = _lfg_api_client(interaction.client)
+            if not client or not client.configured:
+                msg = await interaction.followup.send(
+                    "The QuestLog LFG connection is not configured.",
+                    ephemeral=True,
+                )
+                asyncio.create_task(_auto_delete_after(msg))
+                return
+
+            selected_role = detect_role(
+                game_name=game.game_name,
+                role_detection_mode=getattr(game, "role_detection_mode", "generic"),
+                member_selections=view.selections or {},
+                selected_role=None,
+                custom_options=(
+                    json.loads(game.custom_options) if game.custom_options else []
+                ),
+            )
+            create_payload = {
+                "title": thread_name[:200],
+                "description": (view.description or "")[:2000],
+                "game_name": game.game_name,
+                "game_id": str(game.igdb_id) if game.igdb_id else None,
+                "game_image_url": game.cover_url or None,
+                "group_size": view.max_size or game.max_group_size or 4,
+                "scheduled_time": view.scheduled_time,
+                "allow_network_discovery": True,
+                "selected_role": selected_role or "member",
+                "selections": view.selections or {},
+                "origin": {
+                    "platform": "discord",
+                    "group_id": interaction.id,
+                    "guild_id": str(interaction.guild.id),
+                    "guild_name": interaction.guild.name,
+                },
+            }
+            if community_id:
+                create_payload["community_id"] = community_id
+            create_payload = {
+                key: value for key, value in create_payload.items()
+                if value is not None
+            }
+            try:
+                result = await client.create_group(
+                    create_payload,
+                    actor_user_id=canonical_actor_id,
+                    idempotency_key=f"discord:{interaction.id}:lfg:create",
+                )
+                canonical_data = result.data.get("group", result.data)
+                canonical_group_id = canonical_data.get("id")
+                canonical_share_token = canonical_data.get("share_token")
+                if not canonical_group_id:
+                    raise LFGAPIError(
+                        "invalid_response",
+                        "QuestLog did not return a canonical LFG group ID",
+                    )
+            except LFGAPIError as error:
+                msg = await interaction.followup.send(
+                    _canonical_error_message(error), ephemeral=True
+                )
+                asyncio.create_task(_auto_delete_after(msg))
+                return
+
         try:
             thread = await channel.create_thread(
                 name=thread_name[:100],
@@ -2359,6 +2743,21 @@ class SubmitButton(discord.ui.Button):
             await thread.add_user(interaction.user)
         except Exception as e:
             logger.error(f"Error creating thread: {e}")
+            if canonical_group_id and canonical_actor_id:
+                try:
+                    await client.transition_status(
+                        canonical_group_id,
+                        "cancelled",
+                        actor_user_id=canonical_actor_id,
+                        idempotency_key=(
+                            f"discord:{interaction.id}:lfg:cancel-after-discord-failure"
+                        ),
+                    )
+                except LFGAPIError as cancel_error:
+                    logger.error(
+                        f"Could not cancel canonical LFG {canonical_group_id} "
+                        f"after Discord thread failure: {cancel_error.code}"
+                    )
             msg = await interaction.followup.send("Error creating thread!", ephemeral=True)
             asyncio.create_task(_auto_delete_after(msg))
             return
@@ -2371,6 +2770,8 @@ class SubmitButton(discord.ui.Button):
                     game_id=game.id,
                     thread_id=thread.id,
                     thread_name=thread_name,
+                    canonical_group_id=canonical_group_id,
+                    canonical_share_token=canonical_share_token,
                     creator_id=interaction.user.id,
                     creator_name=interaction.user.display_name,
                     scheduled_time=view.scheduled_time,
@@ -2384,24 +2785,52 @@ class SubmitButton(discord.ui.Button):
                 session.flush()
                 group_id = group.id
 
-                # Add creator as member
-                member = LFGMember(
-                    group_id=group_id,
-                    user_id=interaction.user.id,
-                    display_name=interaction.user.display_name,
-                    rank_value=view.rank,
-                    selections=json.dumps(view.selections) if view.selections else None,
-                    is_creator=True
-                )
-                session.add(member)
+                # Temporary compatibility roster. QuestLog is authoritative
+                # whenever this row has a canonical_group_id.
+                if LFG_LEGACY_WRITES_ENABLED:
+                    member = LFGMember(
+                        group_id=group_id,
+                        user_id=interaction.user.id,
+                        display_name=interaction.user.display_name,
+                        rank_value=view.rank,
+                        selections=json.dumps(view.selections) if view.selections else None,
+                        is_creator=True
+                    )
+                    session.add(member)
 
                 # Auto-confirm attendance for creator if tracking is enabled
                 lfg_config = session.query(LFGConfig).filter_by(guild_id=interaction.guild.id).first()
-                if lfg_config and lfg_config.attendance_tracking_enabled:
+                if (
+                    LFG_LEGACY_WRITES_ENABLED
+                    and lfg_config
+                    and lfg_config.attendance_tracking_enabled
+                ):
                     await _auto_confirm_attendance(session, group_id, interaction.user.id)
 
         except Exception as e:
             logger.error(f"DB error: {e}")
+            if canonical_group_id and canonical_actor_id:
+                try:
+                    await client.transition_status(
+                        canonical_group_id,
+                        "cancelled",
+                        actor_user_id=canonical_actor_id,
+                        idempotency_key=(
+                            f"discord:{interaction.id}:lfg:cancel-after-binding-failure"
+                        ),
+                    )
+                except LFGAPIError as cancel_error:
+                    logger.error(
+                        f"Could not cancel canonical LFG {canonical_group_id} "
+                        f"after binding failure: {cancel_error.code}"
+                    )
+            try:
+                # Pycord's Thread.delete() has no ``reason`` parameter.
+                await thread.delete()
+            except discord.HTTPException as cleanup_error:
+                logger.warning(
+                    f"Could not remove orphan LFG thread {thread.id}: {cleanup_error}"
+                )
             msg = await interaction.followup.send("Database error!", ephemeral=True)
             asyncio.create_task(_auto_delete_after(msg))
             return
@@ -2443,8 +2872,11 @@ class SubmitButton(discord.ui.Button):
         # No success message needed - "started a thread" notification already shows this
 
         # Post to QL Network site if user has a linked QuestLog account
-        _web_group_id = None
-        _ql_group_url = ''
+        _web_group_id = canonical_group_id
+        _ql_group_url = (
+            f"https://casual-heroes.com/ql/lfg/{canonical_share_token or canonical_group_id}/"
+            if canonical_group_id else ""
+        )
         try:
             from sqlalchemy import text as _wt
             _now_wt = int(time.time())
@@ -2453,7 +2885,11 @@ class SubmitButton(discord.ui.Button):
                     _wt("SELECT id, username, display_name FROM web_users WHERE discord_id=:did LIMIT 1"),
                     {"did": str(interaction.user.id)},
                 ).fetchone()
-                if _web_user:
+                if (
+                    _web_user
+                    and not LFG_CANONICAL_API_ENABLED
+                    and LFG_LEGACY_WRITES_ENABLED
+                ):
                     _max_sz = view.max_size or game.max_group_size or 4
                     _title = thread_name
                     _ws.execute(_wt(
@@ -2552,10 +2988,12 @@ class SubmitButton(discord.ui.Button):
             payload_json = json.dumps(embed_data)
             with get_db_session() as session:
                 from sqlalchemy import text as _text
-                configs = session.execute(_text(
-                    "SELECT guild_id, platform, channel_id, is_enabled FROM web_community_bot_configs "
-                    "WHERE event_type='lfg_announce'"
-                )).fetchall()
+                configs = []
+                if not LFG_CANONICAL_API_ENABLED and LFG_LEGACY_WRITES_ENABLED:
+                    configs = session.execute(_text(
+                        "SELECT guild_id, platform, channel_id, is_enabled FROM web_community_bot_configs "
+                        "WHERE event_type='lfg_announce'"
+                    )).fetchall()
                 for cfg in configs:
                     _guild_id_str = str(cfg[0])
                     _platform = cfg[1]
@@ -2732,6 +3170,28 @@ class LFGCog(commands.Cog):
                 if not group:
                     # Not an LFG thread or already inactive
                     return
+
+                canonical_ref = _canonical_group_ref(group)
+                if LFG_CANONICAL_API_ENABLED and canonical_ref:
+                    actor_id, _ = _resolve_questlog_context(
+                        group.creator_id, group.guild_id
+                    )
+                    client = _lfg_api_client(self.bot)
+                    if actor_id and client:
+                        try:
+                            await client.transition_status(
+                                canonical_ref,
+                                "cancelled",
+                                actor_user_id=actor_id,
+                                idempotency_key=(
+                                    f"discord:thread:{thread.id}:lfg:cancel"
+                                ),
+                            )
+                        except LFGAPIError as error:
+                            logger.error(
+                                f"Canonical cancellation failed for deleted "
+                                f"thread {thread.id}: {error.code}"
+                            )
 
                 # Mark the group as inactive and clear the thread reference
                 group.is_active = False
@@ -3081,15 +3541,6 @@ class LFGCog(commands.Cog):
             await ctx.respond("Something went wrong!", ephemeral=True)
 
     # =============================================================================
-    # HELPER: Check premium status
-    # =============================================================================
-
-    def _has_lfg_access(self, session, guild_id: int) -> bool:
-        """All guilds have LFG access."""
-        guild = session.query(Guild).filter_by(guild_id=guild_id).first()
-        return guild is not None
-
-    # =============================================================================
     # ADMIN COMMANDS
     # =============================================================================
 
@@ -3112,7 +3563,7 @@ class LFGCog(commands.Cog):
         if not games:
             await ctx.respond(
                 f"No games found for '{query}'.\n"
-                "Use `/lfg_custom` to add a custom game (Premium).",
+                "Use `/lfg_custom` to add a custom game.",
                 ephemeral=True
             )
             return
@@ -3411,7 +3862,7 @@ class LFGCog(commands.Cog):
             await ctx.respond("Error removing game!", ephemeral=True)
 
     # =============================================================================
-    # PREMIUM: ATTENDANCE TRACKING COMMANDS
+    # ATTENDANCE TRACKING COMMANDS
     # =============================================================================
 
     def _update_member_stats(self, session, guild_id: int, user_id: int, status: AttendanceStatus):
@@ -3481,7 +3932,7 @@ class LFGCog(commands.Cog):
 
         return stats
 
-    @discord.slash_command(name="lfg_mark", description="Mark attendance for LFG group members (Premium)")
+    @discord.slash_command(name="lfg_mark", description="Mark attendance for LFG group members")
     @discord.default_permissions(administrator=True)
     @discord.option("user", description="Member to mark")
     @discord.option("status", description="Attendance status", choices=[
@@ -3501,15 +3952,6 @@ class LFGCog(commands.Cog):
         """Mark a member's attendance for an LFG group."""
         try:
             with get_db_session() as session:
-                # Check LFG access (Complete tier or LFG module)
-                if not self._has_lfg_access(session, ctx.guild.id):
-                    await ctx.respond(
-                        "Attendance tracking requires **Complete tier** or the **LFG Module**!\n"
-                        "Upgrade to track reliability and identify flaky members.",
-                        ephemeral=True
-                    )
-                    return
-
                 # Find the group
                 if group_id:
                     group = session.query(LFGGroup).filter_by(
@@ -3609,7 +4051,7 @@ class LFGCog(commands.Cog):
             logger.error(f"Mark attendance error: {e}")
             await ctx.respond("Error marking attendance!", ephemeral=True)
 
-    @discord.slash_command(name="lfg_stats", description="View LFG reliability stats for a member (Premium)")
+    @discord.slash_command(name="lfg_stats", description="View LFG reliability stats for a member")
     @discord.option("user", description="Member to check (leave blank for yourself)", required=False)
     async def lfg_stats(self, ctx: discord.ApplicationContext, user: discord.Member = None):
         """View LFG reliability statistics for a member."""
@@ -3617,15 +4059,6 @@ class LFGCog(commands.Cog):
 
         try:
             with get_db_session() as session:
-                # Check LFG access (Complete tier or LFG module)
-                if not self._has_lfg_access(session, ctx.guild.id):
-                    await ctx.respond(
-                        "Reliability stats require **Complete tier** or the **LFG Module**!\n"
-                        "Upgrade to track attendance and reliability.",
-                        ephemeral=True
-                    )
-                    return
-
                 stats = session.query(LFGMemberStats).filter_by(
                     guild_id=ctx.guild.id, user_id=target.id
                 ).first()
@@ -3690,7 +4123,7 @@ class LFGCog(commands.Cog):
             logger.error(f"Stats error: {e}")
             await ctx.respond("Error fetching stats!", ephemeral=True)
 
-    @discord.slash_command(name="lfg_leaderboard", description="View LFG reliability leaderboard (Premium)")
+    @discord.slash_command(name="lfg_leaderboard", description="View LFG reliability leaderboard")
     @discord.option("show", description="What to show", choices=[
         discord.OptionChoice(name="Most Reliable", value="reliable"),
         discord.OptionChoice(name="Most Active", value="active"),
@@ -3700,13 +4133,6 @@ class LFGCog(commands.Cog):
         """View the LFG reliability leaderboard."""
         try:
             with get_db_session() as session:
-                if not self._has_lfg_access(session, ctx.guild.id):
-                    await ctx.respond(
-                        "Leaderboards require **Complete tier** or the **LFG Module**!",
-                        ephemeral=True
-                    )
-                    return
-
                 query = session.query(LFGMemberStats).filter(
                     LFGMemberStats.guild_id == ctx.guild.id,
                     LFGMemberStats.total_signups >= 3  # Min 3 events
@@ -3749,7 +4175,7 @@ class LFGCog(commands.Cog):
             logger.error(f"Leaderboard error: {e}")
             await ctx.respond("Error fetching leaderboard!", ephemeral=True)
 
-    @discord.slash_command(name="lfg_blacklist", description="Blacklist/unblacklist a member from LFG (Premium)")
+    @discord.slash_command(name="lfg_blacklist", description="Blacklist or unblacklist a member from LFG")
     @discord.default_permissions(administrator=True)
     @discord.option("user", description="Member to blacklist/unblacklist")
     @discord.option("action", description="Action", choices=[
@@ -3767,13 +4193,6 @@ class LFGCog(commands.Cog):
         """Blacklist or unblacklist a member from LFG."""
         try:
             with get_db_session() as session:
-                if not self._has_lfg_access(session, ctx.guild.id):
-                    await ctx.respond(
-                        "Blacklist management requires **Complete tier** or the **LFG Module**!",
-                        ephemeral=True
-                    )
-                    return
-
                 stats = session.query(LFGMemberStats).filter_by(
                     guild_id=ctx.guild.id, user_id=user.id
                 ).first()
@@ -3810,7 +4229,7 @@ class LFGCog(commands.Cog):
             logger.error(f"Blacklist error: {e}")
             await ctx.respond("Error updating blacklist!", ephemeral=True)
 
-    @discord.slash_command(name="lfg_config", description="Configure LFG attendance settings (Premium)")
+    @discord.slash_command(name="lfg_config", description="Configure LFG attendance settings")
     @discord.default_permissions(administrator=True)
     @discord.option("attendance_tracking", description="Enable attendance tracking?", required=False)
     @discord.option("auto_noshow_hours", description="Hours after event to auto-mark no-show (0=disabled)", required=False)
@@ -3827,14 +4246,6 @@ class LFGCog(commands.Cog):
         """Configure LFG attendance settings."""
         try:
             with get_db_session() as session:
-                if not self._has_lfg_access(session, ctx.guild.id):
-                    await ctx.respond(
-                        "LFG configuration requires **Complete tier** or the **LFG Module**!\n"
-                        "Upgrade to customize attendance tracking.",
-                        ephemeral=True
-                    )
-                    return
-
                 config = session.query(LFGConfig).filter_by(guild_id=ctx.guild.id).first()
                 if not config:
                     config = LFGConfig(guild_id=ctx.guild.id)
@@ -3913,15 +4324,14 @@ class LFGCog(commands.Cog):
                     title="🎮 Looking For Group",
                     description=(
                         "Click a game button below to create an LFG group!\n\n"
-                        "**FREE Tier**: Create unlimited LFG threads for up to 5 games\n"
-                        "**PRO/Premium**: Access web dashboard for advanced features"
+                        "Create groups here, or use the QuestLog dashboard for web access."
                     ),
                     color=discord.Color.purple()
                 )
 
                 # Add games list to embed
                 games_list = []
-                for i, game in enumerate(games[:5], 1):  # Show first 5 for FREE tier
+                for i, game in enumerate(games[:5], 1):  # Discord components support up to 5 rows
                     player_count = player_counts.get(game.id, 0)
                     emoji = game.game_emoji or "🎮"
                     games_list.append(f"{emoji} **{game.game_name}** - {player_count} playing now")
@@ -4046,7 +4456,7 @@ class LFGCog(commands.Cog):
                     day_display = dt.datetime.strptime(day_key, '%Y-%m-%d').strftime('%A, %b %-d')
                     embed.add_field(
                         name=f"📅 {day_display}",
-                        value="\n".join(lines) if lines else "—",
+                        value="\n".join(lines) if lines else "None",
                         inline=False
                     )
                     field_count += 1
@@ -4125,7 +4535,7 @@ class LFGCog(commands.Cog):
                     await ctx.respond(f"Group #{group_id} not found or no longer active.", ephemeral=True)
                     return
 
-                if group.is_full:
+                if group.is_full and not _uses_canonical_api(group):
                     await ctx.respond(f"Group #{group_id} is full.", ephemeral=True)
                     return
 
@@ -4136,6 +4546,19 @@ class LFGCog(commands.Cog):
                 if existing and existing.left_at is None:
                     thread_link = f" <#{group.thread_id}>" if group.thread_id else ""
                     await ctx.respond(f"You're already in Group #{group_id}.{thread_link}", ephemeral=True)
+                    return
+
+                if not await _canonical_join(
+                    ctx.interaction, group, {"selections": {}}
+                ):
+                    return
+
+                if not LFG_LEGACY_WRITES_ENABLED:
+                    thread_link = f"\n<#{group.thread_id}>" if group.thread_id else ""
+                    await ctx.respond(
+                        f"Joined canonical QuestLog Group #{group_id}.{thread_link}",
+                        ephemeral=True,
+                    )
                     return
 
                 # Add member
@@ -4160,7 +4583,10 @@ class LFGCog(commands.Cog):
                 if max_size and group.member_count >= max_size:
                     group.is_full = True
 
-                _sync_web_lfg_mirror(session, group.id, group.member_count, group.is_full)
+                if not _canonical_group_ref(group):
+                    _sync_web_lfg_mirror(
+                        session, group.id, group.member_count, group.is_full
+                    )
 
                 game_label = f"{game.game_emoji or ''} {game.game_name}".strip() if game else "Unknown"
                 thread_link = f"\n<#{group.thread_id}>" if group.thread_id else ""
@@ -4206,12 +4632,22 @@ class LFGCog(commands.Cog):
                     )
                     return
 
+                if not await _canonical_leave(ctx.interaction, group):
+                    return
+
+                if not LFG_LEGACY_WRITES_ENABLED:
+                    await ctx.respond(f"Left Group #{group_id}.", ephemeral=True)
+                    return
+
                 member.left_at = int(time.time())
                 group.member_count = max(0, group.member_count - 1)
                 if group.is_full:
                     group.is_full = False
 
-                _sync_web_lfg_mirror(session, group.id, group.member_count, group.is_full)
+                if not _canonical_group_ref(group):
+                    _sync_web_lfg_mirror(
+                        session, group.id, group.member_count, group.is_full
+                    )
 
                 await ctx.respond(f"Left Group #{group_id}.", ephemeral=True)
 
@@ -4222,9 +4658,10 @@ class LFGCog(commands.Cog):
     @discord.slash_command(name="lfg_delete", description="Delete an LFG group you created")
     @discord.option("group_id", description="Group ID to delete", type=int)
     async def lfg_delete(self, ctx: discord.ApplicationContext, group_id: int):
-        """Delete (archive) an LFG group. Creator or admin only."""
+        """Delete an LFG group and its Discord thread. Creator or admin only."""
         await ctx.defer(ephemeral=True)
         try:
+            thread_id = None
             with get_db_session() as session:
                 group = session.query(LFGGroup).filter(
                     LFGGroup.id == group_id,
@@ -4241,14 +4678,166 @@ class LFGCog(commands.Cog):
                     await ctx.respond("You can only delete your own groups.", ephemeral=True)
                     return
 
+                canonical_ref = _canonical_group_ref(group)
+                if LFG_CANONICAL_API_ENABLED and canonical_ref:
+                    actor_id, _ = _resolve_questlog_context(
+                        ctx.author.id, ctx.guild.id
+                    )
+                    if not actor_id:
+                        await ctx.respond(
+                            "Link your Discord account to QuestLog before cancelling this group.",
+                            ephemeral=True,
+                        )
+                        return
+                    client = _lfg_api_client(self.bot)
+                    try:
+                        await client.transition_status(
+                            canonical_ref,
+                            "cancelled",
+                            actor_user_id=actor_id,
+                            idempotency_key=(
+                                f"discord:{ctx.interaction.id}:lfg:cancel"
+                            ),
+                        )
+                    except (AttributeError, LFGAPIError) as error:
+                        message = (
+                            _canonical_error_message(error)
+                            if isinstance(error, LFGAPIError)
+                            else "The QuestLog LFG connection is unavailable."
+                        )
+                        await ctx.respond(message, ephemeral=True)
+                        return
+
+                thread_id = int(group.thread_id) if group.thread_id else None
                 group.is_active = False
                 group.archived_at = int(time.time())
 
-                await ctx.respond(f"Group #{group_id} has been deleted.", ephemeral=True)
+            if thread_id:
+                try:
+                    get_thread = getattr(ctx.guild, "get_thread", None)
+                    thread = get_thread(thread_id) if get_thread else None
+                    thread = thread or ctx.guild.get_channel(thread_id)
+                    if thread is None:
+                        thread = await ctx.guild.fetch_channel(thread_id)
+                    await thread.delete()
+                except discord.NotFound:
+                    # The requested final state is already true. This also
+                    # makes retries safe after Discord accepted the delete.
+                    pass
+                except discord.Forbidden:
+                    await ctx.respond(
+                        f"Group #{group_id} was deleted from QuestLog, but I "
+                        "could not remove its Discord thread. Give Warden the "
+                        "Manage Threads permission, then remove the thread manually.",
+                        ephemeral=True,
+                    )
+                    return
+                except discord.HTTPException as error:
+                    logger.warning(
+                        "Discord thread delete failed for LFG group %s: %s",
+                        group_id,
+                        error,
+                    )
+                    await ctx.respond(
+                        f"Group #{group_id} was deleted from QuestLog, but "
+                        "Discord did not remove the thread. Please try deleting "
+                        "the thread again.",
+                        ephemeral=True,
+                    )
+                    return
+
+            await ctx.respond(
+                f"Group #{group_id} and its Discord thread have been deleted.",
+                ephemeral=True,
+            )
 
         except Exception as e:
             logger.error(f"lfg_delete error: {e}", exc_info=True)
             await ctx.respond("Something went wrong!", ephemeral=True)
+
+    @discord.slash_command(
+        name="lfg_status",
+        description="Start, complete, or cancel a canonical QuestLog LFG group",
+    )
+    @discord.option("group_id", description="Local Discord group ID", type=int)
+    @discord.option(
+        "status",
+        description="New lifecycle status",
+        choices=["started", "completed", "cancelled"],
+    )
+    async def lfg_status(
+        self, ctx: discord.ApplicationContext, group_id: int, status: str
+    ):
+        """Apply a creator-authorized canonical lifecycle transition."""
+        await ctx.defer(ephemeral=True)
+        try:
+            with get_db_session() as session:
+                group = session.query(LFGGroup).filter(
+                    LFGGroup.id == group_id,
+                    LFGGroup.guild_id == ctx.guild.id,
+                ).first()
+                if not group:
+                    await ctx.respond("LFG group not found.", ephemeral=True)
+                    return
+
+                is_admin = (
+                    ctx.author.guild_permissions.administrator
+                    or ctx.author.guild_permissions.manage_guild
+                )
+                if group.creator_id != ctx.author.id and not is_admin:
+                    await ctx.respond(
+                        "Only the group creator or a server manager can do that.",
+                        ephemeral=True,
+                    )
+                    return
+
+                canonical_ref = _canonical_group_ref(group)
+                if not LFG_CANONICAL_API_ENABLED or not canonical_ref:
+                    await ctx.respond(
+                        "This legacy group has not been migrated to canonical QuestLog LFG.",
+                        ephemeral=True,
+                    )
+                    return
+
+                actor_id, _ = _resolve_questlog_context(
+                    ctx.author.id, ctx.guild.id
+                )
+                if not actor_id:
+                    await ctx.respond(
+                        "Link your Discord account to QuestLog first.",
+                        ephemeral=True,
+                    )
+                    return
+
+                client = _lfg_api_client(self.bot)
+                try:
+                    await client.transition_status(
+                        canonical_ref,
+                        status,
+                        actor_user_id=actor_id,
+                        idempotency_key=(
+                            f"discord:{ctx.interaction.id}:lfg:status:{status}"
+                        ),
+                    )
+                except (AttributeError, LFGAPIError) as error:
+                    message = (
+                        _canonical_error_message(error)
+                        if isinstance(error, LFGAPIError)
+                        else "The QuestLog LFG connection is unavailable."
+                    )
+                    await ctx.respond(message, ephemeral=True)
+                    return
+
+                if status in ("completed", "cancelled"):
+                    group.is_active = False
+                    group.archived_at = int(time.time())
+
+                await ctx.respond(
+                    f"Group #{group_id} is now **{status}**.", ephemeral=True
+                )
+        except Exception as error:
+            logger.error(f"lfg_status error: {error}", exc_info=True)
+            await ctx.respond("Something went wrong updating the group.", ephemeral=True)
 
     @discord.slash_command(name="lfg_discord", description="Open the Discord LFG browser for this server on QuestLog")
     async def lfg_discord(self, ctx: discord.ApplicationContext):
@@ -4520,7 +5109,7 @@ class PersistentLFGView(discord.ui.View):
         super().__init__(timeout=None)  # Persistent view - no timeout
 
         # Add a button for each game, one per row (max 5 rows)
-        for i, game in enumerate(games[:5]):  # Limit to 5 games for FREE tier
+        for i, game in enumerate(games[:5]):  # Discord components support up to 5 rows
             player_count = player_counts.get(game.id, 0)
             button = GameButton(game, player_count)
             button.row = i  # Stack buttons vertically, one per row

@@ -4,7 +4,7 @@ Reads XML save files and extracts gameplay statistics for XP rewards
 """
 
 import logging
-import xml.etree.ElementTree as ET
+from defusedxml import ElementTree as ET
 from typing import Dict, Optional, Any
 from dataclasses import dataclass, asdict
 from datetime import datetime
@@ -108,6 +108,9 @@ class SDTDStatsParser:
         Returns:
             SDTDPlayerStats object or None if parsing fails
         """
+        if len(xml_content.encode("utf-8", errors="ignore")) > 5 * 1024 * 1024:
+            logger.warning("Rejected oversized player XML for %s", steam_id)
+            return None
         try:
             root = ET.fromstring(xml_content)
 
