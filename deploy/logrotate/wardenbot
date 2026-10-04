@@ -1,0 +1,11 @@
+/mnt/gamestoreage2/DiscordBots/wardenbot/log {
+    daily
+    maxsize 50M
+    rotate 14
+    missingok
+    notifempty
+    dateext
+    compress
+    delaycompress
+    copytruncate
+}

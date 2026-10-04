@@ -17,7 +17,11 @@ import asyncio
 import discord
 from discord.ext import commands
 
-from config import db_session_scope, logger, get_debug_guilds
+from config import (
+    db_session_scope,
+    logger,
+    get_debug_guilds,
+)
 from models import Guild, ChannelTemplate, ModAction, RoleTemplate
 
 

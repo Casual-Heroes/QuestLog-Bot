@@ -9,6 +9,6 @@ Cog loading order matters for dependencies:
 4. audit - Audit logging
 5. xp - XP & leveling
 6. roles - React-to-role, level roles
-7. discovery - Self-promo, featured pool (premium)
+7. discovery - Self-promo and featured pool
 8. admin - Admin commands, settings
 """

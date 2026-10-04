@@ -3,6 +3,7 @@ Simple API server for bot control endpoints.
 Allows the web app to trigger actions like forcing a guild sync.
 """
 from aiohttp import web
+import secrets
 import logging
 import os
 import discord
@@ -17,6 +18,9 @@ API_TOKEN = os.getenv("DISCORD_BOT_API_TOKEN")
 if not API_TOKEN:
     logger.critical("DISCORD_BOT_API_TOKEN is not set! Bot API will not start without authentication token.")
     raise RuntimeError("DISCORD_BOT_API_TOKEN environment variable is required for security. Set it in .env file.")
+if len(API_TOKEN) < 32:
+    logger.critical("DISCORD_BOT_API_TOKEN must be at least 32 characters.")
+    raise RuntimeError("DISCORD_BOT_API_TOKEN must be at least 32 characters.")
 
 
 @web.middleware
@@ -27,13 +31,13 @@ async def auth_middleware(request, handler):
         return await handler(request)
 
     # Require authentication
-    auth_header = request.headers.get('Authorization')
-    if not auth_header or not auth_header.startswith('Bearer '):
+    auth_header = request.headers.get('Authorization', '')
+    scheme, separator, token = auth_header.partition(' ')
+    if separator != ' ' or scheme.lower() != 'bearer' or not token or ' ' in token:
         logger.warning(f"Unauthorized API request from {request.remote}")
         return web.json_response({'error': 'Unauthorized - Missing Bearer token'}, status=401)
 
-    token = auth_header.split('Bearer ', 1)[1]
-    if token != API_TOKEN:
+    if not secrets.compare_digest(token, API_TOKEN):
         logger.warning(f"Invalid API token from {request.remote}")
         return web.json_response({'error': 'Unauthorized - Invalid token'}, status=401)
 
@@ -1087,7 +1091,12 @@ async def announce_network_cotm(request):
 def create_app():
     """Create the aiohttp web application."""
     # SECURITY: Add authentication middleware
-    app = web.Application(middlewares=[auth_middleware])
+    # Dashboard requests are small JSON control messages. A tight body limit
+    # reduces memory-exhaustion risk if the localhost boundary is bypassed.
+    app = web.Application(
+        middlewares=[auth_middleware],
+        client_max_size=64 * 1024,
+    )
 
     # Routes
     app.router.add_get('/health', health_check)

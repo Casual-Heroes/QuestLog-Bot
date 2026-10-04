@@ -20,7 +20,11 @@ import csv
 import discord
 from discord.ext import commands, tasks
 
-from config import db_session_scope, logger, get_debug_guilds
+from config import (
+    db_session_scope,
+    logger,
+    get_debug_guilds,
+)
 from models import (
     Guild, GuildMember, ReactRole, LevelRole,
     TempRole, RoleTemplate, RoleRequest, ModAction, ChannelTemplate
@@ -381,11 +385,6 @@ class RolesCog(commands.Cog):
             return
 
         await ctx.defer(ephemeral=True)
-        await ctx.followup.send(
-            f"📊 Processing first **{limit}** members (tier limit). Upgrade for more!",
-            ephemeral=True
-        )
-
         await ctx.followup.send(f"⏳ Assigning **{role.name}** to **{len(members)}** members...", ephemeral=True)
 
         success = 0
@@ -435,11 +434,6 @@ class RolesCog(commands.Cog):
             return
 
         await ctx.defer(ephemeral=True)
-        await ctx.followup.send(
-            f"📊 Processing first **{limit}** members (tier limit). Upgrade for more!",
-            ephemeral=True
-        )
-
         await ctx.followup.send(f"⏳ Removing **{role.name}** from **{len(members)}** members...", ephemeral=True)
 
         success = 0

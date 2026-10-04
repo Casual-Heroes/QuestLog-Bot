@@ -45,13 +45,13 @@ class AuditAction(str, Enum):
     VERIFICATION_FAILED = "verification_failed"
 
 class PromoTier(str, Enum):
-    BASIC = "basic"       # FREE - regular self-promo
-    FEATURED = "featured" # PREMIUM - featured pool (15 tokens)
+    BASIC = "basic"       # Regular self-promo
+    FEATURED = "featured" # Featured pool (15 tokens)
 
 class FlairType(str, Enum):
     NORMAL = "normal"     # Default flairs included with bot
     SEASONAL = "seasonal" # Seasonal/event flairs
-    CUSTOM = "custom"     # Guild-specific custom flairs (Premium feature)
+    CUSTOM = "custom"     # Guild-specific custom flairs
 
 
 class ActionStatus(str, Enum):
@@ -145,7 +145,7 @@ class Guild(Base):
     guild_name = Column(String(255), nullable=True)
     owner_id = Column(BigInteger, nullable=True)
 
-    # VIP flag - partner/trust marker (no feature gating, everything is free)
+    # Deprecated partner marker retained only for database compatibility.
     is_vip = Column(Boolean, default=False)
     vip_granted_by = Column(BigInteger, nullable=True)
     vip_granted_at = Column(BigInteger, nullable=True)
@@ -179,6 +179,11 @@ class Guild(Base):
     cached_members = Column(Text, nullable=True)  # JSON array of member objects (id, username, discriminator, roles, avatar)
     guild_icon_hash = Column(String(255), nullable=True)  # Discord guild icon hash for CDN URL
 
+    # Live Discord roles that may administer Warden through the web dashboard.
+    # The site already owns this database column; keeping it in Warden's model
+    # lets the execution boundary re-check current role membership.
+    admin_roles = Column(Text, nullable=True)
+
     # Cached Member Stats (synced by bot from Discord presence data)
     member_count = Column(Integer, nullable=True)  # Total members (excluding bots)
     online_count = Column(Integer, nullable=True)  # Currently online members
@@ -189,6 +194,18 @@ class Guild(Base):
     level_up_channel_id = Column(BigInteger, nullable=True)
     verification_channel_id = Column(BigInteger, nullable=True)
     self_promo_channel_id = Column(BigInteger, nullable=True)
+    spotlight_channel_id = Column(BigInteger, nullable=True)  # Monthly nominations announcements
+
+    # FFXIV timer alert channels (all optional - only set if guild uses FFXIV features)
+    ffxiv_gathering_channel_id = Column(BigInteger, nullable=True)   # Unspoiled/legendary node alerts
+    ffxiv_ocean_channel_id     = Column(BigInteger, nullable=True)   # Ocean Fishing registration alerts
+    ffxiv_resets_channel_id    = Column(BigInteger, nullable=True)   # Daily/weekly reset reminders
+    ffxiv_gathering_enabled    = Column(Boolean, default=False)
+    ffxiv_ocean_enabled        = Column(Boolean, default=False)
+    ffxiv_resets_enabled       = Column(Boolean, default=False)
+
+    # Soulmask alert channel
+    soulmask_announce_channel_id = Column(BigInteger, nullable=True)
 
     # Roles
     verified_role_id = Column(BigInteger, nullable=True)
@@ -437,7 +454,7 @@ class RaidConfig(Base):
     ping_role_id = Column(BigInteger, nullable=True)
     dm_owner_on_raid = Column(Boolean, default=True)
 
-    # Premium features
+    # Extended verification options
     detect_vpn = Column(Boolean, default=False)
     detect_similar_names = Column(Boolean, default=False)
     honeypot_channel_id = Column(BigInteger, nullable=True)
@@ -490,7 +507,7 @@ class VerificationConfig(Base):
     captcha_length = Column(Integer, default=6)
     captcha_timeout_seconds = Column(Integer, default=300)
 
-    # Multi-step (Premium)
+    # Multi-step verification
     require_rules_read = Column(Boolean, default=False)
     require_intro_message = Column(Boolean, default=False)
     intro_channel_id = Column(BigInteger, nullable=True)
@@ -717,7 +734,7 @@ class DiscoveryConfig(Base):
     # Discord-only quick feature toggle
     selfpromo_quick_feature = Column(Boolean, default=False)  # Enable Discord-only embeds for selfpromo (not website)
 
-    # Creator of the Month (PREMIUM)
+    # Creator of the Month
     cotm_enabled = Column(Boolean, default=False)  # Enable Creator of the Month feature
     cotm_channel_id = Column(BigInteger, nullable=True)  # Channel to post COTM announcement
     cotm_last_message_id = Column(BigInteger, nullable=True)  # Last COTM message ID (for deletion)
@@ -726,7 +743,7 @@ class DiscoveryConfig(Base):
     cotm_auto_rotate = Column(Boolean, default=False)  # Enable automatic monthly rotation
     cotm_rotation_day = Column(Integer, default=1)  # Day of month to rotate (1-31)
 
-    # Creator of the Week (PRO)
+    # Creator of the Week
     cotw_enabled = Column(Boolean, default=False)  # Enable Creator of the Week feature
     cotw_channel_id = Column(BigInteger, nullable=True)  # Channel to post COTW announcement
     cotw_last_message_id = Column(BigInteger, nullable=True)  # Last COTW message ID (for deletion)
@@ -803,7 +820,7 @@ class DiscoveryConfig(Base):
 
 
 class CreatorOfTheMonth(Base):
-    """Creator of the Month history (PREMIUM feature)."""
+    """Creator of the Month history."""
     __tablename__ = "creator_of_the_month"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -828,7 +845,7 @@ class CreatorOfTheMonth(Base):
 
 
 class CreatorOfTheWeek(Base):
-    """Creator of the Week history (PRO feature)."""
+    """Creator of the Week history."""
     __tablename__ = "creator_of_the_week"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -982,7 +999,7 @@ class DiscoveryNetwork(Base):
 
 
 class ServerListing(Base):
-    """Server listings for the discovery directory (PRO only)."""
+    """Server listings for the discovery directory."""
     __tablename__ = "server_listings"
 
     guild_id = Column(BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"), primary_key=True)
@@ -1492,7 +1509,7 @@ class PendingAction(Base):
 class BulkImportJob(Base):
     """
     Track bulk import jobs (CSV uploads) for progress monitoring.
-    Pro/Premium feature for mass operations.
+    Tracks queued mass operations.
     """
     __tablename__ = "bulk_import_jobs"
 
@@ -1547,7 +1564,7 @@ class LFGGame(Base):
     game_short = Column(String(20), nullable=False)  # e.g., "MHW" - used in commands
     game_emoji = Column(String(50), nullable=True)  # Optional emoji
 
-    # IGDB Integration (FREE feature - game search)
+    # IGDB integration
     igdb_id = Column(Integer, nullable=True)  # IGDB game ID
     igdb_slug = Column(String(100), nullable=True)  # IGDB URL slug
     cover_url = Column(String(500), nullable=True)  # Game cover art from IGDB
@@ -1558,7 +1575,7 @@ class LFGGame(Base):
     lfg_channel_id = Column(BigInteger, nullable=True)  # Where LFG threads are created
     notify_role_id = Column(BigInteger, nullable=True)  # Role to ping for new groups
 
-    # Game-specific options (JSON) - PREMIUM/PRO ONLY
+    # Game-specific options (JSON)
     # Structure: {"options": [{"name": "Weapon", "choices": ["Sword", "Bow", ...]}, ...]}
     # For role tagging: {"name": "Spec", "choices": [{"value": "Protection", "role": "tank"}, ...]}
     custom_options = Column(Text, nullable=True)
@@ -1575,7 +1592,7 @@ class LFGGame(Base):
 
     # Feature toggles
     enabled = Column(Boolean, default=True)
-    require_rank = Column(Boolean, default=False)  # Require rank/level input (PREMIUM)
+    require_rank = Column(Boolean, default=False)  # Require rank/level input
     rank_label = Column(String(50), default="Rank")  # e.g., "Hunter Rank", "Power Level"
     rank_min = Column(Integer, default=1)
     rank_max = Column(Integer, default=999)
@@ -1612,6 +1629,11 @@ class LFGGroup(Base):
     management_message_id = Column(BigInteger, nullable=True)
     ping_role_id = Column(BigInteger, nullable=True)  # Role to ping when creating thread
 
+    # Canonical QuestLog identity. The local row is retained temporarily as a
+    # Discord adapter binding while legacy LFG traffic is migrated.
+    canonical_group_id = Column(BigInteger, nullable=True)
+    canonical_share_token = Column(String(100), nullable=True)
+
     # Creator info
     creator_id = Column(BigInteger, nullable=False)
     creator_name = Column(String(255), nullable=True)
@@ -1644,6 +1666,7 @@ class LFGGroup(Base):
     __table_args__ = (
         Index("idx_lfg_group_guild", "guild_id", "is_active"),
         Index("idx_lfg_group_thread", "thread_id"),
+        Index("idx_lfg_group_canonical", "canonical_group_id"),
     )
 
 
@@ -1674,6 +1697,74 @@ class LFGMember(Base):
         UniqueConstraint("group_id", "user_id", name="uq_group_member"),
         Index("idx_lfg_member_group", "group_id"),
         Index("idx_lfg_member_user", "user_id"),
+    )
+
+
+class LFGDeliveryReceipt(Base):
+    """Persistent Discord delivery result used for job deduplication."""
+    __tablename__ = "lfg_delivery_receipts"
+
+    delivery_job_id = Column(String(100), primary_key=True)
+    canonical_group_id = Column(BigInteger, nullable=True)
+    action = Column(String(30), nullable=True)
+    status = Column(String(30), nullable=False, default="processing")
+
+    guild_id = Column(BigInteger, nullable=True)
+    channel_id = Column(BigInteger, nullable=True)
+    message_id = Column(BigInteger, nullable=True)
+    thread_id = Column(BigInteger, nullable=True)
+
+    callback_url = Column(String(1000), nullable=True)
+    payload_hash = Column(String(64), nullable=True)
+    error_code = Column(String(100), nullable=True)
+    error_message = Column(Text, nullable=True)
+
+    created_at = Column(BigInteger, default=lambda: int(time.time()), nullable=False)
+    updated_at = Column(
+        BigInteger,
+        default=lambda: int(time.time()),
+        onupdate=lambda: int(time.time()),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index("idx_lfg_delivery_group", "canonical_group_id", "guild_id"),
+        Index("idx_lfg_delivery_status", "status", "updated_at"),
+    )
+
+
+class ProgressionOutboxEvent(Base):
+    """Durable delivery state for QuestLog progression evidence."""
+    __tablename__ = "progression_outbox_events"
+
+    # This is the same stable key sent to QuestLog. Re-enqueuing the same
+    # Discord evidence therefore cannot create a second local job or award.
+    event_key = Column(String(120), primary_key=True)
+    guild_id = Column(BigInteger, nullable=False)
+    user_id = Column(BigInteger, nullable=False)
+    event_type = Column(String(50), nullable=False)
+    evidence_id = Column(String(255), nullable=False)
+    occurred_at = Column(BigInteger, nullable=False)
+
+    status = Column(String(30), nullable=False, default="queued")
+    attempt_count = Column(Integer, nullable=False, default=0)
+    next_attempt_at = Column(BigInteger, nullable=False, default=0)
+    last_error_code = Column(String(100), nullable=True)
+    last_error_message = Column(Text, nullable=True)
+    result_payload = Column(Text, nullable=True)
+
+    created_at = Column(BigInteger, default=lambda: int(time.time()), nullable=False)
+    updated_at = Column(
+        BigInteger,
+        default=lambda: int(time.time()),
+        onupdate=lambda: int(time.time()),
+        nullable=False,
+    )
+    delivered_at = Column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        Index("idx_progression_outbox_due", "status", "next_attempt_at"),
+        Index("idx_progression_outbox_member", "guild_id", "user_id"),
     )
 
 
@@ -1745,7 +1836,7 @@ class Suggestion(Base):
 
 
 # =============================================================================
-# LFG Attendance & Reliability Tracking (PREMIUM)
+# LFG Attendance & Reliability Tracking
 # =============================================================================
 
 class AttendanceStatus(str, Enum):
@@ -1760,7 +1851,7 @@ class AttendanceStatus(str, Enum):
 
 
 class LFGAttendance(Base):
-    """Track attendance for LFG groups (PREMIUM feature)."""
+    """Track attendance for LFG groups."""
     __tablename__ = "lfg_attendance"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -1795,7 +1886,7 @@ class LFGAttendance(Base):
 
 
 class LFGMemberStats(Base):
-    """Per-guild member LFG reliability stats (PREMIUM feature)."""
+    """Per-guild member LFG reliability stats."""
     __tablename__ = "lfg_member_stats"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -1841,26 +1932,26 @@ class LFGMemberStats(Base):
 
 
 class LFGConfig(Base):
-    """Per-guild LFG configuration (includes premium settings)."""
+    """Per-guild LFG configuration."""
     __tablename__ = "lfg_configs"
 
     guild_id = Column(BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"), primary_key=True)
 
-    # Premium: Attendance tracking
+    # Attendance tracking
     attendance_tracking_enabled = Column(Boolean, default=False)
     auto_noshow_hours = Column(Integer, default=1)  # Hours after start to mark as no-show
     require_confirmation = Column(Boolean, default=False)  # Require members to confirm
 
-    # Premium: Reliability thresholds
+    # Reliability thresholds
     min_reliability_score = Column(Integer, default=0)  # Min score to join groups
     warn_at_reliability = Column(Integer, default=50)  # Warn when below this
     auto_blacklist_noshows = Column(Integer, default=0)  # Auto-blacklist after X no-shows (0=disabled)
 
-    # Premium: Notifications
+    # Notifications
     notify_on_noshow = Column(Boolean, default=False)  # Notify group when someone no-shows
     notify_channel_id = Column(BigInteger, nullable=True)  # Where to send reliability reports
 
-    # LFG Browser Notifications (Pro/Premium/VIP)
+    # LFG browser notifications
     browser_notify_channel_id = Column(BigInteger, nullable=True)  # Channel for group announcements
     notify_on_group_create = Column(Boolean, default=True)  # Announce new groups
     notify_on_group_update = Column(Boolean, default=False)  # Announce group updates
@@ -1923,7 +2014,7 @@ class GuildFlair(Base):
     """
     Configurable flairs for the flair store.
     Supports per-guild customization of flair names, costs, and types.
-    Premium guilds can create custom flairs.
+    Communities can create custom flairs.
     """
     __tablename__ = "guild_flairs"
 

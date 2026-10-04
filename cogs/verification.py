@@ -4,10 +4,10 @@ Full verification system for QuestLog.
 
 VERIFICATION TYPES:
 - NONE: No verification required
-- BUTTON: Click button to agree to rules (FREE)
-- CAPTCHA: Solve random captcha (FREE)
-- ACCOUNT_AGE: Auto-verify if account old enough (FREE)
-- MULTI_STEP: Combination of above + intro message (PREMIUM)
+- BUTTON: Click button to agree to rules
+- CAPTCHA: Solve random captcha
+- ACCOUNT_AGE: Auto-verify if account old enough
+- MULTI_STEP: Combination of above + intro message
 
 FEATURES:
 - Auto-quarantine new members until verified
@@ -260,7 +260,7 @@ class CaptchaButtonView(View):
 
 
 class MultiStepView(View):
-    """Multi-step verification view (Premium)."""
+    """Multi-step verification view."""
 
     def __init__(self, guild_id: int, require_rules: bool, require_intro: bool):
         super().__init__(timeout=None)
@@ -1090,15 +1090,6 @@ class VerificationCog(commands.Cog):
                 )
 
         elif verification_type == VerificationType.MULTI_STEP:
-            # Check access for multi-step (Complete tier, VIP, or Moderation module)
-            if not has_moderation_access(session, ctx.guild.id):
-                await ctx.respond(
-                    "Multi-step verification requires **Complete tier** or the **Moderation Module**.\n"
-                    "Please contact an admin to upgrade or use basic verification.",
-                    ephemeral=True
-                )
-                return
-
             # Show multi-step instructions
             steps = ["1. Click **I've read the rules** after reading the server rules"]
             if config and config.require_intro_message and config.intro_channel_id:
@@ -1353,12 +1344,6 @@ class VerificationCog(commands.Cog):
             view = CaptchaButtonView(ctx.guild.id, captcha_length)
             embed.description += "\n\n*You will be asked to solve a captcha.*"
         elif verification_type == VerificationType.MULTI_STEP:
-            if not has_moderation_access(session, ctx.guild.id):
-                await ctx.respond(
-                    "Multi-step verification requires **Complete tier** or the **Moderation Module**.",
-                    ephemeral=True
-                )
-                return
             view = MultiStepView(ctx.guild.id, True, config.require_intro_message if config else False)
             embed.description = (
                 "**Multi-Step Verification Required**\n\n"
@@ -1436,15 +1421,6 @@ class VerificationCog(commands.Cog):
             changes = []
 
             if type:
-                # Check access for multi_step (Complete tier, VIP, or Moderation module)
-                if type == "multi_step":
-                    if not has_moderation_access(session, ctx.guild.id):
-                        await ctx.respond(
-                            "Multi-step verification requires **Complete tier** or the **Moderation Module**!",
-                            ephemeral=True
-                        )
-                        return
-
                 config.verification_type = VerificationType(type)
                 changes.append(f"Type: **{type}**")
 
@@ -1504,7 +1480,7 @@ class VerificationCog(commands.Cog):
                     ephemeral=True
                 )
 
-    @verify.command(name="intro-channel", description="Set intro channel for multi-step (Premium)")
+    @verify.command(name="intro-channel", description="Set intro channel for multi-step verification")
     @discord.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     @discord.option("channel", discord.TextChannel, description="Channel for introductions")
@@ -1517,13 +1493,6 @@ class VerificationCog(commands.Cog):
     ):
         """Set intro channel for multi-step verification."""
         with db_session_scope() as session:
-            if not has_moderation_access(session, ctx.guild.id):
-                await ctx.respond(
-                    "Multi-step verification requires **Complete tier** or the **Moderation Module**!",
-                    ephemeral=True
-                )
-                return
-
             config = session.get(VerificationConfig, ctx.guild.id)
             if not config:
                 config = VerificationConfig(guild_id=ctx.guild.id)

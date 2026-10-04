@@ -3,14 +3,13 @@
 Security cog for QuestLog.
 Handles anti-raid protection, lockdown, and threat detection.
 
-FREE FEATURES:
+FEATURES:
 - Account age detection (flag <7 days)
 - Mass join alerts
 - Auto-quarantine new accounts
 - Emergency lockdown
 - Rate limiting
 
-PREMIUM FEATURES:
 - VPN/Proxy detection
 - Similar name detection
 - Honeypot channels
@@ -581,7 +580,7 @@ class SecurityCog(commands.Cog):
                 title=f"📋 Mod Action Log (Last {log_days} Days)",
                 color=discord.Color.blue()
             )
-            embed.set_footer(text=f"{tier} tier: {log_days}-day history | Upgrade for more")
+            embed.set_footer(text=f"{log_days}-day moderation history")
 
             for action in actions:
                 time_str = f"<t:{action.timestamp}:R>"

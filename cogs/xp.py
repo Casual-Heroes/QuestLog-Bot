@@ -19,6 +19,7 @@ TOKEN CONVERSION:
 
 import time
 import asyncio
+import hashlib
 import re
 import discord
 from discord.ext import commands, tasks
@@ -29,6 +30,7 @@ from config import (
     logger,
     DefaultXPSettings,
     get_debug_guilds,
+    QUESTLOG_PROGRESSION_API_ENABLED,
 )
 from models import (
     Guild, GuildMember, XPConfig, LevelRole, LevelUpConfig,
@@ -51,6 +53,136 @@ class XPCog(commands.Cog):
         description="XP and leveling commands",
         
     )
+
+    async def _report_questlog_progression(
+        self, *, guild_id: int, user_id: int, event_type: str,
+        evidence_id: str, occurred_at: int,
+    ):
+        """Report evidence only; QuestLog owns the unified award calculation."""
+        if not QUESTLOG_PROGRESSION_API_ENABLED:
+            return None
+        api_cog = self.bot.get_cog("ProgressionAPICog")
+        if not api_cog:
+            logger.error(
+                "QuestLog progression event could not be queued: canonical mode "
+                "is enabled but ProgressionAPICog is unavailable"
+            )
+            return None
+        try:
+            result = await api_cog.submit_event(
+                user_id=user_id,
+                guild_id=guild_id,
+                event_type=event_type,
+                evidence_id=evidence_id,
+                occurred_at=occurred_at,
+            )
+            logger.debug(
+                "QuestLog progression accepted: guild=%s user=%s event=%s "
+                "status=%s xp=%s level=%s",
+                guild_id, user_id, event_type, result.status, result.awarded_xp,
+                result.current_level,
+            )
+            return result
+        except Exception as error:
+            logger.error(
+                "QuestLog progression enqueue failed: guild=%s user=%s event=%s error=%s",
+                guild_id, user_id, event_type, error,
+            )
+            return None
+
+    @staticmethod
+    def uses_canonical_progression(session, guild_id: int) -> bool:
+        """Return whether this Discord server mirrors QuestLog progression."""
+        if not QUESTLOG_PROGRESSION_API_ENABLED:
+            return False
+        try:
+            from sqlalchemy import text as sa_text
+            community = session.execute(
+                sa_text(
+                    "SELECT site_xp_to_guild FROM web_communities "
+                    "WHERE platform='discord' AND platform_id=:g "
+                    "AND network_status='approved' AND is_active=1 LIMIT 1"
+                ),
+                {"g": str(guild_id)},
+            ).fetchone()
+            return bool(community and community[0])
+        except Exception as error:
+            logger.error(
+                "Could not resolve canonical progression mode for guild=%s: %s",
+                guild_id, error,
+            )
+            return False
+
+    @staticmethod
+    def member_uses_canonical_progression(session, guild_id: int, user_id: int) -> bool:
+        """Return whether this member uses Web XP in a Unified community.
+
+        Unlinked members continue using Warden-local XP until Discord linking
+        performs the one-time merge into QuestLog. On lookup failure, fail
+        closed to canonical mode so a transient database error cannot create a
+        second balance for an already-linked member.
+        """
+        if not XPCog.uses_canonical_progression(session, guild_id):
+            return False
+        try:
+            from sqlalchemy import text as sa_text
+            linked = session.execute(
+                sa_text(
+                    "SELECT 1 FROM web_users "
+                    "WHERE discord_id=:discord_id LIMIT 1"
+                ),
+                {"discord_id": str(user_id)},
+            ).fetchone()
+            return linked is not None
+        except Exception as error:
+            logger.error(
+                "Could not resolve QuestLog link state for guild=%s user=%s: %s",
+                guild_id,
+                user_id,
+                error,
+            )
+            return True
+
+    async def _apply_authoritative_progression(
+        self, *, guild: discord.Guild, member: discord.Member, result,
+        current_channel: discord.TextChannel = None,
+    ):
+        """Mirror QuestLog state and drive Discord notices/roles from it."""
+        if not result or not result.identity_linked or result.current_level is None:
+            return False
+
+        with db_session_scope() as session:
+            db_member = session.get(GuildMember, (guild.id, member.id))
+            if not db_member:
+                db_member = GuildMember(
+                    guild_id=guild.id,
+                    user_id=member.id,
+                    display_name=member.display_name,
+                )
+                session.add(db_member)
+            db_member.display_name = member.display_name
+            db_member.xp = float(result.current_xp or 0)
+            db_member.level = int(result.current_level)
+            db_member.last_active = int(time.time())
+            hero_tokens = int(db_member.hero_tokens or 0)
+
+        # Level roles always follow the current QuestLog level, including a
+        # correction downward. A local Warden level can never drive them while
+        # canonical progression is enabled for this community.
+        await self.check_and_award_level_roles(
+            guild, member, int(result.current_level)
+        )
+        if result.level_changed:
+            await self.send_level_up_notification(
+                guild,
+                member,
+                int(result.previous_level or result.current_level),
+                int(result.current_level),
+                hero_tokens,
+                0,
+                current_channel,
+            )
+        return True
 
     # XP helper methods
 
@@ -304,6 +436,21 @@ class XPCog(commands.Cog):
         if display_name and db_member.display_name != display_name:
             db_member.display_name = display_name
 
+        # For a linked member in a Unified community this row is only a
+        # Discord-side mirror. Unlinked members continue earning local XP until
+        # the site's one-time account-link merge moves that balance to Web XP.
+        if XPCog.member_uses_canonical_progression(
+            session, guild_id, user_id
+        ):
+            db_member.last_active = int(time.time())
+            current_level = int(db_member.level or 1)
+            return (
+                current_level,
+                current_level,
+                int(db_member.hero_tokens or 0),
+                0,
+            )
+
         # Store old values
         old_level = db_member.level
         old_xp = db_member.xp
@@ -341,6 +488,12 @@ class XPCog(commands.Cog):
         try:
             from sqlalchemy import text as sa_text
             import time as _time
+
+            # Canonical mode reports provider evidence through QuestLog's
+            # scoped API. Never run the older direct unified-database write at
+            # the same time or the member could be credited twice.
+            if QUESTLOG_PROGRESSION_API_ENABLED:
+                raise Exception("canonical_progression_enabled")
 
             # Check if Unified XP is enabled for this guild before touching web_users
             _community = session.execute(
@@ -429,7 +582,7 @@ class XPCog(commands.Cog):
                     new_level = old_level
                     notify_old_level = old_level
         except Exception as _e:
-            if str(_e) != "unified_xp_off":
+            if str(_e) not in {"unified_xp_off", "canonical_progression_enabled"}:
                 logger.debug(f"web_xp dual-write skipped for user_id={user_id}: {_e}")
 
         logger.debug(
@@ -537,33 +690,40 @@ class XPCog(commands.Cog):
             target_role_id = None
             remove_previous = True
             all_role_ids = []
+            role_levels = {}
 
             for lr in level_roles:
                 all_role_ids.append(lr.role_id)
+                role_levels[lr.role_id] = lr.level
                 if level >= lr.level:
                     target_role_id = lr.role_id
                     remove_previous = lr.remove_previous
 
-        if not target_role_id:
-            return
-
-        target_role = guild.get_role(target_role_id)
-        if not target_role:
-            return
+        target_role = guild.get_role(target_role_id) if target_role_id else None
 
         try:
-            # Remove previous milestone roles if configured
-            if remove_previous:
-                current_milestone_roles = [
-                    role for role in member.roles
-                    if role.id in all_role_ids and role.id != target_role_id
-                ]
-                for role in current_milestone_roles:
-                    await member.remove_roles(role, reason="Upgraded to higher milestone")
+            # Remove roles the authoritative QuestLog level no longer permits.
+            # When the configured target replaces earlier milestones, retain
+            # only that exact role; otherwise keep eligible lower milestones.
+            current_milestone_roles = [
+                role for role in member.roles if role.id in all_role_ids
+            ]
+            for role in current_milestone_roles:
+                should_remove = (
+                    target_role_id is None
+                    or role_levels.get(role.id, 0) > level
+                    or (remove_previous and role.id != target_role_id)
+                )
+                if should_remove:
+                    await member.remove_roles(
+                        role, reason="Synchronized to QuestLog level"
+                    )
 
             # Add new role
-            if target_role not in member.roles:
-                await member.add_roles(target_role, reason="Level milestone reached")
+            if target_role and target_role not in member.roles:
+                await member.add_roles(
+                    target_role, reason="Synchronized to QuestLog level"
+                )
 
         except discord.Forbidden:
             logger.warning(f"Cannot manage roles for {member.id} in {guild.id}")
@@ -592,11 +752,53 @@ class XPCog(commands.Cog):
         except Exception as e:
             logger.error(f"Error updating invite cache for {guild.name}: {e}")
 
+    async def sync_canonical_progression_mirrors(self):
+        """Mirror QuestLog XP/level into Warden and reconcile level roles."""
+        if not QUESTLOG_PROGRESSION_API_ENABLED:
+            return
+        from sqlalchemy import text as sa_text
+
+        mirrored = []
+        with db_session_scope() as session:
+            rows = session.execute(sa_text(
+                "SELECT gm.guild_id, gm.user_id, wu.web_xp, wu.web_level "
+                "FROM guild_members gm "
+                "JOIN web_communities wc "
+                "  ON wc.platform='discord' "
+                " AND wc.platform_id=CAST(gm.guild_id AS CHAR) "
+                " AND wc.network_status='approved' "
+                " AND wc.is_active=1 "
+                " AND wc.site_xp_to_guild=1 "
+                "JOIN web_users wu "
+                "  ON wu.discord_id=CAST(gm.user_id AS CHAR)"
+            )).fetchall()
+            for row in rows:
+                db_member = session.get(GuildMember, (int(row[0]), int(row[1])))
+                if not db_member:
+                    continue
+                site_xp = float(row[2] or 0)
+                site_level = int(row[3] or 1)
+                if db_member.xp != site_xp or db_member.level != site_level:
+                    db_member.xp = site_xp
+                    db_member.level = site_level
+                mirrored.append((int(row[0]), int(row[1]), site_level))
+
+        for guild_id, user_id, site_level in mirrored:
+            guild = self.bot.get_guild(guild_id)
+            member = guild.get_member(user_id) if guild else None
+            if guild and member:
+                await self.check_and_award_level_roles(guild, member, site_level)
+        logger.info(
+            "QuestLog progression mirrors synchronized for %s linked members",
+            len(mirrored),
+        )
+
     # Event listeners
 
     @commands.Cog.listener()
     async def on_ready(self):
         """Initialize invite cache for all guilds."""
+        await self.sync_canonical_progression_mirrors()
         guilds_to_cache = []
         for guild in self.bot.guilds:
             with db_session_scope() as session:
@@ -723,12 +925,17 @@ class XPCog(commands.Cog):
         guild_id = message.guild.id
         should_notify = False
         level_data = None
+        questlog_event = None
+        canonical_progression = False
 
         try:
             with db_session_scope() as session:
                 db_guild = session.get(Guild, guild_id)
                 if not db_guild or not db_guild.xp_enabled:
                     return
+                canonical_progression = XPCog.member_uses_canonical_progression(
+                    session, guild_id, message.author.id
+                )
 
                 if not XPCog.can_gain_xp(session, guild_id, message.author, message.channel):
                     return
@@ -780,6 +987,9 @@ class XPCog(commands.Cog):
                         )
                         db_member.last_media_ts = now
                         old_level, new_level, tokens, token_diff = result
+                        questlog_event = (
+                            "discord_media", f"message:{message.id}", now
+                        )
 
                         if new_level > old_level:
                             should_notify = True
@@ -795,13 +1005,33 @@ class XPCog(commands.Cog):
                         )
                         db_member.last_message_ts = now
                         old_level, new_level, tokens, token_diff = result
+                        questlog_event = (
+                            "discord_message", f"message:{message.id}", now
+                        )
 
                         if new_level > old_level:
                             should_notify = True
                             level_data = (old_level, new_level, tokens, token_diff)
 
             # Send notification after commit
-            if should_notify and level_data:
+            authoritative_result = None
+            if canonical_progression and questlog_event:
+                authoritative_result = await self._report_questlog_progression(
+                    guild_id=guild_id,
+                    user_id=message.author.id,
+                    event_type=questlog_event[0],
+                    evidence_id=questlog_event[1],
+                    occurred_at=questlog_event[2],
+                )
+            authoritative_applied = False
+            if canonical_progression:
+                authoritative_applied = await self._apply_authoritative_progression(
+                    guild=message.guild,
+                    member=message.author,
+                    result=authoritative_result,
+                    current_channel=message.channel,
+                )
+            if not authoritative_applied and should_notify and level_data:
                 await self.send_level_up_notification(
                     message.guild, message.author,
                     level_data[0], level_data[1], level_data[2], level_data[3],
@@ -827,12 +1057,17 @@ class XPCog(commands.Cog):
         guild_id = guild.id
         should_notify = False
         level_data = None
+        questlog_event = None
+        canonical_progression = False
 
         try:
             with db_session_scope() as session:
                 db_guild = session.get(Guild, guild_id)
                 if not db_guild or not db_guild.xp_enabled:
                     return
+                canonical_progression = XPCog.member_uses_canonical_progression(
+                    session, guild_id, payload.user_id
+                )
 
                 channel = guild.get_channel(payload.channel_id)
                 if not XPCog.can_gain_xp(session, guild_id, payload.member, channel):
@@ -867,12 +1102,37 @@ class XPCog(commands.Cog):
                     db_member.last_react_ts = now
                     db_member.reaction_count += 1
                     old_level, new_level, tokens, token_diff = result
+                    emoji_key = str(payload.emoji.id or hashlib.sha256(
+                        str(payload.emoji.name).encode("utf-8")
+                    ).hexdigest()[:16])
+                    questlog_event = (
+                        "discord_reaction",
+                        f"reaction:{payload.message_id}:{payload.user_id}:{emoji_key}",
+                        now,
+                    )
 
                     if new_level > old_level:
                         should_notify = True
                         level_data = (old_level, new_level, tokens, token_diff)
 
-            if should_notify and level_data:
+            authoritative_result = None
+            if canonical_progression and questlog_event:
+                authoritative_result = await self._report_questlog_progression(
+                    guild_id=guild_id,
+                    user_id=payload.user_id,
+                    event_type=questlog_event[0],
+                    evidence_id=questlog_event[1],
+                    occurred_at=questlog_event[2],
+                )
+            authoritative_applied = False
+            if canonical_progression:
+                authoritative_applied = await self._apply_authoritative_progression(
+                    guild=guild,
+                    member=payload.member,
+                    result=authoritative_result,
+                    current_channel=channel,
+                )
+            if not authoritative_applied and should_notify and level_data:
                 await self.send_level_up_notification(
                     guild, payload.member,
                     level_data[0], level_data[1], level_data[2], level_data[3],
@@ -894,12 +1154,17 @@ class XPCog(commands.Cog):
         guild_id = member.guild.id
         should_notify = False
         level_data = None
+        questlog_event = None
+        canonical_progression = False
 
         try:
             with db_session_scope() as session:
                 db_guild = session.get(Guild, guild_id)
                 if not db_guild or not db_guild.xp_enabled:
                     return
+                canonical_progression = XPCog.member_uses_canonical_progression(
+                    session, guild_id, member.id
+                )
 
                 xp_config = XPCog.get_xp_config(session, guild_id)
 
@@ -935,6 +1200,11 @@ class XPCog(commands.Cog):
                             )
                             db_member.last_voice_bonus_ts = now
                             old_level, new_level, tokens, token_diff = result
+                            questlog_event = (
+                                "discord_voice",
+                                f"voice-join:{member.id}:{now}",
+                                now,
+                            )
 
                             if new_level > old_level:
                                 should_notify = True
@@ -953,6 +1223,7 @@ class XPCog(commands.Cog):
                         # Award XP for time in voice - only if voice tracking is enabled
                         chunks = duration // xp_config["voice_interval"]
                         if xp_config["track_voice"] and chunks > 0:
+                            joined_at = db_member.last_voice_join_ts
                             result = XPCog.add_xp(
                                 session, guild_id, member.id,
                                 xp_config["voice_xp"] * chunks,
@@ -960,6 +1231,11 @@ class XPCog(commands.Cog):
                                 source="voice"
                             )
                             old_level, new_level, tokens, token_diff = result
+                            questlog_event = (
+                                "discord_voice",
+                                f"voice-session:{member.id}:{joined_at}:{now}",
+                                now,
+                            )
 
                             if new_level > old_level:
                                 should_notify = True
@@ -967,7 +1243,24 @@ class XPCog(commands.Cog):
 
                         db_member.last_voice_join_ts = 0
 
-            if should_notify and level_data:
+            authoritative_result = None
+            if canonical_progression and questlog_event:
+                authoritative_result = await self._report_questlog_progression(
+                    guild_id=guild_id,
+                    user_id=member.id,
+                    event_type=questlog_event[0],
+                    evidence_id=questlog_event[1],
+                    occurred_at=questlog_event[2],
+                )
+            authoritative_applied = False
+            if canonical_progression:
+                authoritative_applied = await self._apply_authoritative_progression(
+                    guild=member.guild,
+                    member=member,
+                    result=authoritative_result,
+                    current_channel=None,
+                )
+            if not authoritative_applied and should_notify and level_data:
                 await self.send_level_up_notification(
                     member.guild, member,
                     level_data[0], level_data[1], level_data[2], level_data[3],
@@ -1060,12 +1353,17 @@ class XPCog(commands.Cog):
         guild_id = after.guild.id
         should_notify = False
         level_data = None
+        questlog_event = None
+        canonical_progression = False
 
         try:
             with db_session_scope() as session:
                 db_guild = session.get(Guild, guild_id)
                 if not db_guild or not db_guild.xp_enabled:
                     return
+                canonical_progression = XPCog.member_uses_canonical_progression(
+                    session, guild_id, after.id
+                )
 
                 xp_config = XPCog.get_xp_config(session, guild_id)
 
@@ -1109,6 +1407,11 @@ class XPCog(commands.Cog):
                         db_member.last_game_launch_ts = now
                         db_member.last_gaming_ts = now
                         old_level, new_level, tokens, token_diff = result
+                        questlog_event = (
+                            "discord_gaming",
+                            f"gaming-launch:{after.id}:{now}",
+                            now,
+                        )
 
                         if new_level > old_level:
                             should_notify = True
@@ -1124,6 +1427,7 @@ class XPCog(commands.Cog):
 
                     # Award XP for time spent gaming - only if gaming tracking is enabled
                     if xp_config["track_gaming"] and chunks > 0:
+                        started_at = db_member.last_gaming_ts
                         result = XPCog.add_xp(
                             session, guild_id, after.id,
                             xp_config["gaming_xp"] * chunks,
@@ -1131,6 +1435,11 @@ class XPCog(commands.Cog):
                             source="gaming"
                         )
                         old_level, new_level, tokens, token_diff = result
+                        questlog_event = (
+                            "discord_gaming",
+                            f"gaming-session:{after.id}:{started_at}:{now}",
+                            now,
+                        )
 
                         if new_level > old_level:
                             should_notify = True
@@ -1138,7 +1447,24 @@ class XPCog(commands.Cog):
 
                     db_member.last_gaming_ts = 0
 
-            if should_notify and level_data:
+            authoritative_result = None
+            if canonical_progression and questlog_event:
+                authoritative_result = await self._report_questlog_progression(
+                    guild_id=guild_id,
+                    user_id=after.id,
+                    event_type=questlog_event[0],
+                    evidence_id=questlog_event[1],
+                    occurred_at=questlog_event[2],
+                )
+            authoritative_applied = False
+            if canonical_progression:
+                authoritative_applied = await self._apply_authoritative_progression(
+                    guild=after.guild,
+                    member=after,
+                    result=authoritative_result,
+                    current_channel=None,
+                )
+            if not authoritative_applied and should_notify and level_data:
                 await self.send_level_up_notification(
                     after.guild, after,
                     level_data[0], level_data[1], level_data[2], level_data[3],
@@ -1182,16 +1508,18 @@ class XPCog(commands.Cog):
             # Check if guild is in the QuestLog Network
             network_row = session.execute(
                 sa_text(
-                    "SELECT id FROM web_communities "
-                    "WHERE platform='discord' AND platform_id=:g AND network_status='approved' LIMIT 1"
+                    "SELECT id, site_xp_to_guild FROM web_communities "
+                    "WHERE platform='discord' AND platform_id=:g "
+                    "AND network_status='approved' AND is_active=1 LIMIT 1"
                 ),
                 {"g": guild_id_str},
             ).fetchone()
             is_network = network_row is not None
+            is_unified = bool(network_row and network_row[1])
 
-            # Fetch unified QuestLog profile if network-approved
+            # Fetch QuestLog XP only when this community explicitly enabled it.
             unified_row = None
-            if is_network:
+            if is_unified:
                 unified_row = session.execute(
                     sa_text(
                         "SELECT web_xp, web_level, hero_points, username "
@@ -1201,10 +1529,10 @@ class XPCog(commands.Cog):
                 ).fetchone()
 
             # Build embed
-            if is_network and unified_row:
+            if is_unified and unified_row:
                 embed = discord.Embed(
                     title=f"📊 {target.display_name}'s QuestLog Profile",
-                    url=f"https://casual-heroes.com/ql/profile/{unified_row.username}/",
+                    url=f"https://questlog.casual-heroes.com/u/{unified_row.username}/",
                     color=0x6366F1,
                 )
                 embed.add_field(name="🌐 QuestLog XP", value=f"**{unified_row.web_xp:,.0f}**", inline=True)
@@ -1220,7 +1548,7 @@ class XPCog(commands.Cog):
                     ),
                     inline=True,
                 )
-                embed.set_footer(text="QuestLog Network - unified profile | casual-heroes.com/ql/")
+                embed.set_footer(text="QuestLog Network - unified profile | https://questlog.casual-heroes.com/")
             else:
                 embed = discord.Embed(
                     title=f"📊 {target.display_name}'s Profile",
@@ -1239,14 +1567,25 @@ class XPCog(commands.Cog):
                     ),
                     inline=True,
                 )
-                if is_network:
-                    # Guild is in network but user hasn't linked their QuestLog account
+                if is_unified:
+                    # Unified guild, but this member is still on local Warden XP.
                     embed.add_field(
                         name="",
-                        value="[Link your QuestLog account](https://casual-heroes.com/ql/) to see your unified profile!",
+                        value=(
+                            "You are currently earning this server's local XP. "
+                            "[Link your QuestLog account]"
+                            "(https://questlog.casual-heroes.com/) to merge it "
+                            "into Web XP."
+                        ),
                         inline=False,
                     )
-                    embed.set_footer(text="QuestLog Network server | casual-heroes.com/ql/")
+                    embed.set_footer(
+                        text="Unified XP: local until linked | https://questlog.casual-heroes.com/"
+                    )
+                elif is_network:
+                    embed.set_footer(
+                        text="QuestLog connected; this server uses Warden XP"
+                    )
                 else:
                     embed.set_footer(text="Earn XP by chatting, voice, reactions, and more!")
 
@@ -1272,7 +1611,7 @@ class XPCog(commands.Cog):
             is_unified = bool(community and community[0])
 
             if is_unified:
-                rows = session.execute(
+                linked_rows = session.execute(
                     sa_text(
                         "SELECT wu.username, ul.xp_total, wu.web_level "
                         "FROM web_unified_leaderboard ul "
@@ -1282,8 +1621,26 @@ class XPCog(commands.Cog):
                     ),
                     {"g": guild_id_str}
                 ).fetchall()
-                title = f"🏆 {ctx.guild.name} - Unified Leaderboard"
-                footer = "QuestLog Network - unified XP across all platforms | casual-heroes.com/ql/"
+                unlinked_rows = session.execute(
+                    sa_text(
+                        "SELECT COALESCE(gm.display_name, CONCAT('User ', gm.user_id)), "
+                        "gm.xp, gm.level FROM guild_members gm "
+                        "LEFT JOIN web_users wu "
+                        "ON wu.discord_id=CAST(gm.user_id AS CHAR) "
+                        "WHERE gm.guild_id=:guild_id AND wu.id IS NULL"
+                    ),
+                    {"guild_id": ctx.guild.id},
+                ).fetchall()
+                rows = sorted(
+                    list(linked_rows) + list(unlinked_rows),
+                    key=lambda row: float(row[1] or 0),
+                    reverse=True,
+                )[:10]
+                title = f"🏆 {ctx.guild.name} - Unified XP Leaderboard"
+                footer = (
+                    "Web XP for linked members; Warden XP until account link | "
+                    "https://questlog.casual-heroes.com/"
+                )
             else:
                 top_members = (
                     session.query(GuildMember)
@@ -1346,6 +1703,15 @@ class XPCog(commands.Cog):
             return
 
         with db_session_scope() as session:
+            if XPCog.member_uses_canonical_progression(
+                session, ctx.guild.id, member.id
+            ):
+                await ctx.respond(
+                    "QuestLog owns XP and levels for this community. "
+                    "Use QuestLog moderation tools for a reviewed adjustment.",
+                    ephemeral=True,
+                )
+                return
             result = XPCog.add_xp(
                 session, ctx.guild.id, member.id,
                 amount, member.display_name, "active"
@@ -1555,6 +1921,72 @@ class XPCog(commands.Cog):
     def cog_unload(self):
         """Clean up when cog is unloaded."""
         self.check_expired_boost_events.cancel()
+
+    @xp.command(name="nudge_unlinked", description="DM members who have XP but haven't linked QuestLog (admin only)")
+    @commands.has_permissions(administrator=True)
+    async def xp_nudge_unlinked(self, ctx: discord.ApplicationContext):
+        """Find members with Discord XP but no linked QuestLog account and DM them."""
+        await ctx.defer(ephemeral=True)
+
+        with db_session_scope() as session:
+            # Get all guild members with XP
+            from sqlalchemy import text as sa_text
+            members_with_xp = session.execute(sa_text(
+                "SELECT user_id, username, xp FROM guild_members "
+                "WHERE guild_id = :gid AND xp > 0 ORDER BY xp DESC"
+            ), {'gid': ctx.guild.id}).fetchall()
+
+            # Get discord IDs that are already linked
+            linked_ids = {
+                str(r[0]) for r in session.execute(sa_text(
+                    "SELECT discord_id FROM web_users WHERE discord_id IS NOT NULL"
+                )).fetchall()
+            }
+
+        unlinked = [m for m in members_with_xp if str(m[0]) not in linked_ids]
+
+        if not unlinked:
+            await ctx.respond("All members with XP already have linked QuestLog accounts!", ephemeral=True)
+            return
+
+        sent = 0
+        failed = 0
+        connect_url = "https://questlog.casual-heroes.com/settings/"
+        register_url = "https://questlog.casual-heroes.com/register/"
+
+        for m in unlinked:
+            member = ctx.guild.get_member(int(m[0]))
+            if not member or member.bot:
+                continue
+            try:
+                embed = discord.Embed(
+                    title="Connect Your QuestLog Account",
+                    description=(
+                        f"Hey **{member.display_name}**! You've earned **{int(m[2]):,} XP** "
+                        f"in **{ctx.guild.name}** on Discord.\n\n"
+                        "Link your QuestLog account to unify your XP across Discord, Fluxer, "
+                        "and the website - all in one leaderboard.\n\n"
+                        f"**Already have an account?** Connect at:\n{connect_url}\n\n"
+                        f"**New to QuestLog?** Join free at:\n{register_url}"
+                    ),
+                    color=0x6366F1,
+                )
+                embed.set_footer(text=f"Casual Heroes · questlog.casual-heroes.com")
+                await member.send(embed=embed)
+                sent += 1
+                import asyncio
+                await asyncio.sleep(1)  # rate limit safety
+            except discord.Forbidden:
+                failed += 1
+            except Exception as e:
+                logger.error(f"XPCog nudge_unlinked: DM failed for {m[1]}: {e}")
+                failed += 1
+
+        await ctx.respond(
+            f"Nudge complete - **{sent}** DMs sent, **{failed}** failed (DMs closed).\n"
+            f"**{len(unlinked)}** members have Discord XP but no linked QuestLog account.",
+            ephemeral=True
+        )
 
 
 def setup(bot: commands.Bot):

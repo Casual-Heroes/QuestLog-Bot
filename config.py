@@ -233,27 +233,6 @@ def get_bot_token() -> str:
     return token
 
 
-# All features are unlimited - QuestLog Bot is fully open source and free.
-class FeatureLimits:
-    """Stub class kept for API compatibility. All limits are None (unlimited)."""
-
-    @classmethod
-    def get_limits(cls, tier: str) -> dict:
-        return {}
-
-    @classmethod
-    def get_limit(cls, tier: str, feature: str) -> None:
-        return None
-
-    @classmethod
-    def check_limit(cls, tier: str, feature: str, current_count: int) -> tuple[bool, None]:
-        return (True, None)
-
-    @classmethod
-    def get_upgrade_message(cls, feature: str, current_tier: str) -> str:
-        return ""
-
-
 # Default XP settings
 class DefaultXPSettings:
     """Default XP rates and cooldowns for new guilds."""
@@ -326,6 +305,52 @@ class DefaultVerificationSettings:
 # QuestLog internal API (for bridge relay and other cross-platform features)
 QUESTLOG_INTERNAL_API_URL = os.getenv("QUESTLOG_INTERNAL_API_URL", "https://casual-heroes.com")
 QUESTLOG_BOT_SECRET = os.getenv("QUESTLOG_BOT_SECRET", "")
+_ENABLE_BRIDGE_RAW = os.getenv("ENABLE_BRIDGE")
+# Preserve existing configured bridges during migration, but make all new
+# deployments explicit through .env.example. Remove the compatibility branch
+# after production has ENABLE_BRIDGE set.
+ENABLE_BRIDGE_IMPLICIT = _ENABLE_BRIDGE_RAW is None and bool(QUESTLOG_BOT_SECRET)
+ENABLE_BRIDGE = (
+    bool(QUESTLOG_BOT_SECRET)
+    if _ENABLE_BRIDGE_RAW is None
+    else _ENABLE_BRIDGE_RAW.lower() in ("1", "true", "yes", "on")
+)
+BRIDGE_MEDIA_ALLOWED_HOSTS = tuple(
+    host.strip().lower().rstrip(".")
+    for host in os.getenv("BRIDGE_MEDIA_ALLOWED_HOSTS", "").split(",")
+    if host.strip()
+)
+QUESTLOG_LFG_API_URL = os.getenv(
+    "QUESTLOG_LFG_API_URL",
+    "https://questlog.casual-heroes.com/api/v1/lfg",
+).rstrip("/")
+QUESTLOG_LFG_API_TOKEN = os.getenv("QUESTLOG_LFG_API_TOKEN", "")
+QUESTLOG_PROGRESSION_API_URL = os.getenv(
+    "QUESTLOG_PROGRESSION_API_URL",
+    "https://questlog.casual-heroes.com/api/v1/progression/events",
+).rstrip("/")
+QUESTLOG_PROGRESSION_API_TOKEN = os.getenv("QUESTLOG_PROGRESSION_API_TOKEN", "")
+QUESTLOG_PROGRESSION_API_ENABLED = os.getenv(
+    "QUESTLOG_PROGRESSION_API_ENABLED", "false"
+).lower() in ("1", "true", "yes", "on")
+LFG_CANONICAL_API_ENABLED = os.getenv(
+    "LFG_CANONICAL_API_ENABLED", "false"
+).lower() in ("1", "true", "yes", "on")
+LFG_LEGACY_WRITES_ENABLED = os.getenv(
+    "LFG_LEGACY_WRITES_ENABLED", "true"
+).lower() in ("1", "true", "yes", "on")
+ENABLE_LEGACY_STREAMING_MONITOR = os.getenv(
+    "ENABLE_LEGACY_STREAMING_MONITOR", "false"
+).lower() in ("1", "true", "yes", "on")
+ENABLE_LEGACY_DISCORD_FLAIR_STORE = os.getenv(
+    "ENABLE_LEGACY_DISCORD_FLAIR_STORE", "false"
+).lower() in ("1", "true", "yes", "on")
+ENABLE_EMERGENCY_SERVICE_CONTROL = os.getenv(
+    "ENABLE_EMERGENCY_SERVICE_CONTROL", "false"
+).lower() in ("1", "true", "yes", "on")
+ENABLE_LEGACY_SITE_ACTIVITY_EXPORT = os.getenv(
+    "ENABLE_LEGACY_SITE_ACTIVITY_EXPORT", "true"
+).lower() in ("1", "true", "yes", "on")
 MATRIX_ACCESS_TOKEN = os.getenv("MATRIX_ACCESS_TOKEN", "")
 MATRIX_HOMESERVER = os.getenv("MATRIX_HOMESERVER", "https://matrix.casual-heroes.com")
 FLUXER_API_URL = os.getenv("FLUXER_API_URL", "https://api.fluxer.app/v1")

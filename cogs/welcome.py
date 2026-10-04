@@ -18,8 +18,28 @@ from datetime import datetime, timezone
 import discord
 from discord.ext import commands
 
-from config import db_session_scope, logger, get_debug_guilds
+from sqlalchemy import text as sa_text
+from config import (
+    db_session_scope,
+    logger,
+    get_debug_guilds,
+)
 from models import Guild, GuildMember, WelcomeConfig
+
+
+def _sync_discord_member_count(session, guild: discord.Guild):
+    """Update web_communities.member_count for this Discord guild using live Discord data."""
+    try:
+        count = sum(1 for m in guild.members if not m.bot)
+        session.execute(
+            sa_text(
+                "UPDATE web_communities SET member_count = :count "
+                "WHERE platform = 'discord' AND platform_id = :gid"
+            ),
+            {'count': count, 'gid': str(guild.id)},
+        )
+    except Exception as e:
+        logger.warning(f'_sync_discord_member_count failed for guild {guild.id}: {e}')
 
 
 # Available variables for message templates
@@ -229,6 +249,8 @@ class WelcomeCog(commands.Cog):
             if not db_guild:
                 return
 
+            _sync_discord_member_count(session, guild)
+
             config = self.get_welcome_config(session, guild.id)
             if not config.enabled:
                 return
@@ -367,6 +389,8 @@ class WelcomeCog(commands.Cog):
             db_guild = session.get(Guild, guild.id)
             if not db_guild:
                 return
+
+            _sync_discord_member_count(session, guild)
 
             # Save roles for persistence (if enabled)
             if db_guild.role_persistence_enabled:

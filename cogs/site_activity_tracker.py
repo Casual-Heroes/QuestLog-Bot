@@ -8,6 +8,7 @@ No more hardcoded configs - everything is pulled from the database!
 
 import discord
 from discord.ext import commands, tasks
+import asyncio
 import json
 from pathlib import Path
 import logging
@@ -50,7 +51,6 @@ class SiteActivityTracker(commands.Cog):
         self.games_config = {}  # {game_key: {"keywords": [...], "roles": [(guild_id, role_id), ...]}}
 
         self.player_counts = {}
-        self.load_config_from_db()  # Initial load
         self.track_activity.start()
         logger.info("[SiteActivityTracker] Initialized with database-driven config.")
 
@@ -141,7 +141,8 @@ class SiteActivityTracker(commands.Cog):
         logger.debug("[SiteActivityTracker] Loop tick - starting activity scan")
 
         # Reload config from database every iteration (hot reload!)
-        self.load_config_from_db()
+        # mysql.connector is synchronous, so keep it off the Discord event loop.
+        await asyncio.to_thread(self.load_config_from_db)
 
         counts = {}
 
@@ -217,15 +218,17 @@ class SiteActivityTracker(commands.Cog):
         # Save to JSON file
         self.player_counts = counts
         try:
-            # Ensure directory exists
-            DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-            with DATA_FILE.open("w") as f:
-                json.dump(counts, f, indent=2)
-
+            await asyncio.to_thread(self._write_counts, counts)
             logger.info(f"[SiteActivityTracker] Saved counts to {DATA_FILE}: {counts}")
         except Exception as e:
             logger.error(f"[SiteActivityTracker] Failed to write to {DATA_FILE}: {e}", exc_info=True)
+
+    @staticmethod
+    def _write_counts(counts):
+        """Write the compatibility export without blocking the Discord loop."""
+        DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with DATA_FILE.open("w") as output:
+            json.dump(counts, output, indent=2)
 
     @track_activity.before_loop
     async def before_track(self):

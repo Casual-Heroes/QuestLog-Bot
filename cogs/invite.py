@@ -90,7 +90,7 @@ class InviteCog(commands.Cog):
                 db.commit()
                 action = 'new'
 
-        logger.info(f"InviteCog: {action} code {code_str} sent to Discord user {user_id}")
+        logger.info(f"InviteCog: {action} invite code sent to Discord user {user_id}")
 
         embed = discord.Embed(
             title="Your QuestLog Invite Code",

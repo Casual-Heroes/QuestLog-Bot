@@ -41,8 +41,15 @@ test_xp_import.py
 TICKETING_SYSTEM_SPEC.md
 /Archive
 /installscripts
-/migrations
-/docs
+/migrations/*
+!/migrations/canonical_lfg_adapter.sql
+!/migrations/flair_delivery_receipts.sql
+!/migrations/progression_outbox.sql
+/docs/*
+!/docs/lfg_adapter_migration.md
+!/docs/product_boundary_review.md
+!/docs/warden_questlog_engagement_audit_2026-10-03.md
+!/docs/warden_questlog_security_audit_2026-10-03.md
 /auth
 
 # Ignore generated files (e.g., from web scraping or data processing)
@@ -71,6 +78,13 @@ teststats.py
 **/wsgi.py
 *.sql
 *.md
+!/migrations/canonical_lfg_adapter.sql
+!/migrations/flair_delivery_receipts.sql
+!/migrations/progression_outbox.sql
+!/docs/lfg_adapter_migration.md
+!/docs/product_boundary_review.md
+!/docs/warden_questlog_engagement_audit_2026-10-03.md
+!/docs/warden_questlog_security_audit_2026-10-03.md
 
 # Ignore environments
 .env

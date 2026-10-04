@@ -25,6 +25,12 @@ from config import (
     logger,
     IS_PRODUCTION,
     get_debug_guilds,
+    ENABLE_BRIDGE,
+    ENABLE_BRIDGE_IMPLICIT,
+    ENABLE_LEGACY_STREAMING_MONITOR,
+    ENABLE_LEGACY_DISCORD_FLAIR_STORE,
+    ENABLE_EMERGENCY_SERVICE_CONTROL,
+    ENABLE_LEGACY_SITE_ACTIVITY_EXPORT,
 )
 from models import Guild
 
@@ -33,13 +39,11 @@ from models import Guild
 
 # Presence messages to rotate through
 PRESENCE_MESSAGES = [
-    ("watching", "{server_count} servers"),
-    ("playing", "/questlog help"),
-    ("playing", "/xp profile"),
-    ("playing", "/flair store"),
-    ("playing", "/leaderboard"),
-    ("watching", "your server grow"),
-    ("playing", "/questlog dashboard"),
+    ("watching", "{server_count} communities | /questlog help"),
+    ("playing", "/xp profile | {server_count} communities"),
+    ("playing", "/leaderboard | {server_count} communities"),
+    ("watching", "{server_count} communities organize play"),
+    ("playing", "/questlog dashboard | {server_count} communities"),
 ]
 
 current_presence_index = 0
@@ -106,7 +110,7 @@ async def on_ready():
     # Set initial presence manually for immediate effect
     activity = discord.Activity(
         type=discord.ActivityType.watching,
-        name=f"{len(bot.guilds)} servers"
+        name=f"{len(bot.guilds)} communities | /questlog help"
     )
     await bot.change_presence(activity=activity, status=discord.Status.online)
 
@@ -137,10 +141,14 @@ async def on_ready():
 
 
 async def sync_all_guilds():
-    """Ensure all connected guilds are in the database and marked as active."""
+    """Reconcile stored guild presence with Discord's complete READY guild list."""
     import json
+    import time
+    from utils.guild_presence import mark_departed_guilds
+
     synced = 0
     reactivated = 0
+    departed = []
     with db_session_scope() as session:
         for guild in bot.guilds:
             existing = session.get(Guild, guild.id)
@@ -214,7 +222,30 @@ async def sync_all_guilds():
                 existing.cached_emojis = json.dumps(emojis_data)
                 existing.cached_members = json.dumps(members_data)
 
-    logger.info(f"✅ Synced {synced} new guilds, reactivated {reactivated} guilds")
+        active_records = session.query(Guild).filter(Guild.bot_present.is_(True)).all()
+        departed_records = mark_departed_guilds(
+            active_records,
+            (guild.id for guild in bot.guilds),
+            left_at=int(time.time()),
+        )
+        departed = [
+            (record.guild_name, record.guild_id)
+            for record in departed_records
+        ]
+
+    for guild_name, guild_id in departed:
+        logger.info(
+            "Marked guild %s (%s) inactive during startup reconciliation",
+            guild_name,
+            guild_id,
+        )
+
+    logger.info(
+        "✅ Guild presence reconciled: %s new, %s reactivated, %s departed",
+        synced,
+        reactivated,
+        len(departed),
+    )
 
 
 @bot.event
@@ -294,7 +325,7 @@ async def on_guild_join(guild: discord.Guild):
 
     activity = discord.Activity(
         type=discord.ActivityType.watching,
-        name=f"{len(bot.guilds)} servers | /questlog help"
+        name=f"{len(bot.guilds)} communities | /questlog help"
     )
     await bot.change_presence(activity=activity)
 
@@ -333,7 +364,7 @@ async def on_guild_remove(guild: discord.Guild):
 
     activity = discord.Activity(
         type=discord.ActivityType.watching,
-        name=f"{len(bot.guilds)} servers | /questlog help"
+        name=f"{len(bot.guilds)} communities | /questlog help"
     )
     await bot.change_presence(activity=activity)
 
@@ -425,12 +456,15 @@ def main():
         "cogs.security",
         "cogs.verification",
         "cogs.audit",
+        "cogs.progression_api",        # Scoped QuestLog XP evidence adapter
         "cogs.xp",
         "cogs.roles",
         "cogs.rss_feeds",
         "cogs.welcome",
         "cogs.moderation",
         "cogs.channels",
+        "cogs.channel_directory",      # Auto-updating public channel directory
+        "cogs.lfg_api",                # Shared canonical QuestLog LFG API client
         "cogs.lfg_cog",
         "cogs.discovery",
         "cogs.admin",
@@ -438,30 +472,92 @@ def main():
         "cogs.activity_tracker",
         "cogs.guild_sync_cog",  # Syncs member counts from Discord every 5 min
         "cogs.guild_sync",  # Auto-syncs roles/channels when they change (60s cooldown)
-        "cogs.flair_cog",  # Flair store - let members customize their profile
         "cogs.raffles",  # Raffles integration
         "cogs.scheduled_messages",  # Scheduled message processor
-        "cogs.streaming_monitor",  # YouTube/Twitch live stream monitor & notifications
         "cogs.live_alerts",        # Per-guild streamer subscriptions (web dashboard managed)
-        "cogs.site_activity_tracker",  # Site activity tracker - database-driven Discord game tracking
-        "cogs.emergency",              # Owner-only emergency kill switch for incident response
-        "cogs.bridge_cog",             # Discord <-> Fluxer bidirectional message bridge
         "cogs.network_broadcasts",     # QuestLog Network - receive LFG broadcasts from site
         "cogs.invite",                 # /invite slash command - Discord early access codes
         "cogs.flair_sync",             # QuestLog flair -> Discord role sync (opt-in per guild)
         "cogs.gameserver",             # Game server status embeds (Quest Control dashboard)
+        "cogs.legacy",                 # Legacy points: star reactions + clean record milestones
+        "cogs.nominations",            # Monthly community spotlight nominations + voting
+        "cogs.creators",               # Creator of Week/Month spotlight commands
+        "cogs.ffxiv_timers",           # FFXIV gathering/ocean/reset timer alerts
+        # "cogs.soulmask",              # Soulmask cluster management via AMP RCON - DISABLED, not an active game (2026-07-12)
     ]
 
+    if ENABLE_BRIDGE:
+        bridge_secret = os.getenv("QUESTLOG_BOT_SECRET", "").strip()
+        if len(bridge_secret) < 32:
+            logger.critical(
+                "ENABLE_BRIDGE is true but QUESTLOG_BOT_SECRET is shorter than 32 characters; refusing to load the bridge"
+            )
+        else:
+            cogs_to_load.append("cogs.bridge_cog")
+            if ENABLE_BRIDGE_IMPLICIT:
+                logger.warning(
+                    "Bridge enabled by legacy secret detection; set ENABLE_BRIDGE=true explicitly"
+                )
+            logger.warning(
+                "Cross-platform bridge enabled; remote media and channel targets are restricted"
+            )
+
+    # This legacy cog embeds the website's Django process inside Warden and
+    # duplicates the dashboard-managed live alerts adapter. It is off by
+    # default and exists only as a controlled migration escape hatch.
+    if ENABLE_LEGACY_STREAMING_MONITOR:
+        cogs_to_load.append("cogs.streaming_monitor")
+        logger.warning("Legacy streaming monitor enabled; migrate to cogs.live_alerts")
+
+    if ENABLE_LEGACY_DISCORD_FLAIR_STORE:
+        cogs_to_load.append("cogs.flair_cog")
+        logger.warning("Legacy Discord flair store enabled; migrate selection to QuestLog")
+
+    if ENABLE_EMERGENCY_SERVICE_CONTROL:
+        cogs_to_load.append("cogs.emergency")
+        logger.critical(
+            "Discord-triggered host service control is ENABLED; treat the bot owner account as root-equivalent"
+        )
+
+    if ENABLE_LEGACY_SITE_ACTIVITY_EXPORT:
+        cogs_to_load.append("cogs.site_activity_tracker")
+        logger.warning(
+            "Legacy site activity JSON export enabled; this directly couples Warden to the website filesystem"
+        )
+
+    # If one of these fails to import, running the bot would silently remove a
+    # security or moderation control while still appearing healthy.
+    critical_cogs = {
+        "cogs.core",
+        "cogs.security",
+        "cogs.verification",
+        "cogs.audit",
+        "cogs.moderation",
+        "cogs.action_processor",
+    }
+
     loaded_count = 0
+    failed_critical_cogs = []
     for cog in cogs_to_load:
         try:
             bot.load_extension(cog)
             loaded_count += 1
             logger.info(f"  ✅ Loaded: {cog}")
         except Exception as e:
-            logger.warning(f"  ⚠️ Failed to load {cog}: {e}")
+            if cog in critical_cogs:
+                failed_critical_cogs.append(cog)
+                logger.critical(f"  ❌ Critical cog failed to load {cog}: {e}", exc_info=True)
+            else:
+                logger.warning(f"  ⚠️ Failed to load {cog}: {e}", exc_info=True)
 
     logger.info(f"✅ Loaded {loaded_count}/{len(cogs_to_load)} cogs")
+
+    if failed_critical_cogs:
+        logger.critical(
+            "Refusing to start without critical cogs: %s",
+            ", ".join(failed_critical_cogs),
+        )
+        sys.exit(1)
 
     try:
         bot.run(token)
@@ -477,4 +573,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
