@@ -26,9 +26,12 @@ BILLING:
 
 import asyncio
 import html
+import ipaddress
 import json
 import re
+import socket
 import time as time_lib
+from urllib.parse import urljoin, urlsplit, urlunsplit
 from typing import Optional, Dict, Any, List, Tuple
 
 import discord
@@ -46,11 +49,13 @@ from models import (
     Guild,
 )
 
-# Import requests for secure fetching (optional - falls back to feedparser if not available)
+# urllib3 lets the fetcher connect to the exact IP address that was validated.
+# A normal hostname request would perform a second DNS lookup and permit DNS
+# rebinding between validation and connection.
 try:
-    import requests
+    import urllib3
 except ImportError:
-    requests = None
+    urllib3 = None
 
 # Security constants for RSS fetching
 RSS_FETCH_TIMEOUT = 30  # seconds
@@ -96,6 +101,91 @@ def _sanitize_entry_link(url: str) -> str:
     return url
 
 
+def _resolve_rss_target(url: str):
+    """Validate an RSS URL and return a DNS-pinned connection target."""
+    if not url:
+        return None, "URL is required"
+
+    try:
+        parsed = urlsplit(url.strip())
+        scheme = parsed.scheme.lower()
+        if scheme != "https":
+            return None, "RSS feed URLs must use HTTPS"
+        if parsed.username is not None or parsed.password is not None:
+            return None, "Credentials in feed URLs are not allowed"
+        hostname = parsed.hostname
+        if not hostname:
+            return None, "Invalid URL - no hostname"
+        if len(hostname) > 253:
+            return None, "Hostname is too long"
+        port = parsed.port or 443
+    except (TypeError, ValueError):
+        return None, "Invalid URL format"
+
+    hostname_lower = hostname.rstrip(".").lower()
+    blocked_hosts = {
+        # Deny-list comparison, not a listening socket bind.
+        "localhost", "127.0.0.1", "::1", "0.0.0.0",  # nosec B104
+        "0", "0.0", "0.0.0", "127.1", "127.0.1",
+    }
+    if hostname_lower in blocked_hosts:
+        return None, "Localhost URLs are not allowed"
+
+    blocked_suffixes = (
+        ".local", ".internal", ".private", ".corp", ".lan",
+        ".intranet", ".localdomain",
+    )
+    if any(hostname_lower.endswith(suffix) for suffix in blocked_suffixes):
+        return None, "Internal domain names are not allowed"
+    if hostname_lower in {"169.254.169.254", "metadata.google.internal", "metadata.goog"}:
+        return None, "Cloud metadata endpoints are not allowed"
+
+    try:
+        addr_info = socket.getaddrinfo(
+            hostname,
+            port,
+            socket.AF_UNSPEC,
+            socket.SOCK_STREAM,
+        )
+    except socket.gaierror:
+        return None, "Hostname could not be resolved"
+    except OSError:
+        return None, "Hostname resolution failed"
+
+    public_addresses = []
+    for family, _sock_type, _proto, _canonname, sockaddr in addr_info:
+        try:
+            address = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            return None, "Hostname resolved to an invalid address"
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+            address = address.ipv4_mapped
+        if not address.is_global:
+            return None, f"Non-public address not allowed: {address}"
+        public_addresses.append((family, str(address)))
+
+    if not public_addresses:
+        return None, "Hostname did not resolve to a public address"
+
+    # Prefer IPv4 for operational compatibility, while still validating every
+    # answer. The selected address is used directly for the connection.
+    public_addresses.sort(key=lambda item: item[0] != socket.AF_INET)
+    pinned_ip = public_addresses[0][1]
+    default_port = 443
+    host_for_header = f"[{hostname}]" if ":" in hostname else hostname
+    host_header = host_for_header if port == default_port else f"{host_for_header}:{port}"
+    request_target = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+    return {
+        "url": urlunsplit((scheme, parsed.netloc, parsed.path or "/", parsed.query, "")),
+        "scheme": scheme,
+        "hostname": hostname,
+        "port": port,
+        "ip": pinned_ip,
+        "host_header": host_header,
+        "request_target": request_target,
+    }, None
+
+
 def _validate_rss_url_for_fetch(url: str) -> Tuple[bool, Optional[str]]:
     """
     Validate RSS feed URL for SSRF protections.
@@ -104,85 +194,8 @@ def _validate_rss_url_for_fetch(url: str) -> Tuple[bool, Optional[str]]:
     Returns:
         Tuple of (is_valid, error_message)
     """
-    from urllib.parse import urlparse
-    import ipaddress
-    import socket
-
-    if not url:
-        return False, 'URL is required'
-
-    url = url.strip()
-
-    # Check scheme
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        return False, 'Invalid URL format'
-
-    if parsed.scheme not in ('http', 'https'):
-        return False, 'URL must use HTTP or HTTPS'
-
-    hostname = parsed.hostname
-    if not hostname:
-        return False, 'Invalid URL - no hostname'
-
-    hostname_lower = hostname.lower()
-
-    # Block obvious localhost patterns
-    blocked_hosts = {
-        'localhost', '127.0.0.1', '::1', '0.0.0.0',
-        '[::1]', '[::ffff:127.0.0.1]', '[0:0:0:0:0:0:0:1]',
-        '0', '0.0', '0.0.0', '127.1', '127.0.1'
-    }
-    if hostname_lower in blocked_hosts:
-        return False, 'Localhost URLs are not allowed'
-
-    # Block internal domain patterns
-    blocked_suffixes = ['.local', '.internal', '.private', '.corp', '.lan', '.intranet', '.localdomain']
-    for suffix in blocked_suffixes:
-        if hostname_lower.endswith(suffix):
-            return False, f'Internal domains ({suffix}) are not allowed'
-
-    # Block cloud metadata endpoints
-    metadata_hosts = ['169.254.169.254', 'metadata.google.internal', 'metadata.goog']
-    if hostname_lower in metadata_hosts:
-        return False, 'Cloud metadata endpoints are not allowed'
-
-    # Resolve ALL addresses and check each one
-    try:
-        addr_info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
-
-        for family, sock_type, proto, canonname, sockaddr in addr_info:
-            ip_str = sockaddr[0]
-            try:
-                ip_obj = ipaddress.ip_address(ip_str)
-
-                if ip_obj.is_private:
-                    return False, f'Private IP address not allowed: {ip_str}'
-                if ip_obj.is_loopback:
-                    return False, f'Loopback address not allowed: {ip_str}'
-                if ip_obj.is_link_local:
-                    return False, f'Link-local address not allowed: {ip_str}'
-                if ip_obj.is_reserved:
-                    return False, f'Reserved address not allowed: {ip_str}'
-                if ip_obj.is_multicast:
-                    return False, f'Multicast address not allowed: {ip_str}'
-
-                # Check IPv4-mapped IPv6 addresses
-                if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped:
-                    mapped_v4 = ip_obj.ipv4_mapped
-                    if mapped_v4.is_private or mapped_v4.is_loopback or mapped_v4.is_link_local:
-                        return False, f'IPv4-mapped address not allowed: {ip_str}'
-
-            except ValueError:
-                continue
-
-    except socket.gaierror:
-        pass  # DNS resolution failed - let the actual fetch handle it
-    except Exception:
-        pass
-
-    return True, None
+    target, error = _resolve_rss_target(url)
+    return target is not None, error
 
 
 def _secure_fetch_rss_sync(url: str, timeout: int = RSS_FETCH_TIMEOUT, max_size: int = RSS_MAX_SIZE):
@@ -193,96 +206,98 @@ def _secure_fetch_rss_sync(url: str, timeout: int = RSS_FETCH_TIMEOUT, max_size:
     Returns:
         Tuple of (parsed_feed or None, error_message or None)
     """
-    # Validate URL first
-    is_valid, error = _validate_rss_url_for_fetch(url)
-    if not is_valid:
+    target, error = _resolve_rss_target(url)
+    if target is None:
         logger.warning(f"RSSFeeds: URL validation failed for {url}: {error}")
         return None, error
 
-    # Require requests library for secure RSS fetching (SSRF protection)
-    # Do NOT fall back to feedparser.parse(url) as it bypasses security checks
-    if requests is None:
-        logger.error("RSSFeeds: requests library not available - RSS fetching disabled for security")
-        return None, 'RSS fetching requires the requests library for SSRF protection'
+    if urllib3 is None:
+        logger.error("RSSFeeds: urllib3 unavailable - RSS fetching disabled for security")
+        return None, "RSS fetching requires urllib3"
+    if feedparser is None:
+        return None, "RSS parsing is unavailable"
 
     try:
-        current_url = url
         redirect_count = 0
 
         while redirect_count <= RSS_MAX_REDIRECTS:
-            response = requests.get(
-                current_url,
-                timeout=timeout,
-                stream=True,
-                allow_redirects=False,
-                headers={
-                    'User-Agent': 'QuestLog RSS Bot/1.0 (+https://questlog.gg)',
-                    'Accept': 'application/rss+xml, application/xml, application/atom+xml, text/xml, */*'
-                }
+            timeout_config = urllib3.Timeout(connect=timeout, read=timeout)
+            pool = urllib3.HTTPSConnectionPool(
+                target["ip"],
+                port=target["port"],
+                timeout=timeout_config,
+                retries=False,
+                cert_reqs="CERT_REQUIRED",
+                assert_hostname=target["hostname"],
+                server_hostname=target["hostname"],
             )
 
-            # Handle redirects manually - validate each hop
-            if response.is_redirect or response.status_code in (301, 302, 303, 307, 308):
-                redirect_url = response.headers.get('Location')
-                if not redirect_url:
-                    return None, 'Redirect with no Location header'
+            response = pool.urlopen(
+                "GET",
+                target["request_target"],
+                redirect=False,
+                preload_content=False,
+                headers={
+                    "Host": target["host_header"],
+                    'User-Agent': 'QuestLog RSS Bot/1.0 (+https://questlog.gg)',
+                    'Accept': 'application/rss+xml, application/xml, application/atom+xml, text/xml, */*'
+                },
+            )
 
-                # Handle relative redirects
-                if redirect_url.startswith('/'):
-                    from urllib.parse import urlparse, urlunparse
-                    parsed = urlparse(current_url)
-                    redirect_url = urlunparse((parsed.scheme, parsed.netloc, redirect_url, '', '', ''))
+            try:
+                if response.status in (301, 302, 303, 307, 308):
+                    location = response.headers.get("Location")
+                    if not location:
+                        return None, "Redirect with no Location header"
+                    redirect_url = urljoin(target["url"], location)
+                    target, error = _resolve_rss_target(redirect_url)
+                    if target is None:
+                        return None, f"Blocked redirect: {error}"
+                    redirect_count += 1
+                    continue
 
-                # Validate redirect target
-                is_valid, error = _validate_rss_url_for_fetch(redirect_url)
-                if not is_valid:
-                    return None, f'Blocked redirect: {error}'
+                if response.status != 200:
+                    return None, f"HTTP error: {response.status}"
 
-                current_url = redirect_url
-                redirect_count += 1
-                response.close()
-                continue
+                content_length = response.headers.get("Content-Length")
+                if content_length:
+                    try:
+                        if int(content_length) > max_size:
+                            return None, f"Feed too large (max {max_size // 1024 // 1024}MB)"
+                    except ValueError:
+                        return None, "Invalid Content-Length header"
 
-            break
+                content = bytearray()
+                while True:
+                    chunk = response.read(8192)
+                    if not chunk:
+                        break
+                    content.extend(chunk)
+                    if len(content) > max_size:
+                        return None, f"Feed too large (max {max_size // 1024 // 1024}MB)"
+                break
+            finally:
+                response.release_conn()
+                pool.close()
         else:
             return None, f'Too many redirects (max {RSS_MAX_REDIRECTS})'
 
-        if response.status_code != 200:
-            response.close()
-            return None, f'HTTP error: {response.status_code}'
-
-        # Check content length
-        content_length = response.headers.get('Content-Length')
-        if content_length and int(content_length) > max_size:
-            response.close()
-            return None, f'Feed too large (max {max_size // 1024 // 1024}MB)'
-
-        # Read with size limit
-        content = b''
-        for chunk in response.iter_content(chunk_size=8192):
-            content += chunk
-            if len(content) > max_size:
-                response.close()
-                return None, f'Feed too large (max {max_size // 1024 // 1024}MB)'
-
-        response.close()
-
         # Parse the fetched content
-        parsed = feedparser.parse(content)
+        parsed = feedparser.parse(bytes(content))
 
         if parsed.bozo and not parsed.entries:
             return None, str(parsed.get('bozo_exception', 'Parse error'))
 
         return parsed, None
 
-    except requests.Timeout:
+    except urllib3.exceptions.TimeoutError:
         return None, f'Request timed out after {timeout} seconds'
-    except requests.ConnectionError as e:
-        return None, f'Connection error: {str(e)}'
-    except requests.RequestException as e:
-        return None, f'Request failed: {str(e)}'
+    except urllib3.exceptions.HTTPError as exc:
+        logger.warning("RSSFeeds: pinned fetch failed (%s)", type(exc).__name__)
+        return None, "Connection failed"
     except Exception as e:
-        return None, f'Unexpected error: {str(e)}'
+        logger.exception("RSSFeeds: unexpected pinned fetch failure (%s)", type(e).__name__)
+        return None, "Unexpected fetch error"
 
 
 class RSSFeedsCog(commands.Cog):
