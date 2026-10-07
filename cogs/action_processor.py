@@ -247,6 +247,7 @@ class ActionProcessorCog(commands.Cog):
         """Atomically claim, authorize, and process a single pending action."""
         action_type = None
         guild_id = None
+        execution_started = False
         try:
             with db_session_scope() as session:
                 claimed = session.query(PendingAction).filter(
@@ -290,6 +291,7 @@ class ActionProcessorCog(commands.Cog):
             )
 
             # Process based on action type
+            execution_started = True
             result = await self._execute_action(guild, action_type, payload)
 
             with db_session_scope() as session:
@@ -318,7 +320,11 @@ class ActionProcessorCog(commands.Cog):
 
                 # Authorization and validation failures are permanent. Retrying
                 # cannot make an unsafe request acceptable and creates noise.
-                if isinstance(e, (ActionPolicyError, json.JSONDecodeError)) or action.retry_count >= action.max_retries:
+                if (
+                    execution_started
+                    or isinstance(e, (ActionPolicyError, json.JSONDecodeError))
+                    or action.retry_count >= action.max_retries
+                ):
                     action.status = ActionStatus.FAILED
                     action.completed_at = int(time.time())
                     logger.error(
@@ -2130,7 +2136,7 @@ class ActionProcessorCog(commands.Cog):
         from models import LFGGroup, LFGGame, LFGConfig, LFGMember
         from db import get_db_session
 
-        logger.info(f"🔵 BOT: Starting LFG thread creation - payload: {payload}")
+        logger.info("LFG: Starting thread creation for guild %s", guild.id)
 
         group_id = payload.get('group_id')
         if not group_id:
@@ -2138,14 +2144,20 @@ class ActionProcessorCog(commands.Cog):
 
         # Get group and game data from database
         with get_db_session() as session:
-            group = session.query(LFGGroup).filter_by(id=group_id).first()
+            group = session.query(LFGGroup).filter_by(
+                id=group_id,
+                guild_id=guild.id,
+            ).first()
             if not group:
                 logger.error(f"❌ BOT: LFG group {group_id} not found in database")
                 raise ValueError(f"LFG group {group_id} not found")
 
             logger.info(f"✅ BOT: Found group {group_id}: {group.thread_name}")
 
-            game = session.query(LFGGame).filter_by(id=group.game_id).first()
+            game = session.query(LFGGame).filter_by(
+                id=group.game_id,
+                guild_id=guild.id,
+            ).first()
             if not game:
                 logger.error(f"❌ BOT: Game {group.game_id} not found in database")
                 raise ValueError(f"Game {group.game_id} not found")
@@ -2158,17 +2170,28 @@ class ActionProcessorCog(commands.Cog):
             custom_options = json_lib.loads(game.custom_options) if game.custom_options else []
 
             # Get channel
-            channel_id = payload.get('channel_id') or (config.browser_notify_channel_id if config else None)
+            allowed_channel_ids = {
+                int(value) for value in (
+                    game.lfg_channel_id,
+                    config.browser_notify_channel_id if config else None,
+                ) if value
+            }
+            channel_id = payload.get('channel_id') or game.lfg_channel_id or (
+                config.browser_notify_channel_id if config else None
+            )
             if not channel_id:
                 logger.error(f"❌ BOT: No channel configured for LFG notifications")
                 raise ValueError("No channel configured for LFG notifications")
+            channel_id = int(channel_id)
+            if channel_id not in allowed_channel_ids:
+                raise ValueError("Requested channel is not configured for LFG delivery")
 
             logger.info(f"🔵 BOT: Using channel_id: {channel_id}")
 
-            channel = guild.get_channel(int(channel_id))
-            if not channel:
+            channel = guild.get_channel(channel_id)
+            if not isinstance(channel, discord.TextChannel):
                 logger.error(f"❌ BOT: Channel {channel_id} not found in guild {guild.name}")
-                raise ValueError(f"Channel {channel_id} not found")
+                raise ValueError(f"Configured LFG text channel {channel_id} not found")
 
             logger.info(f"✅ BOT: Found channel: {channel.name} (#{channel.id})")
 
@@ -2194,27 +2217,47 @@ class ActionProcessorCog(commands.Cog):
             title = group.thread_name or "LFG Group"
             thread_name = f"{title} - {game.game_name} - {creator_name}"
 
-            # Create thread
-            logger.info(f"🔵 BOT: Creating thread '{thread_name[:100]}' in channel {channel.name}")
-            thread = await channel.create_thread(
-                name=thread_name[:100],  # Discord 100 char limit
-                type=discord.ChannelType.public_thread,
-                auto_archive_duration=10080  # 7 days (in minutes)
-            )
-            logger.info(f"✅ BOT: Thread created! ID: {thread.id}, Name: {thread.name}")
+            # Reuse a previously created thread if a delivery was interrupted
+            # after Discord accepted it. This prevents duplicate side effects.
+            thread = None
+            if group.thread_id:
+                thread = guild.get_thread(int(group.thread_id))
+                if thread is None:
+                    try:
+                        fetched = await guild.fetch_channel(int(group.thread_id))
+                        if isinstance(fetched, discord.Thread):
+                            thread = fetched
+                    except (discord.NotFound, discord.Forbidden):
+                        thread = None
+                if thread is not None and thread.parent_id not in allowed_channel_ids:
+                    raise ValueError("Existing LFG thread is outside configured LFG channels")
 
-            # Update group with thread ID
-            group.thread_id = thread.id
-            session.commit()
-            logger.info(f"✅ BOT: Updated group {group_id} with thread_id {thread.id}")
+            if thread is None:
+                logger.info(f"🔵 BOT: Creating thread '{thread_name[:100]}' in channel {channel.name}")
+                thread = await channel.create_thread(
+                    name=thread_name[:100],
+                    type=discord.ChannelType.public_thread,
+                    auto_archive_duration=10080,
+                )
+                logger.info(f"✅ BOT: Thread created! ID: {thread.id}, Name: {thread.name}")
+                group.thread_id = thread.id
+                session.commit()
+                logger.info(f"✅ BOT: Updated group {group_id} with thread_id {thread.id}")
 
             # Ping role and auto-invite members if ping_role_id is set
             if group.ping_role_id:
                 try:
                     role = guild.get_role(int(group.ping_role_id))
-                    if role:
+                    if role and not role.is_default():
                         # Send ping message
-                        await thread.send(f"{role.mention} - New LFG group created!")
+                        await thread.send(
+                            f"{role.mention} - New LFG group created!",
+                            allowed_mentions=discord.AllowedMentions(
+                                everyone=False,
+                                users=False,
+                                roles=[role],
+                            ),
+                        )
 
                         # Add all members with this role to the thread
                         for member in guild.members:
@@ -2283,18 +2326,30 @@ class ActionProcessorCog(commands.Cog):
             raise ValueError("group_id is required")
 
         with get_db_session() as session:
-            group = session.query(LFGGroup).filter_by(id=group_id).first()
+            group = session.query(LFGGroup).filter_by(
+                id=group_id,
+                guild_id=guild.id,
+            ).first()
             if not group:
                 raise ValueError(f"LFG group {group_id} not found")
 
             if not group.thread_id:
                 raise ValueError(f"Group {group_id} has no thread to update")
 
-            game = session.query(LFGGame).filter_by(id=group.game_id).first()
+            game = session.query(LFGGame).filter_by(
+                id=group.game_id,
+                guild_id=guild.id,
+            ).first()
             if not game:
                 raise ValueError(f"Game {group.game_id} not found")
 
             config = session.query(LFGConfig).filter_by(guild_id=guild.id).first()
+            allowed_channel_ids = {
+                int(value) for value in (
+                    game.lfg_channel_id,
+                    config.browser_notify_channel_id if config else None,
+                ) if value
+            }
 
             # Get the thread
             thread = guild.get_thread(group.thread_id)
@@ -2302,12 +2357,21 @@ class ActionProcessorCog(commands.Cog):
                 # Try fetching it
                 try:
                     thread = await guild.fetch_channel(group.thread_id)
-                except:
+                except (discord.NotFound, discord.Forbidden):
                     raise ValueError(f"Thread {group.thread_id} not found")
+            if not isinstance(thread, discord.Thread) or thread.parent_id not in allowed_channel_ids:
+                raise ValueError("LFG thread is outside configured LFG channels")
 
             # Add user to thread if requested (when joining from website)
             add_user_id = payload.get('add_user_to_thread')
             if add_user_id:
+                active_membership = session.query(LFGMember).filter_by(
+                    group_id=group.id,
+                    user_id=int(add_user_id),
+                    left_at=None,
+                ).first()
+                if not active_membership:
+                    raise ValueError("Only active group members can be added to the LFG thread")
                 try:
                     user = guild.get_member(int(add_user_id))
                     if user:
@@ -2319,6 +2383,12 @@ class ActionProcessorCog(commands.Cog):
             # Remove users from thread if requested (when co-leaders are removed)
             remove_user_ids = payload.get('remove_users_from_thread', [])
             for user_id in remove_user_ids:
+                membership = session.query(LFGMember).filter_by(
+                    group_id=group.id,
+                    user_id=int(user_id),
+                ).first()
+                if not membership:
+                    raise ValueError("Only group members can be removed from the LFG thread")
                 try:
                     user = guild.get_member(int(user_id))
                     if user:
@@ -2391,6 +2461,24 @@ class ActionProcessorCog(commands.Cog):
         if not group_id:
             raise ValueError("group_id is required")
 
+        with get_db_session() as session:
+            config = session.query(LFGConfig).filter_by(guild_id=guild.id).first()
+            configured_games = session.query(LFGGame).filter_by(guild_id=guild.id).all()
+            group = session.query(LFGGroup).filter_by(
+                id=group_id,
+                guild_id=guild.id,
+            ).first()
+            allowed_channel_ids = {
+                int(value) for value in (
+                    [config.browser_notify_channel_id] if config and config.browser_notify_channel_id else []
+                ) + [game.lfg_channel_id for game in configured_games if game.lfg_channel_id]
+            }
+
+        if channel_id and int(channel_id) not in allowed_channel_ids:
+            raise ValueError("Cancellation channel is not configured for LFG delivery")
+        if group and thread_id and int(thread_id) != int(group.thread_id):
+            raise ValueError("Thread does not belong to the requested LFG group")
+
         # Delete the thread if it exists
         if thread_id:
             try:
@@ -2398,8 +2486,16 @@ class ActionProcessorCog(commands.Cog):
                 if not thread:
                     thread = await guild.fetch_channel(thread_id)
 
+                if thread and (
+                    not isinstance(thread, discord.Thread)
+                    or thread.parent_id not in allowed_channel_ids
+                ):
+                    raise ValueError("Thread is outside configured LFG channels")
+
                 if thread:
                     await thread.delete()
+            except ValueError:
+                raise
             except Exception as e:
                 logger.warning(f"Failed to delete thread {thread_id}: {e}")
 
@@ -2417,7 +2513,7 @@ class ActionProcessorCog(commands.Cog):
                     if deleted_by_id:
                         embed.add_field(name="Cancelled by", value=f"<@{deleted_by_id}>", inline=True)
 
-                    await channel.send(embed=embed)
+                    await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
             except Exception as e:
                 logger.warning(f"Failed to send cancellation message: {e}")
 

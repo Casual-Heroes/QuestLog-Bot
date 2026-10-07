@@ -274,9 +274,15 @@ class SoulmaskCog(commands.Cog):
 
     # ---- Slash commands ----
 
-    sm = SlashCommandGroup('sm', 'Soulmask server management', guild_ids=get_debug_guilds())
+    sm = SlashCommandGroup(
+        'sm',
+        'Soulmask server management',
+        guild_ids=get_debug_guilds(),
+        default_member_permissions=discord.Permissions(administrator=True),
+    )
 
     @sm.command(name='status', description='Show current mode and next scheduled change')
+    @commands.has_permissions(administrator=True)
     async def slash_status(self, ctx: discord.ApplicationContext):
         schedule = _load_schedule()
         instances = schedule.get('instances', {})
@@ -296,6 +302,7 @@ class SoulmaskCog(commands.Cog):
         await ctx.respond(embeds=embeds[:3])  # Discord max 3 embeds per message
 
     @sm.command(name='mode', description='Manually apply a mode to an instance')
+    @commands.has_permissions(administrator=True)
     async def slash_mode(
         self, ctx: discord.ApplicationContext,
         instance: discord.Option(str, 'Instance: sunken or verdant', choices=['sunken', 'verdant']),
@@ -322,6 +329,7 @@ class SoulmaskCog(commands.Cog):
         await ctx.send_followup(result)
 
     @sm.command(name='reset', description='Reset all coefficients to baseline')
+    @commands.has_permissions(administrator=True)
     async def slash_reset(
         self, ctx: discord.ApplicationContext,
         instance: discord.Option(str, 'Instance: sunken or verdant', choices=['sunken', 'verdant']),
@@ -340,6 +348,7 @@ class SoulmaskCog(commands.Cog):
         await ctx.respond(f'Baseline restored on `{instance_name}`. {result}.')
 
     @sm.command(name='coefficients', description='Show active coefficients for an instance')
+    @commands.has_permissions(administrator=True)
     async def slash_coefficients(
         self, ctx: discord.ApplicationContext,
         instance: discord.Option(str, 'Instance: sunken or verdant', choices=['sunken', 'verdant']),
@@ -363,12 +372,14 @@ class SoulmaskCog(commands.Cog):
         await ctx.respond(f'**{instance_name}** — {mode_name} mode:\n{lines}', ephemeral=True)
 
     @sm.command(name='reload', description='Reload schedule.json without restarting')
+    @commands.has_permissions(administrator=True)
     async def slash_reload(self, ctx: discord.ApplicationContext):
         schedule = _load_schedule()
         count = len(schedule.get('instances', {}))
         await ctx.respond(f'Schedule reloaded. {count} instance(s) configured.', ephemeral=True)
 
     @sm.command(name='schedule', description='Show the full weekly schedule')
+    @commands.has_permissions(administrator=True)
     async def slash_schedule(self, ctx: discord.ApplicationContext):
         schedule = _load_schedule()
         instances = schedule.get('instances', {})

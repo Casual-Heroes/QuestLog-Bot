@@ -24,7 +24,7 @@ _INVITE_COOLDOWN = 3600.0  # 1 hour
 _raw = os.getenv('EARLY_ACCESS_GUILD_IDS', '').strip()
 EARLY_ACCESS_GUILD_IDS: set[int] = {int(g.strip()) for g in _raw.split(',') if g.strip().isdigit()}
 
-_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'  # no O/0 or I/1
+_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'  # pragma: allowlist secret; no O/0 or I/1
 
 
 def _gen_code() -> str:

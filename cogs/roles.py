@@ -17,6 +17,7 @@ import time
 import asyncio
 import io
 import csv
+import json
 import discord
 from discord.ext import commands, tasks
 
@@ -42,6 +43,46 @@ DANGEROUS_PERMS = [
     "manage_messages",
     "mention_everyone",
 ]
+
+
+def _dangerous_permission_names(permissions: discord.Permissions) -> list[str]:
+    """Return privileged permissions that must never flow through self-service."""
+    return [name for name in DANGEROUS_PERMS if getattr(permissions, name, False)]
+
+
+def _requestable_role_error(
+    guild: discord.Guild,
+    role: discord.Role,
+    *,
+    reviewer: discord.Member | None = None,
+    target: discord.Member | None = None,
+) -> str | None:
+    """Validate a self-service role against live Discord hierarchy state."""
+    if role.guild.id != guild.id:
+        return "That role does not belong to this server."
+    if role.is_default() or role.managed:
+        return "Default and integration-managed roles cannot be requested."
+
+    dangerous = _dangerous_permission_names(role.permissions)
+    if dangerous:
+        return "Privileged roles cannot be requested through self-service."
+
+    bot_member = guild.me
+    if bot_member is None or role >= bot_member.top_role:
+        return "I cannot safely assign that role."
+
+    if target is not None and target.id == guild.owner_id:
+        return "The server owner's roles cannot be changed through this workflow."
+    if target is not None and bot_member is not None and target.top_role >= bot_member.top_role:
+        return "I do not outrank the requested member."
+
+    if reviewer is not None and reviewer.id != guild.owner_id:
+        if role >= reviewer.top_role:
+            return "You cannot approve a role at or above your highest role."
+        if target is not None and target.id != reviewer.id and target.top_role >= reviewer.top_role:
+            return "You cannot approve role changes for a member you do not outrank."
+
+    return None
 
 
 class TempRoleModal(discord.ui.Modal):
@@ -77,6 +118,16 @@ class TempRoleModal(discord.ui.Modal):
         self.add_item(self.reason)
 
     async def callback(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            await interaction.response.send_message("This request must be made in a server.", ephemeral=True)
+            return
+
+        role = interaction.guild.get_role(self.role.id)
+        role_error = _requestable_role_error(interaction.guild, role) if role else "Role not found."
+        if role_error:
+            await interaction.response.send_message(f"❌ {role_error}", ephemeral=True)
+            return
+
         try:
             duration_hours = int(self.duration.value)
             if duration_hours < 1 or duration_hours > 720:
@@ -102,7 +153,7 @@ class TempRoleModal(discord.ui.Modal):
             request = RoleRequest(
                 guild_id=interaction.guild.id,
                 user_id=interaction.user.id,
-                role_id=self.role.id,
+                role_id=role.id,
                 reason=self.reason.value,
                 is_temp_request=True,
                 requested_duration_hours=duration_hours,
@@ -122,7 +173,7 @@ class TempRoleModal(discord.ui.Modal):
                     color=discord.Color.blue()
                 )
                 embed.add_field(name="User", value=interaction.user.mention, inline=True)
-                embed.add_field(name="Role", value=self.role.mention, inline=True)
+                embed.add_field(name="Role", value=role.mention, inline=True)
                 embed.add_field(name="Duration", value=f"{duration_hours} hours", inline=True)
                 embed.add_field(name="Event", value=self.event_name.value, inline=False)
                 embed.add_field(name="Reason", value=self.reason.value, inline=False)
@@ -138,7 +189,7 @@ class TempRoleModal(discord.ui.Modal):
                         req.channel_id = log_channel.id
 
         await interaction.response.send_message(
-            f"✅ Your request for **{self.role.name}** has been submitted for review!",
+            f"✅ Your request for **{role.name}** has been submitted for review!",
             ephemeral=True
         )
 
@@ -152,20 +203,18 @@ class RoleRequestButtons(discord.ui.View):
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success, emoji="✅")
     async def approve(self, button: discord.ui.Button, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.manage_roles:
+        if interaction.guild is None or not interaction.user.guild_permissions.manage_roles:
             await interaction.response.send_message("You don't have permission.", ephemeral=True)
             return
 
         with db_session_scope() as session:
-            request = session.get(RoleRequest, self.request_id)
+            request = session.query(RoleRequest).filter(
+                RoleRequest.id == self.request_id,
+                RoleRequest.guild_id == interaction.guild.id,
+            ).first()
             if not request or request.status != "pending":
                 await interaction.response.send_message("Request already processed.", ephemeral=True)
                 return
-
-            request.status = "approved"
-            request.reviewed_by = interaction.user.id
-            request.reviewed_at = int(time.time())
-
             user_id = request.user_id
             role_id = request.role_id
             duration_hours = request.requested_duration_hours
@@ -179,12 +228,48 @@ class RoleRequestButtons(discord.ui.View):
             await interaction.response.send_message("User or role not found.", ephemeral=True)
             return
 
+        role_error = _requestable_role_error(
+            interaction.guild,
+            role,
+            reviewer=interaction.user,
+            target=member,
+        )
+        if role_error:
+            await interaction.response.send_message(f"❌ {role_error}", ephemeral=True)
+            return
+
+        # Claim the request before the Discord mutation. Only one reviewer can
+        # transition a pending row, preventing duplicate role grants/temp rows.
+        with db_session_scope() as session:
+            claimed = session.query(RoleRequest).filter(
+                RoleRequest.id == self.request_id,
+                RoleRequest.guild_id == interaction.guild.id,
+                RoleRequest.status == "pending",
+            ).update({
+                RoleRequest.status: "processing",
+                RoleRequest.reviewed_by: interaction.user.id,
+                RoleRequest.reviewed_at: int(time.time()),
+            }, synchronize_session=False)
+        if claimed != 1:
+            await interaction.response.send_message("Request already processed.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        role_added = False
         try:
             await member.add_roles(role, reason=f"Approved by {interaction.user}")
+            role_added = True
 
-            if is_temp and duration_hours:
-                expires_at = int(time.time()) + (duration_hours * 3600)
-                with db_session_scope() as session:
+            with db_session_scope() as session:
+                request = session.query(RoleRequest).filter(
+                    RoleRequest.id == self.request_id,
+                    RoleRequest.guild_id == interaction.guild.id,
+                    RoleRequest.status == "processing",
+                ).first()
+                if not request:
+                    raise RuntimeError("Role request claim was lost")
+                if is_temp and duration_hours:
+                    expires_at = int(time.time()) + (duration_hours * 3600)
                     temp = TempRole(
                         guild_id=interaction.guild.id,
                         user_id=user_id,
@@ -195,39 +280,66 @@ class RoleRequestButtons(discord.ui.View):
                         event_name=event_name,
                     )
                     session.add(temp)
+                request.status = "approved"
 
-            embed = interaction.message.embeds[0] if interaction.message.embeds else None
-            if embed:
-                embed.color = discord.Color.green()
-                embed.add_field(name="✅ Approved", value=f"By {interaction.user.mention}", inline=False)
-                await interaction.message.edit(embed=embed, view=None)
-
-            await interaction.response.send_message(
-                f"✅ Approved! {member.mention} now has {role.mention}" +
-                (f" for {duration_hours}h" if is_temp else ""),
-                ephemeral=True
+        except (discord.Forbidden, discord.HTTPException, RuntimeError):
+            if role_added:
+                try:
+                    await member.remove_roles(role, reason="Role request approval did not commit")
+                except discord.HTTPException:
+                    logger.exception(
+                        "Failed to roll back role %s for member %s after approval failure",
+                        role.id,
+                        member.id,
+                    )
+            with db_session_scope() as session:
+                session.query(RoleRequest).filter(
+                    RoleRequest.id == self.request_id,
+                    RoleRequest.guild_id == interaction.guild.id,
+                    RoleRequest.status == "processing",
+                ).update({RoleRequest.status: "pending"}, synchronize_session=False)
+            await interaction.followup.send(
+                "I couldn't safely complete that assignment. The request remains pending.",
+                ephemeral=True,
             )
+            return
 
+        embed = interaction.message.embeds[0] if interaction.message.embeds else None
+        if embed:
+            embed.color = discord.Color.green()
+            embed.add_field(name="✅ Approved", value=f"By {interaction.user.mention}", inline=False)
             try:
-                await member.send(
-                    f"✅ Your request for **{role.name}** in **{interaction.guild.name}** was approved!" +
-                    (f"\nThis role will expire in {duration_hours} hours." if is_temp else "")
-                )
-            except discord.Forbidden:
-                pass
+                await interaction.message.edit(embed=embed, view=None)
+            except discord.HTTPException:
+                logger.warning("Could not update approved role request message %s", self.request_id)
 
+        await interaction.followup.send(
+            f"✅ Approved! {member.mention} now has {role.mention}" +
+            (f" for {duration_hours}h" if is_temp else ""),
+            ephemeral=True,
+        )
+
+        try:
+            await member.send(
+                f"✅ Your request for **{role.name}** in **{interaction.guild.name}** was approved!" +
+                (f"\nThis role will expire in {duration_hours} hours." if is_temp else "")
+            )
         except discord.Forbidden:
-            await interaction.response.send_message("I don't have permission to assign that role.", ephemeral=True)
+            pass
 
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, emoji="❌")
     async def deny(self, button: discord.ui.Button, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.manage_roles:
+        if interaction.guild is None or not interaction.user.guild_permissions.manage_roles:
             await interaction.response.send_message("You don't have permission.", ephemeral=True)
             return
 
         with db_session_scope() as session:
-            request = session.get(RoleRequest, self.request_id)
-            if not request or request.status != "pending":
+            request = session.query(RoleRequest).filter(
+                RoleRequest.id == self.request_id,
+                RoleRequest.guild_id == interaction.guild.id,
+                RoleRequest.status == "pending",
+            ).first()
+            if not request:
                 await interaction.response.send_message("Request already processed.", ephemeral=True)
                 return
 
@@ -472,6 +584,17 @@ class RolesCog(commands.Cog):
         role: discord.Role, template_name: str, description: str = None
     ):
         """Save a role configuration as a template."""
+        if role.is_default() or role.managed:
+            await ctx.respond("❌ Default and integration-managed roles cannot be templated.", ephemeral=True)
+            return
+        if role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
+            await ctx.respond("❌ You cannot template a role at or above your own.", ephemeral=True)
+            return
+        dangerous = _dangerous_permission_names(role.permissions)
+        if dangerous:
+            await ctx.respond("❌ Privileged role permissions cannot be saved in templates.", ephemeral=True)
+            return
+
         with db_session_scope() as session:
             existing = (
                 session.query(RoleTemplate)
@@ -500,10 +623,13 @@ class RolesCog(commands.Cog):
                 guild_id=ctx.guild.id,
                 name=template_name,
                 description=description or f"Template from {role.name}",
-                color=role.color.value,
-                hoist=role.hoist,
-                mentionable=role.mentionable,
-                permissions_value=role.permissions.value,
+                template_data=json.dumps({"roles": [{
+                    "name": role.name,
+                    "color": role.color.value,
+                    "hoist": role.hoist,
+                    "mentionable": role.mentionable,
+                    "permissions": role.permissions.value,
+                }]}),
                 created_by=ctx.author.id,
             )
             session.add(template)
@@ -531,11 +657,21 @@ class RolesCog(commands.Cog):
                 await ctx.respond(f"❌ Template '{template_name}' not found.", ephemeral=True)
                 return
 
-            color = template.color
-            hoist = template.hoist
-            mentionable = template.mentionable
-            perms_value = template.permissions_value
-            template.use_count += 1
+            try:
+                template_data = json.loads(template.template_data)
+                role_data = template_data["roles"][0]
+                color = int(role_data.get("color", 0))
+                hoist = bool(role_data.get("hoist", False))
+                mentionable = bool(role_data.get("mentionable", False))
+                perms_value = int(role_data.get("permissions", 0))
+            except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+                await ctx.respond("❌ This role template is invalid.", ephemeral=True)
+                return
+
+        permissions = discord.Permissions(perms_value)
+        if _dangerous_permission_names(permissions):
+            await ctx.respond("❌ This template contains privileged permissions and was blocked.", ephemeral=True)
+            return
 
         try:
             new_role = await ctx.guild.create_role(
@@ -543,7 +679,7 @@ class RolesCog(commands.Cog):
                 color=discord.Color(color),
                 hoist=hoist,
                 mentionable=mentionable,
-                permissions=discord.Permissions(perms_value),
+                permissions=permissions,
                 reason=f"Created from template '{template_name}' by {ctx.author}"
             )
 
@@ -552,6 +688,14 @@ class RolesCog(commands.Cog):
                 target_id=new_role.id, target_name=role_name, target_type="role",
                 details=f"From template: {template_name}"
             )
+
+            with db_session_scope() as session:
+                template = session.query(RoleTemplate).filter(
+                    RoleTemplate.guild_id == ctx.guild.id,
+                    RoleTemplate.name == template_name,
+                ).first()
+                if template:
+                    template.use_count += 1
 
             await ctx.respond(
                 f"✅ Created role {new_role.mention} from template **{template_name}**",
@@ -649,6 +793,10 @@ class RolesCog(commands.Cog):
     @discord.option("role", discord.Role, description="Role to request")
     async def request_role(self, ctx: discord.ApplicationContext, role: discord.Role):
         """Open a form to request a temporary role."""
+        role_error = _requestable_role_error(ctx.guild, role)
+        if role_error:
+            await ctx.respond(f"❌ {role_error}", ephemeral=True)
+            return
         modal = TempRoleModal(role)
         await ctx.send_modal(modal)
 

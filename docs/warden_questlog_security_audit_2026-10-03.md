@@ -398,3 +398,48 @@ No security remediation is complete until it has:
    never replayed automatically: recommended yes.
 4. Confirm that Full Coverage/Administrator remains an explicit opt-in while
    Named Permissions becomes the normal recommendation: recommended yes.
+
+## 2026-10-07 hardening addendum
+
+The follow-up review remediated the repository-local findings discovered during
+implementation:
+
+- self-service role requests and templates now fail closed for privileged,
+  managed, default, cross-guild, and out-of-hierarchy roles;
+- role approval has an atomic claim and rollback path;
+- RSS fetching is HTTPS-only, fails closed on DNS errors, pins validated public
+  IPs, preserves TLS hostname validation, and revalidates redirects;
+- legacy queued mutations are never automatically replayed once execution may
+  have started;
+- legacy LFG operations are scoped to their guild, configured channel, thread,
+  and group membership, with controlled mentions;
+- Warden no longer caches game-server passwords in the shared database and
+  never publishes them in channels visible to `@everyone`;
+- disabled Soulmask RCON commands have administrator checks if re-enabled.
+
+Post-fix verification:
+
+- 84 unit/regression tests passed;
+- Semgrep ran 293 rules on 81 tracked files with 0 findings;
+- Bandit reported 0 high and 0 medium findings across 34,675 lines;
+- `pip-audit` reported no known vulnerabilities in the locked dependencies;
+- `detect-secrets` reported 0 findings;
+- Python compilation and `git diff --check` passed.
+
+Deployment work that cannot be completed from the Warden repository alone:
+
+1. Install `logrotate` with host-administrator access and install
+   `deploy/logrotate/wardenbot` as `/etc/logrotate.d/wardenbot`.
+2. Replace the legacy website-to-bot master bearer token with scoped service
+   credentials and cryptographically bound actor identity in a coordinated
+   website and bot protocol cutover. The API is loopback-only and rechecks live
+   Discord permissions, but possession of the current master token still allows
+   a caller to spoof `requester_id`.
+3. Complete the separately offered Codex Security installation in the product
+   UI; its state was still reported as not installed at the end of this review.
+
+This code review found no evidence of Warden credential compromise. That does
+not replace production forensics of Discord, host, database, cloud, and payment
+provider audit logs. If independent evidence suggests compromise, rotate all
+authoritative credentials from their provider consoles and do not commit the
+replacements to this repository.

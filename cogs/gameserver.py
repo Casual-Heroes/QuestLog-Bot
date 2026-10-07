@@ -31,7 +31,7 @@ logging.getLogger('ampapi').setLevel(logging.CRITICAL)
 AMP_URL      = os.getenv('AMP_URL', '')
 AMP_USER     = os.getenv('AMP_USER', '')
 AMP_PASSWORD = os.getenv('AMP_PASSWORD', '')
-AMP_SERVER_PASSWORD_NODE = 'Meta.GenericModule.ServerPassword'
+AMP_SERVER_PASSWORD_NODE = 'Meta.GenericModule.ServerPassword'  # pragma: allowlist secret
 
 # ---- AMP instance paths (same as Fluxer bot) ----
 from pathlib import Path
@@ -135,9 +135,9 @@ async def _get_amp_server_password(instance_name: str) -> str | None:
         return password if found else None
     except Exception as e:
         logger.warning(
-            '[gameserver] AMP password lookup failed for %s: %s',
+            '[gameserver] AMP protected-setting lookup failed for %s: %s',
             instance_name,
-            e,
+            type(e).__name__,
         )
         return None
 
@@ -205,7 +205,8 @@ async def _get_server_status(instance_name: str, public_ip: str | None = None) -
                     game_port.get('ip') or game_port.get('hostname')
                     or game_port.get('address') or game_port.get('Address')
                 )
-                if not raw_ip or raw_ip in ('0.0.0.0', '::'):
+                # Comparison with wildcard addresses, not a listening socket.
+                if not raw_ip or raw_ip in ('0.0.0.0', '::'):  # nosec B104
                     try:
                         raw_ip = _requests.get('https://ifconfig.me', timeout=5).text.strip()
                     except Exception:
@@ -227,7 +228,13 @@ def _load_all_configs() -> list[dict]:
             rows = db.execute(text(
                 "SELECT * FROM gamebot_configs WHERE configured = 1 AND discord_guild_id IS NOT NULL"
             )).fetchall()
-            return [dict(r._mapping) for r in rows]
+            configs = [dict(r._mapping) for r in rows]
+            # The legacy schema still has a plaintext password column used by
+            # another service. Warden deliberately drops it at the boundary and
+            # reads the current value from AMP only when a private channel needs it.
+            for config in configs:
+                config.pop('server_password', None)
+            return configs
     except Exception as e:
         logger.error(f'[gameserver] _load_all_configs: {e}')
         return []
@@ -382,30 +389,11 @@ def _update_discord_message_id(instance_name: str, channel_id: str, msg_id: str 
         logger.error(f'[gameserver] _update_discord_message_id: {e}')
 
 
-def _update_server_password(instance_name: str, password: str):
-    """Persist an authoritative AMP password in the shared bot config."""
-    try:
-        with db_session_scope() as db:
-            db.execute(text(
-                "UPDATE gamebot_configs SET server_password=:pw WHERE instance_name=:n"
-            ), {'pw': password, 'n': instance_name})
-    except Exception as e:
-        logger.error(f'[gameserver] _update_server_password: {e}')
-
-
 async def _resolve_server_password(cfg: dict) -> str | None:
-    """Return the cached password, or self-heal it directly from AMP."""
-    cached = cfg.get('server_password')
-    if cached:
-        return str(cached)
+    """Read the password from AMP without copying it into the shared database."""
     if not cfg.get('show_password'):
         return None
-
-    password = await _get_amp_server_password(cfg['instance_name'])
-    if password is not None:
-        _update_server_password(cfg['instance_name'], password)
-        cfg['server_password'] = password
-    return password
+    return await _get_amp_server_password(cfg['instance_name'])
 
 
 # ---------------------------------------------------------------------------
@@ -510,7 +498,7 @@ def read_ingame_server_name(instance_name: str, game_type: str) -> str | None:
 # Embed builder (1:1 port of Fluxer build_serverinfo_embed)
 # ---------------------------------------------------------------------------
 
-async def build_serverinfo_embed(cfg: dict) -> discord.Embed:
+async def build_serverinfo_embed(cfg: dict, *, include_password: bool = True) -> discord.Embed:
     instance_name = cfg['instance_name']
     game_type     = cfg.get('game_type', 'Game Server')
     display_name  = cfg.get('server_display_name') or game_type
@@ -548,9 +536,9 @@ async def build_serverinfo_embed(cfg: dict) -> discord.Embed:
         connect = f"{status['ip']}:{status['port']}" if status.get('port') else status['ip']
         embed.add_field(name='IP Address', value=f"```{connect}```", inline=False)
 
-    # Password. If the DB cache is blank, recover directly from AMP and
-    # self-heal the shared cache used by both Discord and Fluxer.
-    server_password = await _resolve_server_password(cfg)
+    # Passwords are allowed only in channels hidden from @everyone. The caller
+    # determines channel visibility before requesting this field.
+    server_password = await _resolve_server_password(cfg) if include_password else None
     if server_password:
         embed.add_field(name='Server Password', value=f"```{server_password}```", inline=False)
 
@@ -725,23 +713,67 @@ class GameServerCog(commands.Cog):
             return
 
         msg_map = _parse_stats_message_map(cfg.get('discord_stats_message_id'))
-        embed = await build_serverinfo_embed(cfg)
-        fingerprint = _embed_fingerprint(embed)
+        embeds = {}
 
         # Each selected channel gets its own live-edited message, tracked independently -
         # one channel's permission/404 failure must not stop the others from updating.
         for channel_id in channel_ids:
+            channel = self.bot.get_channel(int(channel_id))
+            if channel is None:
+                try:
+                    channel = await self.bot.fetch_channel(int(channel_id))
+                except Exception as e:
+                    logger.warning(
+                        '[gameserver] channel %s not found for %s: %s',
+                        channel_id,
+                        instance_name,
+                        type(e).__name__,
+                    )
+                    continue
+
+            include_password = False
+            if isinstance(channel, discord.abc.GuildChannel):
+                everyone = channel.guild.default_role
+                include_password = not channel.permissions_for(everyone).view_channel
+            if cfg.get('show_password') and not include_password:
+                logger.warning(
+                    '[gameserver] sensitive field hidden in public channel %s',
+                    channel_id,
+                )
+
+            if include_password not in embeds:
+                embed = await build_serverinfo_embed(
+                    cfg,
+                    include_password=include_password,
+                )
+                embeds[include_password] = (embed, _embed_fingerprint(embed))
+            embed, fingerprint = embeds[include_password]
+
             cache_key = (instance_name, channel_id)
             if self._last_fingerprint.get(cache_key) == fingerprint:
                 continue  # content unchanged since last edit - skip the API call entirely
-            ok = await self._refresh_one_channel(instance_name, channel_id, msg_map.get(channel_id), embed)
+            ok = await self._refresh_one_channel(
+                instance_name,
+                channel_id,
+                msg_map.get(channel_id),
+                embed,
+                channel=channel,
+            )
             if ok:
                 self._last_fingerprint[cache_key] = fingerprint
             # else: leave the cached fingerprint as-is, so a real content change is
             # retried next cycle instead of being silently swallowed by the cache.
 
-    async def _refresh_one_channel(self, instance_name: str, channel_id: str, old_msg_id: str | None, embed) -> bool:
-        channel = self.bot.get_channel(int(channel_id))
+    async def _refresh_one_channel(
+        self,
+        instance_name: str,
+        channel_id: str,
+        old_msg_id: str | None,
+        embed,
+        *,
+        channel=None,
+    ) -> bool:
+        channel = channel or self.bot.get_channel(int(channel_id))
         if channel is None:
             try:
                 channel = await self.bot.fetch_channel(int(channel_id))
