@@ -430,13 +430,15 @@ Deployment work that cannot be completed from the Warden repository alone:
 
 1. Install `logrotate` with host-administrator access and install
    `deploy/logrotate/wardenbot` as `/etc/logrotate.d/wardenbot`.
-2. Replace the legacy website-to-bot master bearer token with scoped service
-   credentials and cryptographically bound actor identity in a coordinated
-   website and bot protocol cutover. The API is loopback-only and rechecks live
-   Discord permissions, but possession of the current master token still allows
-   a caller to spoof `requester_id`.
-3. Complete the separately offered Codex Security installation in the product
-   UI; its state was still reported as not installed at the end of this review.
+2. Deploy and configure the implemented Ed25519 website-to-bot protocol using
+   `docs/signed_api_auth_migration.md`. Code support is complete in both
+   repositories, but the legacy credential must remain until the public/private
+   key pair is placed in the production secret stores and signed traffic is
+   verified.
+
+Codex Security was installed and enabled on 2026-10-07. Its tools are loaded
+when a new Codex chat starts, so this already-open review used Semgrep, Bandit,
+`pip-audit`, regression tests, and manual threat modeling for its final pass.
 
 This code review found no evidence of Warden credential compromise. That does
 not replace production forensics of Discord, host, database, cloud, and payment

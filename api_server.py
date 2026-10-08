@@ -3,46 +3,204 @@ Simple API server for bot control endpoints.
 Allows the web app to trigger actions like forcing a guild sync.
 """
 from aiohttp import web
+import json
 import secrets
 import logging
 import os
 import discord
+
+from utils.signed_request_auth import (
+    AuthenticationError,
+    ReplayCache,
+    load_trusted_signers,
+    validate_required_scopes,
+    verify_signed_request,
+)
 
 logger = logging.getLogger("api_server")
 
 # Store bot reference (set by bot.py on startup)
 bot_instance = None
 
-# SECURITY: Load API token from environment - REQUIRED for production
+# Signed authentication is rolled out in dual mode so the website and bot can
+# be deployed independently. Set WARDEN_API_AUTH_MODE=signed after the website
+# is signing every request, then remove the legacy token from this service.
+API_AUTH_MODE = os.getenv("WARDEN_API_AUTH_MODE", "dual").strip().lower()
+if API_AUTH_MODE not in {"legacy", "dual", "signed"}:
+    raise RuntimeError("WARDEN_API_AUTH_MODE must be legacy, dual, or signed")
+
 API_TOKEN = os.getenv("DISCORD_BOT_API_TOKEN")
-if not API_TOKEN:
-    logger.critical("DISCORD_BOT_API_TOKEN is not set! Bot API will not start without authentication token.")
-    raise RuntimeError("DISCORD_BOT_API_TOKEN environment variable is required for security. Set it in .env file.")
-if len(API_TOKEN) < 32:
+if API_TOKEN and len(API_TOKEN) < 32:
     logger.critical("DISCORD_BOT_API_TOKEN must be at least 32 characters.")
     raise RuntimeError("DISCORD_BOT_API_TOKEN must be at least 32 characters.")
+
+LOCAL_SYNC_TOKEN = os.getenv("WARDEN_API_LOCAL_SYNC_TOKEN")
+if LOCAL_SYNC_TOKEN and len(LOCAL_SYNC_TOKEN) < 32:
+    raise RuntimeError("WARDEN_API_LOCAL_SYNC_TOKEN must be at least 32 characters")
+
+TRUSTED_SIGNERS = load_trusted_signers(os.getenv("WARDEN_API_TRUSTED_SIGNERS"))
+REPLAY_CACHE = ReplayCache()
+REQUIRED_SIGNED_SCOPES = {
+    "guilds.read",
+    "guilds.sync",
+    "moderation.write",
+    "creator.write",
+    "creator.network.write",
+}
+if API_AUTH_MODE == "legacy" and not API_TOKEN:
+    raise RuntimeError("DISCORD_BOT_API_TOKEN is required in legacy authentication mode")
+if API_AUTH_MODE == "dual" and not API_TOKEN and not TRUSTED_SIGNERS:
+    raise RuntimeError(
+        "Dual authentication mode requires DISCORD_BOT_API_TOKEN or WARDEN_API_TRUSTED_SIGNERS"
+    )
+if API_AUTH_MODE == "signed":
+    validate_required_scopes(TRUSTED_SIGNERS, REQUIRED_SIGNED_SCOPES)
+    if not LOCAL_SYNC_TOKEN:
+        raise RuntimeError(
+            "WARDEN_API_LOCAL_SYNC_TOKEN is required in signed mode for internal sync jobs"
+        )
+
+
+ROUTE_AUTH_POLICIES = {
+    "guilds-list": ("guilds.read", False),
+    "guild-sync-all": ("guilds.sync", True),
+    "guild-sync-one": ("guilds.sync", True),
+    "mod-untimeout": ("moderation.write", True),
+    "mod-kick": ("moderation.write", True),
+    "mod-ban": ("moderation.write", True),
+    "mod-unban": ("moderation.write", True),
+    "mod-unmute": ("moderation.write", True),
+    "mod-unjail": ("moderation.write", True),
+    "creator-announce-cotw": ("creator.write", True),
+    "creator-announce-cotm": ("creator.write", True),
+    "creator-delete-message": ("creator.write", True),
+    "creator-network-cotw": ("creator.network.write", True),
+    "creator-network-cotm": ("creator.network.write", True),
+}
+
+
+def _legacy_token_is_valid(request):
+    auth_header = request.headers.get('Authorization', '')
+    scheme, separator, token = auth_header.partition(' ')
+    return bool(
+        API_TOKEN
+        and separator == ' '
+        and scheme.lower() == 'bearer'
+        and token
+        and ' ' not in token
+        and secrets.compare_digest(token, API_TOKEN)
+    )
+
+
+def _local_sync_token_is_valid(request, policy):
+    if not LOCAL_SYNC_TOKEN or not policy or policy[0] != "guilds.sync":
+        return False
+    if request.remote not in {"127.0.0.1", "::1"}:
+        return False
+    auth_header = request.headers.get('Authorization', '')
+    scheme, separator, token = auth_header.partition(' ')
+    return bool(
+        separator == ' '
+        and scheme.lower() == 'bearer'
+        and token
+        and ' ' not in token
+        and secrets.compare_digest(token, LOCAL_SYNC_TOKEN)
+    )
+
+
+def _signed_actor_is_authorized(request, scope, actor_id, body):
+    """Apply defense-in-depth actor checks after signature verification."""
+    if scope == "moderation.write":
+        try:
+            payload = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False, "Signed moderation request must contain valid JSON"
+        if str(payload.get("requester_id", "")) != actor_id:
+            return False, "Signed actor does not match requester_id"
+
+    if scope in {"guilds.sync", "creator.write"}:
+        guild_id = request.match_info.get("guild_id")
+        if guild_id is None:
+            try:
+                payload = json.loads(body)
+                guild_id = payload.get("guild_id")
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return False, "Signed request must contain a guild ID"
+        try:
+            guild_id = int(guild_id)
+            actor_snowflake = int(actor_id)
+        except (TypeError, ValueError):
+            return False, "Signed request has an invalid actor or guild ID"
+
+        guild = bot_instance.get_guild(guild_id) if bot_instance else None
+        actor = guild.get_member(actor_snowflake) if guild else None
+        if not actor:
+            return False, "Signed actor is not a current member of the guild"
+        if scope == "creator.write" and not actor.guild_permissions.administrator:
+            return False, "Signed actor is not a current guild administrator"
+
+    return True, ""
 
 
 @web.middleware
 async def auth_middleware(request, handler):
-    """Require Bearer token authentication for all non-health endpoints."""
+    """Authenticate signed requests, with an explicit migration fallback."""
     # Skip auth for health check
     if request.path == '/health':
         return await handler(request)
 
-    # Require authentication
-    auth_header = request.headers.get('Authorization', '')
-    scheme, separator, token = auth_header.partition(' ')
-    if separator != ' ' or scheme.lower() != 'bearer' or not token or ' ' in token:
-        logger.warning(f"Unauthorized API request from {request.remote}")
-        return web.json_response({'error': 'Unauthorized - Missing Bearer token'}, status=401)
+    route_name = request.match_info.route.name
+    policy = ROUTE_AUTH_POLICIES.get(route_name)
+    signed_attempt = bool(
+        request.headers.get("X-Warden-Auth-Version")
+        or request.headers.get("X-Warden-Signature")
+    )
 
-    if not secrets.compare_digest(token, API_TOKEN):
-        logger.warning(f"Invalid API token from {request.remote}")
-        return web.json_response({'error': 'Unauthorized - Invalid token'}, status=401)
+    if API_AUTH_MODE != "legacy" and signed_attempt and policy:
+        scope, actor_required = policy
+        body = await request.read()
+        try:
+            context = verify_signed_request(
+                headers=request.headers,
+                method=request.method,
+                path=request.path,
+                body=body,
+                expected_scope=scope,
+                actor_required=actor_required,
+                signers=TRUSTED_SIGNERS,
+                replay_cache=REPLAY_CACHE,
+            )
+            authorized, reason = _signed_actor_is_authorized(
+                request, context.scope, context.actor_id, body
+            )
+            if not authorized:
+                logger.warning("Signed API authorization rejected: %s", reason)
+                return web.json_response({'error': 'Forbidden'}, status=403)
+            request["auth_method"] = "signed"
+            request["auth_actor_id"] = context.actor_id
+            request["auth_key_id"] = context.key_id
+            return await handler(request)
+        except AuthenticationError as exc:
+            logger.warning("Signed API authentication failed from %s: %s", request.remote, exc)
+            return web.json_response({'error': 'Unauthorized'}, status=401)
 
-    # Token is valid, proceed
-    return await handler(request)
+    if _local_sync_token_is_valid(request, policy):
+        request["auth_method"] = "local-sync"
+        request["auth_actor_id"] = None
+        return await handler(request)
+
+    if API_AUTH_MODE != "signed" and _legacy_token_is_valid(request):
+        request["auth_method"] = "legacy"
+        request["auth_actor_id"] = None
+        logger.warning("Legacy bearer authentication used for %s", request.path)
+        return await handler(request)
+
+    logger.warning("Unauthorized API request from %s", request.remote)
+    return web.json_response(
+        {'error': 'Unauthorized'},
+        status=401,
+        headers={'WWW-Authenticate': 'WardenSignature realm="warden-api"'},
+    )
 
 
 async def force_guild_sync(request):
@@ -1099,29 +1257,43 @@ def create_app():
     )
 
     # Routes
-    app.router.add_get('/health', health_check)
-    app.router.add_get('/api/guilds', get_guild_ids)
-    app.router.add_post('/api/sync', force_guild_sync)
-    app.router.add_post('/api/sync/{guild_id}', force_guild_sync)
+    app.router.add_get('/health', health_check, name='health')
+    app.router.add_get('/api/guilds', get_guild_ids, name='guilds-list')
+    app.router.add_post('/api/sync', force_guild_sync, name='guild-sync-all')
+    app.router.add_post('/api/sync/{guild_id}', force_guild_sync, name='guild-sync-one')
 
     # Moderation endpoints (now protected by auth_middleware)
-    app.router.add_post('/mod/untimeout', mod_untimeout)
-    app.router.add_post('/mod/kick', mod_kick)
-    app.router.add_post('/mod/ban', mod_ban)
-    app.router.add_post('/mod/unban', mod_unban)
-    app.router.add_post('/mod/unmute', mod_unmute)
-    app.router.add_post('/mod/unjail', mod_unjail)
+    app.router.add_post('/mod/untimeout', mod_untimeout, name='mod-untimeout')
+    app.router.add_post('/mod/kick', mod_kick, name='mod-kick')
+    app.router.add_post('/mod/ban', mod_ban, name='mod-ban')
+    app.router.add_post('/mod/unban', mod_unban, name='mod-unban')
+    app.router.add_post('/mod/unmute', mod_unmute, name='mod-unmute')
+    app.router.add_post('/mod/unjail', mod_unjail, name='mod-unjail')
 
     # Creator Discovery endpoints
-    app.router.add_post('/api/announce-cotw', announce_cotw)
-    app.router.add_post('/api/announce-cotm', announce_cotm)
-    app.router.add_post('/api/delete-message', delete_message)
+    app.router.add_post(
+        '/api/announce-cotw', announce_cotw, name='creator-announce-cotw'
+    )
+    app.router.add_post(
+        '/api/announce-cotm', announce_cotm, name='creator-announce-cotm'
+    )
+    app.router.add_post(
+        '/api/delete-message', delete_message, name='creator-delete-message'
+    )
 
     # Network Creator Discovery endpoints (DISCOVERY_APPROVERS only)
-    app.router.add_post('/api/announce-network-cotw', announce_network_cotw)
-    app.router.add_post('/api/announce-network-cotm', announce_network_cotm)
+    app.router.add_post(
+        '/api/announce-network-cotw',
+        announce_network_cotw,
+        name='creator-network-cotw',
+    )
+    app.router.add_post(
+        '/api/announce-network-cotm',
+        announce_network_cotm,
+        name='creator-network-cotm',
+    )
 
-    logger.info("API server created with authentication middleware")
+    logger.info("API server created with %s authentication mode", API_AUTH_MODE)
     return app
 
 
