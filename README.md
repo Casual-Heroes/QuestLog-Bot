@@ -171,7 +171,10 @@ Copy `.env.example` for the full list. Key variables:
 
 | Variable | Description |
 |---|---|
-| `DISCORD_BOT_API_TOKEN` | Shared secret for QuestLog <-> bot API calls |
+| `WARDEN_API_AUTH_MODE` | `dual` during migration; `signed` after cutover |
+| `WARDEN_API_TRUSTED_SIGNERS` | Ed25519 public keys and authorized API scopes |
+| `WARDEN_API_LOCAL_SYNC_TOKEN` | Loopback-only credential limited to internal sync jobs |
+| `DISCORD_BOT_API_TOKEN` | Temporary legacy dashboard credential; remove after cutover |
 | `DJANGO_DB_NAME` / `DJANGO_DB_USER` / `DJANGO_DB_PASSWORD` | Access to the QuestLog web database for shared data |
 
 ### Discord OAuth (optional - for web dashboard)
@@ -274,7 +277,9 @@ Replace `wardenbot` with whatever user the bot process runs as. Replace service 
 ## Security
 
 - Bot token and all credentials stored outside the repo at `/etc/casual-heroes/warden.env` in production
-- Internal API authenticated with a pre-shared token (`DISCORD_BOT_API_TOKEN`)
+- Internal API supports scoped Ed25519 request signatures with actor binding, short expiry, and replay protection
+- Warden stores only dashboard public keys; the website signing key never resides on the bot host
+- Legacy bearer authentication is available only as an explicit migration mode
 - Error responses never leak internal exception details - exceptions log server-side only
 - Emergency commands locked to `BOT_OWNER_ID` - Discord permissions are not used for this
 - All emergency responses ephemeral and require a `CONFIRM` modal for destructive actions

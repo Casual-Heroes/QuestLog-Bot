@@ -67,10 +67,16 @@ class ProductBoundaryTests(unittest.TestCase):
 
     def test_internal_api_has_bounded_constant_time_auth(self):
         api = source("api_server.py")
+        signed_auth = source("utils/signed_request_auth.py")
 
         self.assertIn("secrets.compare_digest", api)
         self.assertIn("client_max_size=64 * 1024", api)
         self.assertIn("len(API_TOKEN) < 32", api)
+        self.assertIn('WARDEN_API_AUTH_MODE", "dual"', api)
+        self.assertIn("verify_signed_request", api)
+        self.assertIn("Ed25519PublicKey", signed_auth)
+        self.assertIn("Request replay detected", signed_auth)
+        self.assertIn("hashlib.sha256(body)", signed_auth)
         self.assertIn("'Authorization': f'Bearer {api_token}'", source("cogs/action_processor.py"))
 
     def test_legacy_action_queue_has_execution_boundary_policy(self):

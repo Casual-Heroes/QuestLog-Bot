@@ -57,7 +57,9 @@ class AutoGuildSyncCog(commands.Cog):
             import os
 
             bot_api_port = int(os.getenv('BOT_API_PORT', 8001))
-            api_token = os.getenv('DISCORD_BOT_API_TOKEN')
+            api_token = os.getenv('WARDEN_API_LOCAL_SYNC_TOKEN') or os.getenv(
+                'DISCORD_BOT_API_TOKEN'
+            )
             url = f"http://localhost:{bot_api_port}/api/sync/{guild_id}"
 
             # Prepare headers with Bearer token for authentication
