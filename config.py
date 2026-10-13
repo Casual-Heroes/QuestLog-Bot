@@ -341,15 +341,7 @@ class DefaultVerificationSettings:
 QUESTLOG_INTERNAL_API_URL = os.getenv("QUESTLOG_INTERNAL_API_URL", "https://casual-heroes.com")
 QUESTLOG_BOT_SECRET = os.getenv("QUESTLOG_BOT_SECRET", "")
 _ENABLE_BRIDGE_RAW = os.getenv("ENABLE_BRIDGE")
-# Preserve existing configured bridges during migration, but make all new
-# deployments explicit through .env.example. Remove the compatibility branch
-# after production has ENABLE_BRIDGE set.
-ENABLE_BRIDGE_IMPLICIT = _ENABLE_BRIDGE_RAW is None and bool(QUESTLOG_BOT_SECRET)
-ENABLE_BRIDGE = (
-    bool(QUESTLOG_BOT_SECRET)
-    if _ENABLE_BRIDGE_RAW is None
-    else _ENABLE_BRIDGE_RAW.lower() in ("1", "true", "yes", "on")
-)
+ENABLE_BRIDGE = (_ENABLE_BRIDGE_RAW or "false").lower() in ("1", "true", "yes", "on")
 BRIDGE_MEDIA_ALLOWED_HOSTS = tuple(
     host.strip().lower().rstrip(".")
     for host in os.getenv("BRIDGE_MEDIA_ALLOWED_HOSTS", "").split(",")
@@ -384,7 +376,7 @@ ENABLE_EMERGENCY_SERVICE_CONTROL = os.getenv(
     "ENABLE_EMERGENCY_SERVICE_CONTROL", "false"
 ).lower() in ("1", "true", "yes", "on")
 ENABLE_LEGACY_SITE_ACTIVITY_EXPORT = os.getenv(
-    "ENABLE_LEGACY_SITE_ACTIVITY_EXPORT", "true"
+    "ENABLE_LEGACY_SITE_ACTIVITY_EXPORT", "false"
 ).lower() in ("1", "true", "yes", "on")
 MATRIX_ACCESS_TOKEN = os.getenv("MATRIX_ACCESS_TOKEN", "")
 MATRIX_HOMESERVER = os.getenv("MATRIX_HOMESERVER", "https://matrix.casual-heroes.com")

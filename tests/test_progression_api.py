@@ -19,6 +19,22 @@ from utils.progression_outbox import ProgressionOutbox
 
 
 class ProgressionAPIClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rejects_non_https_service_url_before_http(self):
+        client = ProgressionAPIClient(
+            "http://questlog.example/api/v1/progression/events",
+            "qlp_valid_service_token",
+        )
+        with self.assertRaises(ProgressionAPIError) as context:
+            await client.record_discord_event(
+                user_id=1,
+                guild_id=2,
+                event_type="discord_message",
+                evidence_id="message:3",
+                occurred_at=4,
+            )
+        self.assertEqual(context.exception.code, "invalid_configuration")
+        self.assertIn("must be an HTTPS URL", context.exception.message)
+
     async def test_rejects_client_id_in_token_field(self):
         client = ProgressionAPIClient(
             "https://questlog.example/api/v1/progression/events",

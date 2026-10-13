@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -12,6 +13,23 @@ from cogs.bridge_cog import (
 
 
 class BridgeSecurityTests(unittest.IsolatedAsyncioTestCase):
+    def test_secret_bearing_requests_never_follow_redirects(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "cogs" / "bridge_cog.py"
+        ).read_text(encoding="utf-8")
+
+        lines = source.splitlines()
+        request_lines = [
+            index for index, line in enumerate(lines) if "headers=_HEADERS" in line
+        ]
+        self.assertGreater(len(request_lines), 0)
+        for index in request_lines:
+            with self.subTest(line=index + 1):
+                self.assertIn(
+                    "allow_redirects=False",
+                    "\n".join(lines[index:index + 5]),
+                )
+
     def test_media_requires_https_allowlisted_host(self):
         with patch("cogs.bridge_cog._TRUSTED_MEDIA_HOSTS", {"media.example"}):
             self.assertTrue(_bridge_media_url_allowed("https://media.example/image.png"))

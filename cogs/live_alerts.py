@@ -352,7 +352,11 @@ class LiveAlertsCog(commands.Cog):
             return
 
         try:
-            await channel.send(content=content, embed=embed)
+            await channel.send(
+                content=content,
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
         except Exception as e:
             logger.warning(
                 f"LiveAlerts: failed to send alert for {handle} "
