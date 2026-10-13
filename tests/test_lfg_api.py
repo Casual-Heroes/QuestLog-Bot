@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import AsyncMock
 
 from utils.lfg_api import LFGAPIClient, LFGAPIError
 
@@ -39,6 +40,45 @@ class FakeSession:
 
 
 class LFGAPIClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rejects_non_https_service_url_before_http(self):
+        client = LFGAPIClient(
+            "http://questlog.example/api/v1/lfg",
+            "secret-token",
+            max_attempts=1,
+        )
+        self.assertFalse(client.configured)
+        with self.assertRaises(LFGAPIError) as raised:
+            await client._request(
+                "POST",
+                "http://questlog.example/api/v1/lfg/",
+                payload={},
+                idempotency_key="test:insecure-url",
+            )
+        self.assertEqual(raised.exception.code, "invalid_configuration")
+        self.assertIn("must be an HTTPS URL", raised.exception.message)
+
+    async def test_public_read_cannot_bypass_insecure_url_rejection(self):
+        client = LFGAPIClient(
+            "http://questlog.example/api/v1/lfg",
+            "secret-token",
+            max_attempts=1,
+        )
+        client._get_session = AsyncMock()
+
+        with self.assertRaises(LFGAPIError) as raised:
+            await client.browse()
+
+        self.assertEqual(raised.exception.code, "invalid_configuration")
+        client._get_session.assert_not_awaited()
+
+    async def test_public_read_does_not_attach_bearer_token(self):
+        client = self.make_client(FakeResponse(200, {"results": []}))
+
+        await client.browse()
+
+        _method, _url, request = client._session.requests[0]
+        self.assertNotIn("Authorization", request["headers"])
+
     def make_client(self, *responses):
         client = LFGAPIClient(
             "https://questlog.example/api/v1/lfg",

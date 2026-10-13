@@ -26,7 +26,6 @@ from config import (
     IS_PRODUCTION,
     get_debug_guilds,
     ENABLE_BRIDGE,
-    ENABLE_BRIDGE_IMPLICIT,
     ENABLE_LEGACY_STREAMING_MONITOR,
     ENABLE_LEGACY_DISCORD_FLAIR_STORE,
     ENABLE_EMERGENCY_SERVICE_CONTROL,
@@ -494,10 +493,6 @@ def main():
             )
         else:
             cogs_to_load.append("cogs.bridge_cog")
-            if ENABLE_BRIDGE_IMPLICIT:
-                logger.warning(
-                    "Bridge enabled by legacy secret detection; set ENABLE_BRIDGE=true explicitly"
-                )
             logger.warning(
                 "Cross-platform bridge enabled; remote media and channel targets are restricted"
             )

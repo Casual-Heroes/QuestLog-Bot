@@ -34,6 +34,13 @@ from utils import igdb
 DASHBOARD_BASE_URL = "https://dashboard.casual-heroes.com"
 
 
+def _featured_allowed_mentions(member) -> discord.AllowedMentions:
+    """Allow the intended featured-member ping and suppress injected mentions."""
+    return discord.AllowedMentions(
+        everyone=False, roles=False, users=[member], replied_user=False
+    )
+
+
 def get_today_start_timestamp() -> int:
     """Get Unix timestamp for start of today (UTC)."""
     now = int(time.time())
@@ -996,7 +1003,8 @@ class DiscoveryCog(commands.Cog):
                 try:
                     msg = await feature_channel.send(
                         content=config.feature_message.replace('{user}', member.mention) if config.feature_message else f"🎉 Shoutout to {member.mention}!",
-                        embed=embed
+                        embed=embed,
+                        allowed_mentions=_featured_allowed_mentions(member),
                     )
                 except Exception as e:
                     logger.error(f"Failed to send feature embed: {e}")
@@ -1010,7 +1018,10 @@ class DiscoveryCog(commands.Cog):
                     message += f"\n🔗 {winner.link_url}"
 
                 try:
-                    msg = await feature_channel.send(message)
+                    msg = await feature_channel.send(
+                        message,
+                        allowed_mentions=_featured_allowed_mentions(member),
+                    )
                 except Exception as e:
                     logger.error(f"Failed to send feature message: {e}")
                     return {'success': False, 'error': str(e)}
@@ -2015,7 +2026,10 @@ class DiscoveryCog(commands.Cog):
                 if response_channel:
                     # Include username in message
                     full_message = f"**{user.display_name}** {message_text}"
-                    msg = await response_channel.send(full_message)
+                    msg = await response_channel.send(
+                        full_message,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
                     # Delete after specified seconds
                     await asyncio.sleep(delete_after)
                     try:
@@ -2030,7 +2044,12 @@ class DiscoveryCog(commands.Cog):
             if original_channel:
                 # Check if it's a TextChannel/Thread (has send method)
                 if hasattr(original_channel, 'send'):
-                    msg = await original_channel.send(f"{user.mention} {message_text}")
+                    msg = await original_channel.send(
+                        f"{user.mention} {message_text}",
+                        allowed_mentions=discord.AllowedMentions(
+                            everyone=False, roles=False, users=[user], replied_user=False
+                        ),
+                    )
                     await asyncio.sleep(delete_after)
                     try:
                         await msg.delete()

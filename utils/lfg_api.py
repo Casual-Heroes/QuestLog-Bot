@@ -7,6 +7,8 @@ from urllib.parse import quote, urlparse
 
 import aiohttp
 
+from utils.service_url import validate_https_service_url
+
 
 RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
 
@@ -50,19 +52,30 @@ class LFGAPIClient:
         timeout_seconds: float = 15,
         max_attempts: int = 3,
     ):
-        self.base_url = base_url.rstrip("/")
+        raw_base_url = str(base_url or "").strip()
+        self.base_url = raw_base_url.rstrip("/")
         self.token = token.strip()
         self.configuration_error = None
+        self.configuration_error_code = None
+        try:
+            self.base_url = validate_https_service_url(
+                raw_base_url, "QUESTLOG_LFG_API_URL"
+            )
+        except ValueError as exc:
+            self.configuration_error = str(exc)
+            self.configuration_error_code = "invalid_configuration"
         if self.token.startswith("qlc_"):
             self.configuration_error = (
                 "QUESTLOG_LFG_API_TOKEN contains the qlc_ client ID. "
                 "Use the separately generated one-time qlp_ token instead."
             )
+            self.configuration_error_code = "invalid_token_format"
         elif self.token.lower().startswith("client:"):
             self.configuration_error = (
                 "QUESTLOG_LFG_API_TOKEN must contain only the one-time qlp_ "
                 "token, without a 'client:' label."
             )
+            self.configuration_error_code = "invalid_token_format"
         self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         self.max_attempts = max(1, max_attempts)
         self._session: Optional[aiohttp.ClientSession] = None
@@ -91,7 +104,7 @@ class LFGAPIClient:
         callback = urlparse(callback_url)
         base = urlparse(self.base_url)
         if (
-            callback.scheme not in ("http", "https")
+            callback.scheme != "https"
             or callback.scheme != base.scheme
             or callback.netloc != base.netloc
         ):
@@ -112,9 +125,9 @@ class LFGAPIClient:
         idempotency_key: Optional[str] = None,
         authenticated: bool = True,
     ) -> LFGAPIResult:
-        if authenticated and self.configuration_error:
+        if self.configuration_error:
             raise LFGAPIError(
-                "invalid_token_format",
+                self.configuration_error_code or "invalid_configuration",
                 self.configuration_error,
             )
         if authenticated and not self.token:
@@ -124,7 +137,7 @@ class LFGAPIClient:
             )
 
         headers = {"Accept": "application/json"}
-        if self.token:
+        if authenticated and self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         if payload is not None:
             headers["Content-Type"] = "application/json"
