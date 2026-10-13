@@ -33,6 +33,18 @@ from models import (
 from utils.action_policy import ActionPolicyError, authorize_legacy_action
 
 
+def _configured_lfg_ping_role(guild, game, group):
+    """Resolve only the notification role approved in the game's configuration."""
+    if not group.ping_role_id:
+        return None
+    if not game.notify_role_id or int(group.ping_role_id) != int(game.notify_role_id):
+        raise ValueError("LFG ping role is not the configured game notification role")
+    role = guild.get_role(int(group.ping_role_id))
+    if role is None or role.is_default() or role.managed:
+        raise ValueError("Configured LFG notification role is unavailable")
+    return role
+
+
 class ActionProcessorCog(commands.Cog):
     """Processes pending actions from the web dashboard."""
 
@@ -46,6 +58,18 @@ class ActionProcessorCog(commands.Cog):
         """Stop the loop when cog unloads."""
         self.process_actions_loop.cancel()
         logger.info("ActionProcessor: Stopped action queue processor")
+
+    async def _thread_matches_lfg_group(self, thread: discord.Thread, group_id: int) -> bool:
+        """Verify a thread using Warden-authored, group-bound management state."""
+        expected_footer = f"Group ID: {int(group_id)}"
+        async for message in thread.history(limit=20, oldest_first=True):
+            if message.author.id != self.bot.user.id:
+                continue
+            for embed in message.embeds:
+                footer = getattr(getattr(embed, "footer", None), "text", None)
+                if footer == expected_footer:
+                    return True
+        return False
 
     async def _lookup_steam_url(self, game_name: str) -> str:
         """
@@ -2251,6 +2275,15 @@ class ActionProcessorCog(commands.Cog):
                         thread = None
                 if thread is not None and thread.parent_id not in allowed_channel_ids:
                     raise ValueError("Existing LFG thread is outside configured LFG channels")
+                if thread is not None and not await self._thread_matches_lfg_group(
+                    thread, int(group.id)
+                ):
+                    logger.warning(
+                        "LFG: Refusing to adopt unbound existing thread %s for group %s",
+                        thread.id,
+                        group.id,
+                    )
+                    thread = None
 
             if thread is None:
                 logger.info(f"🔵 BOT: Creating thread '{thread_name[:100]}' in channel {channel.name}")
@@ -2267,8 +2300,8 @@ class ActionProcessorCog(commands.Cog):
             # Ping role and auto-invite members if ping_role_id is set
             if group.ping_role_id:
                 try:
-                    role = guild.get_role(int(group.ping_role_id))
-                    if role and not role.is_default():
+                    role = _configured_lfg_ping_role(guild, game, group)
+                    if role:
                         # Send ping message
                         await thread.send(
                             f"{role.mention} - New LFG group created!",
@@ -2511,6 +2544,9 @@ class ActionProcessorCog(commands.Cog):
                     or thread.parent_id not in allowed_channel_ids
                 ):
                     raise ValueError("Thread is outside configured LFG channels")
+
+                if thread and not await self._thread_matches_lfg_group(thread, int(group_id)):
+                    raise ValueError("Thread does not contain Warden's LFG group binding")
 
                 if thread:
                     await thread.delete()

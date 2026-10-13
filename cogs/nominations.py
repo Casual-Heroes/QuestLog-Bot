@@ -34,6 +34,7 @@ from config import (
     QUESTLOG_BOT_SECRET,
     get_debug_guilds,
 )
+from utils.service_url import validate_https_service_url
 from utils.guild_resources import resolve_guild_channel
 
 CHECK_INTERVAL = 3600  # check once per hour
@@ -156,12 +157,16 @@ def _save_nomination(month_year: str, category: str,
 def _call_close_nominations(month_year: str) -> dict:
     """POST to QuestLog web API to tally votes and award winners."""
     try:
-        url = f"{QUESTLOG_INTERNAL_API_URL}/api/internal/close-nominations/"
+        base_url = validate_https_service_url(
+            QUESTLOG_INTERNAL_API_URL, "QUESTLOG_INTERNAL_API_URL"
+        )
+        url = f"{base_url}/api/internal/close-nominations/"
         resp = requests.post(
             url,
             json={'month_year': month_year},
             headers={'X-Bot-Secret': QUESTLOG_BOT_SECRET, 'Content-Type': 'application/json'},
             timeout=15,
+            allow_redirects=False,
         )
         return resp.json() if resp.ok else {'error': resp.text[:200]}
     except Exception as e:

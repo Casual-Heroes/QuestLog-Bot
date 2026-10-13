@@ -1,10 +1,14 @@
 import socket
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import discord
 
+from cogs.action_processor import ActionProcessorCog, _configured_lfg_ping_role
+from cogs.discovery import _featured_allowed_mentions
+from cogs.live_alerts import LiveAlertsCog
+from cogs.nominations import _call_close_nominations
 from cogs.audit import _deleted_message_details
 from cogs.roles import _requestable_role_error
 from cogs.rss_feeds import _resolve_rss_target
@@ -14,6 +18,7 @@ from utils.role_security import (
     automatic_role_execution_error,
     delegated_role_grant_error,
 )
+from utils.service_url import validate_https_service_url
 
 
 class FakeRole:
@@ -61,6 +66,134 @@ class WelcomeMentionSecurityTests(unittest.TestCase):
         mentions = _welcome_allowed_mentions(member).to_dict()
 
         self.assertEqual(mentions, {"users": [123456789], "parse": []})
+
+    def test_featured_post_can_ping_only_the_selected_member(self):
+        member = SimpleNamespace(id=987654321)
+
+        mentions = _featured_allowed_mentions(member).to_dict()
+
+        self.assertEqual(mentions, {"users": [987654321], "parse": []})
+
+
+class LiveAlertMentionSecurityTests(unittest.IsolatedAsyncioTestCase):
+    @patch("cogs.live_alerts.resolve_guild_channel", new_callable=AsyncMock)
+    async def test_external_stream_text_cannot_trigger_mentions(self, resolve):
+        channel = SimpleNamespace(send=AsyncMock())
+        resolve.return_value = channel
+        cog = LiveAlertsCog.__new__(LiveAlertsCog)
+        cog.bot = object()
+
+        await cog._send_alert(
+            1,
+            2,
+            "twitch",
+            "streamer",
+            "@everyone",
+            {
+                "title": "<@&123456789>",
+                "stream_url": "https://twitch.tv/streamer",
+            },
+            "{streamer}: {title} {url}",
+        )
+
+        mentions = channel.send.await_args.kwargs["allowed_mentions"].to_dict()
+        self.assertEqual(mentions, {"parse": []})
+
+
+class LFGThreadBindingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_accepts_matching_warden_authored_group_footer(self):
+        cog = ActionProcessorCog.__new__(ActionProcessorCog)
+        cog.bot = SimpleNamespace(user=SimpleNamespace(id=99))
+        message = SimpleNamespace(
+            author=SimpleNamespace(id=99),
+            embeds=[SimpleNamespace(footer=SimpleNamespace(text="Group ID: 42"))],
+        )
+
+        class Thread:
+            async def history(self, **_kwargs):
+                yield message
+
+        self.assertTrue(await cog._thread_matches_lfg_group(Thread(), 42))
+
+    async def test_rejects_wrong_or_non_warden_group_footer(self):
+        cog = ActionProcessorCog.__new__(ActionProcessorCog)
+        cog.bot = SimpleNamespace(user=SimpleNamespace(id=99))
+        messages = [
+            SimpleNamespace(
+                author=SimpleNamespace(id=77),
+                embeds=[SimpleNamespace(footer=SimpleNamespace(text="Group ID: 42"))],
+            ),
+            SimpleNamespace(
+                author=SimpleNamespace(id=99),
+                embeds=[SimpleNamespace(footer=SimpleNamespace(text="Group ID: 43"))],
+            ),
+        ]
+
+        class Thread:
+            async def history(self, **_kwargs):
+                for message in messages:
+                    yield message
+
+        self.assertFalse(await cog._thread_matches_lfg_group(Thread(), 42))
+
+
+class LFGPingRoleBindingTests(unittest.TestCase):
+    def test_accepts_only_the_game_configured_notification_role(self):
+        role = SimpleNamespace(id=15, managed=False, is_default=lambda: False)
+        guild = SimpleNamespace(get_role=lambda role_id: role if role_id == 15 else None)
+        game = SimpleNamespace(notify_role_id=15)
+        group = SimpleNamespace(ping_role_id=15)
+
+        self.assertIs(_configured_lfg_ping_role(guild, game, group), role)
+
+    def test_rejects_group_controlled_role_override(self):
+        guild = SimpleNamespace(get_role=lambda _role_id: object())
+        game = SimpleNamespace(notify_role_id=15)
+        group = SimpleNamespace(ping_role_id=99)
+
+        with self.assertRaisesRegex(ValueError, "not the configured"):
+            _configured_lfg_ping_role(guild, game, group)
+
+
+class ServiceURLSecurityTests(unittest.TestCase):
+    def test_accepts_https_service_url(self):
+        self.assertEqual(
+            validate_https_service_url(
+                "https://questlog.example/api/v1/", "SERVICE_URL"
+            ),
+            "https://questlog.example/api/v1",
+        )
+
+    def test_rejects_cleartext_credentials_and_url_metadata(self):
+        for value in (
+            "http://questlog.example/api",
+            "https://user:pass@questlog.example/api",
+            "https://questlog.example:8443/api",
+            "https://questlog.example/api?redirect=https://attacker.example",
+            "https://questlog.example/api#fragment",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    validate_https_service_url(value, "SERVICE_URL")
+
+    @patch("cogs.nominations.requests.post")
+    @patch(
+        "cogs.nominations.QUESTLOG_INTERNAL_API_URL",
+        "http://questlog.example",
+    )
+    def test_nomination_secret_is_not_sent_to_cleartext_url(self, post):
+        result = _call_close_nominations("2026-10")
+
+        post.assert_not_called()
+        self.assertIn("must be an HTTPS URL", result["error"])
+
+    @patch("cogs.nominations.requests.post")
+    def test_nomination_secret_request_does_not_follow_redirects(self, post):
+        post.return_value = SimpleNamespace(ok=False, text="redirect")
+
+        _call_close_nominations("2026-10")
+
+        self.assertIs(post.call_args.kwargs["allow_redirects"], False)
 
 
 class RoleRequestSecurityTests(unittest.TestCase):

@@ -51,8 +51,16 @@ from config import (
     logger,
 )
 from utils.guild_resources import resolve_guild_channel, resource_belongs_to_guild
+from utils.service_url import validate_https_service_url
 
-_BASE = QUESTLOG_INTERNAL_API_URL.rstrip('/')
+_BASE = validate_https_service_url(
+    QUESTLOG_INTERNAL_API_URL, "QUESTLOG_INTERNAL_API_URL"
+)
+_FLUXER_BASE = (
+    validate_https_service_url(FLUXER_API_URL, "FLUXER_API_URL")
+    if FLUXER_BOT_TOKEN
+    else ""
+)
 _RELAY_URL              = _BASE + '/api/internal/bridge/relay/'
 _PENDING_URL            = _BASE + '/api/internal/bridge/pending/discord/'
 _MSG_MAP_URL            = _BASE + '/api/internal/bridge/message-map/'
@@ -526,7 +534,8 @@ class BridgeCog(commands.Cog):
             if self._session and not self._session.closed:
                 async with self._session.post(
                     _RELAY_URL, json=payload, headers=_HEADERS,
-                    timeout=aiohttp.ClientTimeout(total=5)
+                    timeout=aiohttp.ClientTimeout(total=5),
+                    allow_redirects=False,
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
@@ -552,7 +561,8 @@ class BridgeCog(commands.Cog):
                         'channel_id': str(payload.channel_id),
                     },
                     headers=_HEADERS,
-                    timeout=aiohttp.ClientTimeout(total=5)
+                    timeout=aiohttp.ClientTimeout(total=5),
+                    allow_redirects=False,
                 ) as resp:
                     pass  # best-effort
         except Exception as e:
@@ -582,7 +592,8 @@ class BridgeCog(commands.Cog):
                         'new_content': new_content,
                     },
                     headers=_HEADERS,
-                    timeout=aiohttp.ClientTimeout(total=5)
+                    timeout=aiohttp.ClientTimeout(total=5),
+                    allow_redirects=False,
                 ) as resp:
                     pass
         except Exception as e:
@@ -614,7 +625,8 @@ class BridgeCog(commands.Cog):
                         'emoji': emoji_str,
                     },
                     headers=_HEADERS,
-                    timeout=aiohttp.ClientTimeout(total=5)
+                    timeout=aiohttp.ClientTimeout(total=5),
+                    allow_redirects=False,
                 ) as resp:
                     pass  # best-effort
         except Exception as e:
@@ -636,7 +648,8 @@ class BridgeCog(commands.Cog):
                 _TYPING_URL,
                 json={'platform': 'discord', 'channel_id': source_channel_id},
                 headers=_HEADERS,
-                timeout=aiohttp.ClientTimeout(total=3)
+                timeout=aiohttp.ClientTimeout(total=3),
+                allow_redirects=False,
             ) as resp:
                 if resp.status != 200:
                     return
@@ -652,7 +665,7 @@ class BridgeCog(commands.Cog):
                 continue
             try:
                 async with self._session.post(
-                    f'{FLUXER_API_URL.rstrip("/")}/channels/{fluxer_channel_id}/typing',
+                    f'{_FLUXER_BASE}/channels/{fluxer_channel_id}/typing',
                     headers={'Authorization': f'Bot {FLUXER_BOT_TOKEN}', 'Content-Type': 'application/json'},
                     timeout=aiohttp.ClientTimeout(total=3)
                 ) as _:
@@ -694,7 +707,8 @@ class BridgeCog(commands.Cog):
         try:
             async with self._session.get(
                 _PENDING_URL, headers=_HEADERS,
-                timeout=aiohttp.ClientTimeout(total=8)
+                timeout=aiohttp.ClientTimeout(total=8),
+                allow_redirects=False,
             ) as resp:
                 if resp.status != 200:
                     logger.warning(f"BridgeCog (Discord): pending fetch returned {resp.status} from {_PENDING_URL}")
@@ -851,7 +865,8 @@ class BridgeCog(commands.Cog):
                         'matrix_thread_event_id': matrix_thread_event_id,
                     },
                     headers=_HEADERS,
-                    timeout=aiohttp.ClientTimeout(total=5)
+                    timeout=aiohttp.ClientTimeout(total=5),
+                    allow_redirects=False,
                 ) as resp:
                     pass
         except Exception as e:
@@ -870,7 +885,8 @@ class BridgeCog(commands.Cog):
                         'channel_id': channel_id,
                     },
                     headers=_HEADERS,
-                    timeout=aiohttp.ClientTimeout(total=5)
+                    timeout=aiohttp.ClientTimeout(total=5),
+                    allow_redirects=False,
                 ) as resp:
                     pass
         except Exception as e:
@@ -883,7 +899,8 @@ class BridgeCog(commands.Cog):
         try:
             async with self._session.get(
                 _PENDING_REACTIONS_URL, headers=_HEADERS,
-                timeout=aiohttp.ClientTimeout(total=8)
+                timeout=aiohttp.ClientTimeout(total=8),
+                allow_redirects=False,
             ) as resp:
                 if resp.status != 200:
                     return
@@ -918,7 +935,8 @@ class BridgeCog(commands.Cog):
         try:
             async with self._session.get(
                 _PENDING_DELETIONS_URL, headers=_HEADERS,
-                timeout=aiohttp.ClientTimeout(total=8)
+                timeout=aiohttp.ClientTimeout(total=8),
+                allow_redirects=False,
             ) as resp:
                 if resp.status != 200:
                     return
@@ -960,7 +978,8 @@ class BridgeCog(commands.Cog):
         try:
             async with self._session.get(
                 _PENDING_EDITS_URL, headers=_HEADERS,
-                timeout=aiohttp.ClientTimeout(total=8)
+                timeout=aiohttp.ClientTimeout(total=8),
+                allow_redirects=False,
             ) as resp:
                 if resp.status != 200:
                     return

@@ -7,6 +7,8 @@ from typing import Optional
 
 import aiohttp
 
+from utils.service_url import validate_https_service_url
+
 
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 
@@ -45,16 +47,25 @@ def progression_idempotency_key(guild_id, event_type, evidence_id):
 
 class ProgressionAPIClient:
     def __init__(self, url, token, *, timeout_seconds=10, max_attempts=3):
-        self.url = str(url or "").rstrip("/") + "/"
+        raw_url = str(url or "").strip()
+        self.url = raw_url.rstrip("/") + "/" if raw_url else ""
         self.token = str(token or "").strip()
         self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         self.max_attempts = max(1, int(max_attempts))
         self._session: Optional[aiohttp.ClientSession] = None
         self.configuration_error = None
+        self.configuration_error_code = None
+        try:
+            self.url = validate_https_service_url(raw_url, "QUESTLOG_PROGRESSION_API_URL") + "/"
+        except ValueError as exc:
+            self.configuration_error = str(exc)
+            self.configuration_error_code = "invalid_configuration"
         if self.token.startswith("qlc_"):
             self.configuration_error = "Use the one-time qlp_ token, not the qlc_ client ID"
+            self.configuration_error_code = "invalid_token_format"
         elif self.token.lower().startswith("client:"):
             self.configuration_error = "Do not include a client: label in the token"
+            self.configuration_error_code = "invalid_token_format"
 
     @property
     def configured(self):
@@ -73,7 +84,10 @@ class ProgressionAPIClient:
         self, *, user_id, guild_id, event_type, evidence_id, occurred_at
     ):
         if self.configuration_error:
-            raise ProgressionAPIError("invalid_token_format", self.configuration_error)
+            raise ProgressionAPIError(
+                self.configuration_error_code or "invalid_configuration",
+                self.configuration_error,
+            )
         if not self.configured:
             raise ProgressionAPIError("client_not_configured", "Progression API is not configured")
 
