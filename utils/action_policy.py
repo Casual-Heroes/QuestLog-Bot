@@ -12,6 +12,8 @@ import json
 import time
 from collections.abc import Mapping
 
+from utils.role_security import DANGEROUS_AUTOMATIC_ROLE_PERMISSIONS
+
 
 class ActionPolicyError(ValueError):
     """Raised when a legacy action is unsafe or no longer authorized."""
@@ -72,17 +74,7 @@ ROLE_ACTIONS = frozenset({
 MODERATION_ACTIONS = frozenset({
     "member_kick", "member_ban", "member_timeout", "member_untimeout",
 })
-DANGEROUS_ROLE_PERMISSIONS = frozenset({
-    "administrator",
-    "manage_guild",
-    "manage_roles",
-    "manage_channels",
-    "kick_members",
-    "ban_members",
-    "moderate_members",
-    "manage_webhooks",
-    "mention_everyone",
-})
+DANGEROUS_ROLE_PERMISSIONS = DANGEROUS_AUTOMATIC_ROLE_PERMISSIONS
 
 
 def _action_name(action_type) -> str:
@@ -132,7 +124,9 @@ def _validate_role_template(payload: Mapping) -> None:
             )
 
 
-def _validate_role_target(guild, actor, payload: Mapping) -> None:
+def _validate_role_target(
+    guild, actor, payload: Mapping, *, reject_dangerous: bool = False
+) -> None:
     role_id = payload.get("role_id")
     if role_id is None:
         raise ActionPolicyError("Role action is missing role_id")
@@ -143,6 +137,16 @@ def _validate_role_target(guild, actor, payload: Mapping) -> None:
         raise ActionPolicyError("Default and integration-managed roles cannot be changed")
     if getattr(getattr(role, "permissions", None), "administrator", False):
         raise ActionPolicyError("Administrator roles cannot be assigned through the legacy queue")
+    if reject_dangerous:
+        dangerous = sorted(
+            name for name in DANGEROUS_ROLE_PERMISSIONS
+            if getattr(getattr(role, "permissions", None), name, False)
+        )
+        if dangerous:
+            raise ActionPolicyError(
+                "Delegated custom administrators cannot assign privileged roles: "
+                + ", ".join(dangerous)
+            )
 
     bot_member = getattr(guild, "me", None)
     if bot_member is None or not _outranks(bot_member, type("RoleTarget", (), {
@@ -272,6 +276,20 @@ def authorize_legacy_action(
 
     _validate_member_targets(guild, actor, payload, action_name)
     if action_name in ROLE_ACTIONS:
-        _validate_role_target(guild, actor, payload)
+        native_role_authority = (
+            _is_owner(guild, actor)
+            or administrator
+            or bool(getattr(permissions, required_permission, False))
+        )
+        _validate_role_target(
+            guild,
+            actor,
+            payload,
+            reject_dangerous=(
+                custom_admin
+                and not native_role_authority
+                and action_name in {"role_add", "role_bulk_add"}
+            ),
+        )
     if action_name == "role_create":
         _validate_role_template(payload)

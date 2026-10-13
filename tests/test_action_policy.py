@@ -14,11 +14,11 @@ class FakePermissions:
 
 
 class FakeRole:
-    def __init__(self, role_id, position, *, administrator=False, managed=False):
+    def __init__(self, role_id, position, *, administrator=False, managed=False, **permissions):
         self.id = role_id
         self.position = position
         self.managed = managed
-        self.permissions = FakePermissions(administrator=administrator)
+        self.permissions = FakePermissions(administrator=administrator, **permissions)
 
     def __gt__(self, other):
         return self.position > other.position
@@ -126,6 +126,51 @@ class LegacyActionPolicyTests(unittest.TestCase):
         self.guild.roles[dangerous.id] = dangerous
         with self.assertRaisesRegex(ActionPolicyError, "Administrator roles"):
             self.authorize("role_add", {"user_id": 3, "role_id": 20})
+
+    def test_custom_admin_without_native_permission_cannot_assign_dangerous_role(self):
+        delegated_role = FakeRole(77, 30)
+        delegated = FakeMember(4, delegated_role, roles=[delegated_role])
+        dangerous = FakeRole(20, 20, manage_roles=True)
+        self.guild.members[4] = delegated
+        self.guild.roles[20] = dangerous
+
+        with self.assertRaisesRegex(ActionPolicyError, "privileged roles"):
+            self.authorize(
+                "role_add",
+                {"user_id": 3, "role_id": 20},
+                actor_id=4,
+                custom_admin_role_ids=[77],
+            )
+
+    def test_custom_admin_can_remove_dangerous_role(self):
+        delegated_role = FakeRole(77, 30)
+        delegated = FakeMember(4, delegated_role, roles=[delegated_role])
+        dangerous = FakeRole(20, 20, manage_roles=True)
+        self.guild.members[4] = delegated
+        self.guild.roles[20] = dangerous
+
+        self.authorize(
+            "role_remove",
+            {"user_id": 3, "role_id": 20},
+            actor_id=4,
+            custom_admin_role_ids=[77],
+        )
+
+    def test_native_role_manager_retains_normal_hierarchy_behavior(self):
+        delegated_role = FakeRole(77, 30)
+        delegated = FakeMember(
+            4, delegated_role, roles=[delegated_role], manage_roles=True
+        )
+        dangerous = FakeRole(20, 20, manage_roles=True)
+        self.guild.members[4] = delegated
+        self.guild.roles[20] = dangerous
+
+        self.authorize(
+            "role_add",
+            {"user_id": 3, "role_id": 20},
+            actor_id=4,
+            custom_admin_role_ids=[77],
+        )
 
     def test_role_template_cannot_create_privileged_role(self):
         with self.assertRaisesRegex(ActionPolicyError, "administrator"):

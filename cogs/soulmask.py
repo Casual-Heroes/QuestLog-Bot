@@ -26,9 +26,15 @@ from discord.ext import commands
 from sqlalchemy import text as sa_text
 
 from config import db_session_scope, logger, get_debug_guilds
+from utils.guild_resources import resolve_guild_channel
+from utils.amp_security import validate_amp_url
 
 # ---- AMP credentials ----
-AMP_URL      = os.getenv('AMP_URL', '')
+try:
+    AMP_URL = validate_amp_url(os.getenv('AMP_URL', ''))
+except ValueError as exc:
+    logger.critical('SoulmaskCog: %s; AMP-backed features are disabled', exc)
+    AMP_URL = ''
 AMP_USER     = os.getenv('AMP_USER', '')
 AMP_PASSWORD = os.getenv('AMP_PASSWORD', '')
 
@@ -96,6 +102,8 @@ def _next_mode_change(instance_cfg: dict, now: datetime.datetime):
 # ---------------------------------------------------------------------------
 
 async def _get_amp_instance(instance_name: str):
+    if not AMP_URL or not AMP_USER or not AMP_PASSWORD:
+        return None
     try:
         from ampapi.dataclass import APIParams
         from ampapi.bridge import Bridge
@@ -180,15 +188,15 @@ def _status_embed(instance_name: str, mode_name: str, mode: dict,
 # DB helper - get announce channel for a guild
 # ---------------------------------------------------------------------------
 
-def _get_announce_channels() -> list[int]:
-    """Return all configured soulmask announce channel IDs."""
+def _get_announce_channels() -> list[tuple[int, int]]:
+    """Return guild-bound Soulmask announcement destinations."""
     try:
         with db_session_scope() as db:
             rows = db.execute(sa_text(
-                "SELECT soulmask_announce_channel_id FROM guilds "
+                "SELECT guild_id, soulmask_announce_channel_id FROM guilds "
                 "WHERE soulmask_announce_channel_id IS NOT NULL AND bot_present = 1"
             )).fetchall()
-            return [r[0] for r in rows]
+            return [(r[0], r[1]) for r in rows]
     except Exception as e:
         logger.error(f'SoulmaskCog: DB error: {e}')
         return []
@@ -243,8 +251,8 @@ class SoulmaskCog(commands.Cog):
                     logger.info(f'SoulmaskCog: applying [{mode_name}] to {instance_name}')
 
                     # Announce upcoming change
-                    for ch_id in _get_announce_channels():
-                        channel = self.bot.get_channel(ch_id)
+                    for guild_id, ch_id in _get_announce_channels():
+                        channel = await resolve_guild_channel(self.bot, guild_id, ch_id)
                         if channel:
                             try:
                                 await channel.send(embed=_mode_embed(instance_name, mode_name, mode, 'Activating'))
@@ -259,8 +267,8 @@ class SoulmaskCog(commands.Cog):
                     # Confirm
                     label = mode.get('label', mode_name.title())
                     result = f'{ok} coefficients applied' + (f', {fail} failed' if fail else '')
-                    for ch_id in _get_announce_channels():
-                        channel = self.bot.get_channel(ch_id)
+                    for guild_id, ch_id in _get_announce_channels():
+                        channel = await resolve_guild_channel(self.bot, guild_id, ch_id)
                         if channel:
                             try:
                                 await channel.send(f'**{label}** mode is now active on `{instance_name}`. {result}.')
@@ -274,9 +282,15 @@ class SoulmaskCog(commands.Cog):
 
     # ---- Slash commands ----
 
-    sm = SlashCommandGroup('sm', 'Soulmask server management', guild_ids=get_debug_guilds())
+    sm = SlashCommandGroup(
+        'sm',
+        'Soulmask server management',
+        guild_ids=get_debug_guilds(),
+        default_member_permissions=discord.Permissions(administrator=True),
+    )
 
     @sm.command(name='status', description='Show current mode and next scheduled change')
+    @commands.has_permissions(administrator=True)
     async def slash_status(self, ctx: discord.ApplicationContext):
         schedule = _load_schedule()
         instances = schedule.get('instances', {})
@@ -296,6 +310,7 @@ class SoulmaskCog(commands.Cog):
         await ctx.respond(embeds=embeds[:3])  # Discord max 3 embeds per message
 
     @sm.command(name='mode', description='Manually apply a mode to an instance')
+    @commands.has_permissions(administrator=True)
     async def slash_mode(
         self, ctx: discord.ApplicationContext,
         instance: discord.Option(str, 'Instance: sunken or verdant', choices=['sunken', 'verdant']),
@@ -322,6 +337,7 @@ class SoulmaskCog(commands.Cog):
         await ctx.send_followup(result)
 
     @sm.command(name='reset', description='Reset all coefficients to baseline')
+    @commands.has_permissions(administrator=True)
     async def slash_reset(
         self, ctx: discord.ApplicationContext,
         instance: discord.Option(str, 'Instance: sunken or verdant', choices=['sunken', 'verdant']),
@@ -340,6 +356,7 @@ class SoulmaskCog(commands.Cog):
         await ctx.respond(f'Baseline restored on `{instance_name}`. {result}.')
 
     @sm.command(name='coefficients', description='Show active coefficients for an instance')
+    @commands.has_permissions(administrator=True)
     async def slash_coefficients(
         self, ctx: discord.ApplicationContext,
         instance: discord.Option(str, 'Instance: sunken or verdant', choices=['sunken', 'verdant']),
@@ -363,12 +380,14 @@ class SoulmaskCog(commands.Cog):
         await ctx.respond(f'**{instance_name}** — {mode_name} mode:\n{lines}', ephemeral=True)
 
     @sm.command(name='reload', description='Reload schedule.json without restarting')
+    @commands.has_permissions(administrator=True)
     async def slash_reload(self, ctx: discord.ApplicationContext):
         schedule = _load_schedule()
         count = len(schedule.get('instances', {}))
         await ctx.respond(f'Schedule reloaded. {count} instance(s) configured.', ephemeral=True)
 
     @sm.command(name='schedule', description='Show the full weekly schedule')
+    @commands.has_permissions(administrator=True)
     async def slash_schedule(self, ctx: discord.ApplicationContext):
         schedule = _load_schedule()
         instances = schedule.get('instances', {})

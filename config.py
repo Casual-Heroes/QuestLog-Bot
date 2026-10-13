@@ -218,8 +218,43 @@ intents.voice_states = True
 intents.typing = True
 
 
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    """Read an integer setting without allowing unbounded memory allocation."""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s; using %s", name, default)
+        return default
+    if value < minimum or value > maximum:
+        logger.warning(
+            "%s must be between %s and %s; using %s",
+            name,
+            minimum,
+            maximum,
+            default,
+        )
+        return default
+    return value
+
+
+# Pycord's default is only 1,000 messages across every connected guild.  Audit
+# deletion events contain no message body, so a bounded in-memory cache is the
+# only way to retain author/content context without permanently archiving every
+# message.  The raw audit listener still records metadata after cache misses.
+DISCORD_MESSAGE_CACHE_SIZE = _bounded_env_int(
+    "DISCORD_MESSAGE_CACHE_SIZE",
+    default=25_000,
+    minimum=1_000,
+    maximum=100_000,
+)
+
+
 # start the bot
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    max_messages=DISCORD_MESSAGE_CACHE_SIZE,
+)
 
 
 # Bot configuration

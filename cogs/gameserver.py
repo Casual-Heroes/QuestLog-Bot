@@ -22,16 +22,97 @@ from discord.ext import commands, tasks
 from sqlalchemy import text
 
 from config import logger, db_session_scope
+from utils.amp_registry import (
+    REGISTRY_PATH as AMP_GUILD_REGISTRY_PATH,
+    parse_legacy_amp_guild_bindings,
+    read_secure_amp_registry_policy,
+)
+from utils.guild_resources import resolve_guild_channel, resource_belongs_to_guild
+from utils.amp_security import validate_amp_url
 
 # Suppress noisy AMP library logs
 import logging
 logging.getLogger('ampapi').setLevel(logging.CRITICAL)
 
 # ---- AMP credentials ----
-AMP_URL      = os.getenv('AMP_URL', '')
+try:
+    AMP_URL = validate_amp_url(os.getenv('AMP_URL', ''))
+except ValueError as exc:
+    logger.critical('[gameserver] %s; AMP-backed features are disabled', exc)
+    AMP_URL = ''
 AMP_USER     = os.getenv('AMP_USER', '')
 AMP_PASSWORD = os.getenv('AMP_PASSWORD', '')
-AMP_SERVER_PASSWORD_NODE = 'Meta.GenericModule.ServerPassword'
+AMP_SERVER_PASSWORD_NODE = 'Meta.GenericModule.ServerPassword'  # pragma: allowlist secret
+
+
+def _load_amp_guild_bindings(raw: str | None) -> dict[str, frozenset[int]]:
+    """Compatibility wrapper for the deprecated environment mapping."""
+    return parse_legacy_amp_guild_bindings(raw)
+
+
+try:
+    AMP_GUILD_BINDINGS = _load_amp_guild_bindings(
+        os.getenv('WARDEN_AMP_GUILD_BINDINGS')
+    )
+except ValueError as exc:
+    logger.critical('[gameserver] %s; AMP-backed Discord delivery is disabled', exc)
+    AMP_GUILD_BINDINGS = {}
+
+_AMP_REGISTRY_SEEN = False
+_AMP_REGISTRY_LAST_ERROR = None
+
+
+def _current_amp_guild_bindings() -> dict[str, frozenset[int]]:
+    """Hot-reload the authoritative registry, failing closed after cutover."""
+    global _AMP_REGISTRY_SEEN, _AMP_REGISTRY_LAST_ERROR
+    try:
+        policy = read_secure_amp_registry_policy(AMP_GUILD_REGISTRY_PATH)
+        if policy is None:
+            if _AMP_REGISTRY_SEEN:
+                raise ValueError('AMP guild registry disappeared after it was loaded')
+            return AMP_GUILD_BINDINGS
+        _AMP_REGISTRY_SEEN = True
+        _AMP_REGISTRY_LAST_ERROR = None
+        return policy.bindings
+    except ValueError as exc:
+        error = str(exc)
+        if error != _AMP_REGISTRY_LAST_ERROR:
+            logger.critical('[gameserver] %s; AMP-backed Discord delivery is disabled', error)
+            _AMP_REGISTRY_LAST_ERROR = error
+        return {}
+
+
+def _amp_public_password_is_authorized(cfg: dict) -> bool:
+    """Require an explicit root-owned grant before public password disclosure."""
+    try:
+        policy = read_secure_amp_registry_policy(AMP_GUILD_REGISTRY_PATH)
+        if policy is None:
+            return False
+        instance_name = str(cfg['instance_name'])
+        guild_id = int(cfg['discord_guild_id'])
+        return (
+            guild_id in policy.bindings.get(instance_name, ())
+            and guild_id in policy.public_passwords.get(instance_name, ())
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+if (AMP_URL or AMP_USER or AMP_PASSWORD) and not _current_amp_guild_bindings():
+    logger.critical(
+        '[gameserver] AMP guild registry and migration fallback are empty; '
+        'AMP-backed Discord delivery is disabled'
+    )
+
+
+def _amp_config_is_authorized(cfg: dict) -> bool:
+    """Check a DB row against ownership configured outside the shared database."""
+    try:
+        return int(cfg['discord_guild_id']) in _current_amp_guild_bindings().get(
+            str(cfg['instance_name']),
+            (),
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
 
 # ---- AMP instance paths (same as Fluxer bot) ----
 from pathlib import Path
@@ -40,6 +121,22 @@ _extra_raw = os.getenv('AMP_INSTANCES_EXTRA', '')
 AMP_INSTANCES_PATHS: list[Path] = [AMP_INSTANCES_BASE] + [
     Path(p.strip()) for p in _extra_raw.split(':') if p.strip()
 ]
+
+
+def _authorized_amp_log_dir(cfg: dict) -> Path | None:
+    """Return a log directory only when it stays inside the bound instance root."""
+    if not _amp_config_is_authorized(cfg) or not cfg.get('amp_log_dir'):
+        return None
+    try:
+        candidate = Path(cfg['amp_log_dir']).resolve(strict=False)
+        instance_name = str(cfg['instance_name'])
+        for base in AMP_INSTANCES_PATHS:
+            instance_root = (base / instance_name).resolve(strict=False)
+            if candidate == instance_root or instance_root in candidate.parents:
+                return candidate
+    except (OSError, RuntimeError, TypeError, ValueError):
+        pass
+    return None
 
 # ---- Game color / emoji maps (1:1 with Fluxer) ----
 GAME_COLORS = {
@@ -135,9 +232,9 @@ async def _get_amp_server_password(instance_name: str) -> str | None:
         return password if found else None
     except Exception as e:
         logger.warning(
-            '[gameserver] AMP password lookup failed for %s: %s',
+            '[gameserver] AMP protected-setting lookup failed for %s: %s',
             instance_name,
-            e,
+            type(e).__name__,
         )
         return None
 
@@ -205,7 +302,8 @@ async def _get_server_status(instance_name: str, public_ip: str | None = None) -
                     game_port.get('ip') or game_port.get('hostname')
                     or game_port.get('address') or game_port.get('Address')
                 )
-                if not raw_ip or raw_ip in ('0.0.0.0', '::'):
+                # Comparison with wildcard addresses, not a listening socket.
+                if not raw_ip or raw_ip in ('0.0.0.0', '::'):  # nosec B104
                     try:
                         raw_ip = _requests.get('https://ifconfig.me', timeout=5).text.strip()
                     except Exception:
@@ -227,7 +325,23 @@ def _load_all_configs() -> list[dict]:
             rows = db.execute(text(
                 "SELECT * FROM gamebot_configs WHERE configured = 1 AND discord_guild_id IS NOT NULL"
             )).fetchall()
-            return [dict(r._mapping) for r in rows]
+            configs = [dict(r._mapping) for r in rows]
+            # The legacy schema still has a plaintext password column used by
+            # another service. Warden deliberately drops it at the boundary and
+            # reads the current value from AMP only when a private channel needs it.
+            for config in configs:
+                config.pop('server_password', None)
+            authorized = [
+                config for config in configs
+                if _amp_config_is_authorized(config)
+            ]
+            rejected = len(configs) - len(authorized)
+            if rejected:
+                logger.error(
+                    '[gameserver] quarantined %s config row(s) without an authorized AMP guild binding',
+                    rejected,
+                )
+            return authorized
     except Exception as e:
         logger.error(f'[gameserver] _load_all_configs: {e}')
         return []
@@ -362,50 +476,46 @@ def _parse_stats_message_map(raw) -> dict:
     return {}
 
 
-def _update_discord_message_id(instance_name: str, channel_id: str, msg_id: str | None):
+def _update_discord_message_id(
+    instance_name: str,
+    guild_id: int,
+    channel_id: str,
+    msg_id: str | None,
+):
     """Update just this channel's entry in the per-channel message-id map, so
     other channels' tracked messages are left untouched."""
     try:
         with db_session_scope() as db:
             row = db.execute(text(
-                "SELECT discord_stats_message_id FROM gamebot_configs WHERE instance_name=:n"
-            ), {'n': instance_name}).fetchone()
+                "SELECT discord_stats_message_id FROM gamebot_configs "
+                "WHERE instance_name=:n AND discord_guild_id=:g"
+            ), {'n': instance_name, 'g': guild_id}).fetchone()
+            if row is None:
+                logger.warning(
+                    '[gameserver] refusing message-map update for unbound instance %s guild %s',
+                    instance_name,
+                    guild_id,
+                )
+                return
             msg_map = _parse_stats_message_map(row[0] if row else None)
             if msg_id:
                 msg_map[channel_id] = msg_id
             else:
                 msg_map.pop(channel_id, None)
             db.execute(text(
-                "UPDATE gamebot_configs SET discord_stats_message_id=:mid WHERE instance_name=:n"
-            ), {'mid': json.dumps(msg_map), 'n': instance_name})
+                "UPDATE gamebot_configs SET discord_stats_message_id=:mid "
+                "WHERE instance_name=:n AND discord_guild_id=:g"
+            ), {'mid': json.dumps(msg_map), 'n': instance_name, 'g': guild_id})
     except Exception as e:
         logger.error(f'[gameserver] _update_discord_message_id: {e}')
 
 
-def _update_server_password(instance_name: str, password: str):
-    """Persist an authoritative AMP password in the shared bot config."""
-    try:
-        with db_session_scope() as db:
-            db.execute(text(
-                "UPDATE gamebot_configs SET server_password=:pw WHERE instance_name=:n"
-            ), {'pw': password, 'n': instance_name})
-    except Exception as e:
-        logger.error(f'[gameserver] _update_server_password: {e}')
-
-
 async def _resolve_server_password(cfg: dict) -> str | None:
-    """Return the cached password, or self-heal it directly from AMP."""
-    cached = cfg.get('server_password')
-    if cached:
-        return str(cached)
-    if not cfg.get('show_password'):
+    """Read the password from AMP without copying it into the shared database."""
+    if not cfg.get('show_password') or not _amp_config_is_authorized(cfg):
         return None
-
     password = await _get_amp_server_password(cfg['instance_name'])
-    if password is not None:
-        _update_server_password(cfg['instance_name'], password)
-        cfg['server_password'] = password
-    return password
+    return password if _amp_config_is_authorized(cfg) else None
 
 
 # ---------------------------------------------------------------------------
@@ -510,7 +620,9 @@ def read_ingame_server_name(instance_name: str, game_type: str) -> str | None:
 # Embed builder (1:1 port of Fluxer build_serverinfo_embed)
 # ---------------------------------------------------------------------------
 
-async def build_serverinfo_embed(cfg: dict) -> discord.Embed:
+async def build_serverinfo_embed(cfg: dict, *, include_password: bool = True) -> discord.Embed:
+    if not _amp_config_is_authorized(cfg):
+        raise PermissionError('AMP instance is not authorized for this Discord guild')
     instance_name = cfg['instance_name']
     game_type     = cfg.get('game_type', 'Game Server')
     display_name  = cfg.get('server_display_name') or game_type
@@ -548,9 +660,9 @@ async def build_serverinfo_embed(cfg: dict) -> discord.Embed:
         connect = f"{status['ip']}:{status['port']}" if status.get('port') else status['ip']
         embed.add_field(name='IP Address', value=f"```{connect}```", inline=False)
 
-    # Password. If the DB cache is blank, recover directly from AMP and
-    # self-heal the shared cache used by both Discord and Fluxer.
-    server_password = await _resolve_server_password(cfg)
+    # Passwords are allowed only in channels hidden from @everyone. The caller
+    # determines channel visibility before requesting this field.
+    server_password = await _resolve_server_password(cfg) if include_password else None
     if server_password:
         embed.add_field(name='Server Password', value=f"```{server_password}```", inline=False)
 
@@ -599,6 +711,8 @@ async def build_serverinfo_embed(cfg: dict) -> discord.Embed:
     embed.set_footer(text='Powered by QuestLog - Casual Heroes')
     # Set timestamp after construction so it reflects last-updated time on each edit
     embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
+    if not _amp_config_is_authorized(cfg):
+        raise PermissionError('AMP authorization was revoked while building the embed')
     return embed
 
 
@@ -666,13 +780,37 @@ class GameServerCog(commands.Cog):
         but Discord-only and forwarding-only (no join/leave regex processing here)."""
         try:
             configs = _load_all_configs()
+            active_log_dirs = {
+                cfg['instance_name']: str(log_dir)
+                for cfg in configs
+                if cfg.get('alert_live_logs')
+                and cfg.get('live_log_discord_channel_id')
+                and (log_dir := _authorized_amp_log_dir(cfg)) is not None
+            }
+            for instance_name, watcher in list(self._log_watchers.items()):
+                if active_log_dirs.get(instance_name) != watcher.log_dir:
+                    watcher.close()
+                    del self._log_watchers[instance_name]
             for cfg in configs:
                 if not cfg.get('alert_live_logs') or not cfg.get('live_log_discord_channel_id'):
                     continue
+                if not _amp_config_is_authorized(cfg):
+                    continue
                 instance_name = cfg['instance_name']
-                log_dir = cfg.get('amp_log_dir', '')
+                channel_id = cfg['live_log_discord_channel_id']
+                guild_id = cfg['discord_guild_id']
+                channel = await resolve_guild_channel(self.bot, guild_id, channel_id)
+                if channel is None:
+                    logger.warning(
+                        '[gameserver] watch_logs channel %s is not available in guild %s for %s',
+                        channel_id,
+                        guild_id,
+                        instance_name,
+                    )
+                    continue
+                log_dir = _authorized_amp_log_dir(cfg)
                 try:
-                    log_dir_exists = bool(log_dir) and Path(log_dir).exists()
+                    log_dir_exists = bool(log_dir) and log_dir.exists()
                 except PermissionError:
                     logger.warning(f'[gameserver] watch_logs: permission denied on {log_dir} - fix with: sudo chmod o+rx {log_dir}')
                     continue
@@ -680,7 +818,7 @@ class GameServerCog(commands.Cog):
                     continue
                 if instance_name not in self._log_watchers:
                     try:
-                        self._log_watchers[instance_name] = LogWatcher(log_dir)
+                        self._log_watchers[instance_name] = LogWatcher(str(log_dir))
                         logger.info(f'[gameserver] LogWatcher started for {instance_name}')
                     except Exception as e:
                         logger.error(f'[gameserver] LogWatcher init {instance_name}: {e}')
@@ -696,16 +834,14 @@ class GameServerCog(commands.Cog):
                 filtered = _filter_live_log_lines(lines)
                 if not filtered:
                     continue
-                channel_id = cfg['live_log_discord_channel_id']
-                try:
-                    channel = self.bot.get_channel(int(channel_id))
-                    if channel is None:
-                        channel = await self.bot.fetch_channel(int(channel_id))
-                except Exception as e:
-                    logger.warning(f'[gameserver] watch_logs channel {channel_id} not found for {instance_name}: {e}')
-                    continue
                 for chunk in _chunk_log_lines(filtered):
                     try:
+                        if not _amp_config_is_authorized(cfg):
+                            logger.warning(
+                                '[gameserver] AMP authorization revoked before log delivery for %s',
+                                instance_name,
+                            )
+                            break
                         await channel.send(f'```\n{chunk}\n```')
                     except Exception as e:
                         logger.error(f'[gameserver] watch_logs send {instance_name}: {e}')
@@ -719,45 +855,105 @@ class GameServerCog(commands.Cog):
         logger.info('[gameserver] live log watcher started (3s poll interval)')
 
     async def _refresh_one(self, cfg: dict):
+        if not _amp_config_is_authorized(cfg):
+            logger.warning(
+                '[gameserver] blocked unbound AMP instance %r for guild %r',
+                cfg.get('instance_name'),
+                cfg.get('discord_guild_id'),
+            )
+            return
         instance_name = cfg['instance_name']
+        guild_id = cfg['discord_guild_id']
         channel_ids   = _parse_stats_channel_ids(cfg.get('discord_stats_channel_id'))
         if not channel_ids:
             return
 
         msg_map = _parse_stats_message_map(cfg.get('discord_stats_message_id'))
-        embed = await build_serverinfo_embed(cfg)
-        fingerprint = _embed_fingerprint(embed)
+        embeds = {}
 
         # Each selected channel gets its own live-edited message, tracked independently -
         # one channel's permission/404 failure must not stop the others from updating.
         for channel_id in channel_ids:
+            channel = await resolve_guild_channel(self.bot, guild_id, channel_id)
+            if channel is None:
+                logger.warning(
+                    '[gameserver] channel %s is not available in guild %s for %s',
+                    channel_id,
+                    guild_id,
+                    instance_name,
+                )
+                continue
+
+            include_password = False
+            if isinstance(channel, discord.abc.GuildChannel):
+                everyone = channel.guild.default_role
+                include_password = not channel.permissions_for(everyone).view_channel
+            include_password = include_password or _amp_public_password_is_authorized(cfg)
+            if cfg.get('show_password') and not include_password:
+                logger.warning(
+                    '[gameserver] sensitive field hidden in public channel %s',
+                    channel_id,
+                )
+
+            if include_password not in embeds:
+                embed = await build_serverinfo_embed(
+                    cfg,
+                    include_password=include_password,
+                )
+                embeds[include_password] = (embed, _embed_fingerprint(embed))
+            embed, fingerprint = embeds[include_password]
+
             cache_key = (instance_name, channel_id)
             if self._last_fingerprint.get(cache_key) == fingerprint:
                 continue  # content unchanged since last edit - skip the API call entirely
-            ok = await self._refresh_one_channel(instance_name, channel_id, msg_map.get(channel_id), embed)
+            ok = await self._refresh_one_channel(
+                cfg,
+                channel_id,
+                msg_map.get(channel_id),
+                embed,
+                channel=channel,
+            )
             if ok:
                 self._last_fingerprint[cache_key] = fingerprint
             # else: leave the cached fingerprint as-is, so a real content change is
             # retried next cycle instead of being silently swallowed by the cache.
 
-    async def _refresh_one_channel(self, instance_name: str, channel_id: str, old_msg_id: str | None, embed) -> bool:
-        channel = self.bot.get_channel(int(channel_id))
+    async def _refresh_one_channel(
+        self,
+        cfg: dict,
+        channel_id: str,
+        old_msg_id: str | None,
+        embed,
+        *,
+        channel=None,
+    ) -> bool:
+        instance_name = cfg['instance_name']
+        guild_id = cfg['discord_guild_id']
+        if not _amp_config_is_authorized(cfg):
+            return False
+        if channel is not None and not resource_belongs_to_guild(channel, guild_id, channel_id):
+            channel = None
+        channel = channel or await resolve_guild_channel(self.bot, guild_id, channel_id)
         if channel is None:
-            try:
-                channel = await self.bot.fetch_channel(int(channel_id))
-            except Exception as e:
-                logger.warning(f'[gameserver] channel {channel_id} not found for {instance_name}: {e}')
-                return False
+            logger.warning(
+                '[gameserver] channel %s is not available in guild %s for %s',
+                channel_id,
+                guild_id,
+                instance_name,
+            )
+            return False
 
         if old_msg_id:
             try:
                 msg = await channel.fetch_message(int(old_msg_id))
+                if not _amp_config_is_authorized(cfg):
+                    return False
                 await msg.edit(embed=embed)
                 logger.debug(f'[gameserver] edited embed for {instance_name} channel={channel_id} msg={old_msg_id}')
                 return True
             except discord.NotFound:
                 logger.warning(f'[gameserver] message {old_msg_id} not found for {instance_name} channel={channel_id} - posting fresh')
-                _update_discord_message_id(instance_name, channel_id, None)
+                _update_discord_message_id(instance_name, guild_id, channel_id, None)
                 old_msg_id = None
             except discord.Forbidden as e:
                 logger.warning(f'[gameserver] no permission to edit msg {old_msg_id} for {instance_name} channel={channel_id}: {e}')
@@ -769,8 +965,10 @@ class GameServerCog(commands.Cog):
 
         # No existing message (first run or 404 cleared it) - post a new one
         try:
+            if not _amp_config_is_authorized(cfg):
+                return False
             msg = await channel.send(embed=embed)
-            _update_discord_message_id(instance_name, channel_id, str(msg.id))
+            _update_discord_message_id(instance_name, guild_id, channel_id, str(msg.id))
             logger.info(f'[gameserver] posted new embed for {instance_name} msg={msg.id} channel={channel_id}')
             return True
         except discord.Forbidden as e:

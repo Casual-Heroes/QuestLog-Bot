@@ -24,6 +24,7 @@ import json
 import time
 import asyncio
 import hashlib
+import re
 from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import urlsplit
@@ -45,6 +46,24 @@ STAFF_BOARD_CONFIG_KEY = "community_staff_board_v1"
 STAFF_BOARD_MESSAGE_KEY = "community_staff_board"
 TERMINAL_DELIVERY_STATUSES = {
     "delivered", "permission_missing", "destination_missing", "failed"
+}
+LINK_BUTTON_SPECS = {
+    "steam": ("Steam", "store.steampowered.com", re.compile(r"^/app/[1-9][0-9]*/?$")),
+    "play_together": (
+        "Play Together",
+        "questlog.casual-heroes.com",
+        re.compile(r"^/play-together/request/[1-9][0-9]*/?$"),
+    ),
+    "questlog": (
+        "QuestLog",
+        "questlog.casual-heroes.com",
+        re.compile(r"^(?:/|/u/[^/]+/?)$"),
+    ),
+}
+LINK_FIELD_KINDS = {
+    "Steam": "steam",
+    "Play Together": "play_together",
+    "QuestLog": "questlog",
 }
 
 
@@ -97,6 +116,40 @@ def _discord_http_url(value: Any) -> Optional[str]:
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         return None
     return candidate
+
+
+def _validated_link_buttons(embed_data: dict) -> list[tuple[str, str, str]]:
+    """Return known, server-generated HTTPS buttons from an untrusted payload."""
+    validated = []
+    seen = set()
+    for item in embed_data.get("buttons") or []:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "")
+        url = str(item.get("url") or "").strip()
+        spec = LINK_BUTTON_SPECS.get(kind)
+        if not spec or kind in seen or len(url) > 2048:
+            continue
+        label, expected_host, path_pattern = spec
+        try:
+            parsed = urlsplit(url)
+            port = parsed.port
+        except (TypeError, ValueError):
+            continue
+        if (
+            parsed.scheme.lower() != "https"
+            or (parsed.hostname or "").lower() != expected_host
+            or parsed.username is not None
+            or parsed.password is not None
+            or port not in (None, 443)
+            or not path_pattern.fullmatch(parsed.path)
+        ):
+            continue
+        seen.add(kind)
+        validated.append((kind, label, url))
+        if len(validated) == 3:
+            break
+    return validated
 
 
 def _canonical_actor_id(discord_user_id: int) -> Optional[int]:
@@ -999,6 +1052,9 @@ class NetworkBroadcastsCog(commands.Cog):
 
     def _build_embed(self, embed_data: dict) -> discord.Embed:
         """Build a discord.Embed from a payload dict."""
+        button_kinds = {
+            kind for kind, _label, _url in _validated_link_buttons(embed_data)
+        }
         embed_url = _discord_http_url(embed_data.get("url"))
         if embed_data.get("url") and not embed_url:
             logger.warning(
@@ -1011,6 +1067,8 @@ class NetworkBroadcastsCog(commands.Cog):
             color=embed_data.get("color", BRAND_COLOR),
         )
         for field in embed_data.get("fields", []):
+            if LINK_FIELD_KINDS.get(field.get("name")) in button_kinds:
+                continue
             embed.add_field(
                 name=field.get("name", ""),
                 value=field.get("value", ""),
@@ -1027,8 +1085,34 @@ class NetworkBroadcastsCog(commands.Cog):
         return embed
 
     @staticmethod
-    def _staff_board_state_key(guild_id):
-        return f"{STAFF_BOARD_MESSAGE_KEY}_discord_{guild_id}"
+    def _build_link_view(embed_data: dict) -> Optional[discord.ui.View]:
+        buttons = _validated_link_buttons(embed_data)
+        if not buttons:
+            return None
+        view = discord.ui.View(timeout=None)
+        for _kind, label, url in buttons:
+            view.add_item(discord.ui.Button(
+                style=discord.ButtonStyle.link,
+                label=label,
+                url=url,
+            ))
+        return view
+
+    @staticmethod
+    def _tracked_message_state_key(guild_id, message_key):
+        if message_key == STAFF_BOARD_MESSAGE_KEY:
+            return f"{STAFF_BOARD_MESSAGE_KEY}_discord_{guild_id}"
+        digest = hashlib.sha256(str(message_key).encode("utf-8")).hexdigest()[:32]
+        return f"tracked_message_discord_{guild_id}_{digest}"
+
+    @staticmethod
+    def _tracked_message_key(embed_data):
+        message_key = str(embed_data.get("message_key") or "")
+        if not message_key or len(message_key) > 160 or any(
+            not (char.isalnum() or char in ":_-") for char in message_key
+        ):
+            raise ValueError("Invalid tracked message key")
+        return message_key
 
     @staticmethod
     def _embed_signature(embed_data):
@@ -1036,27 +1120,29 @@ class NetworkBroadcastsCog(commands.Cog):
             key: embed_data.get(key)
             for key in (
                 "title", "description", "url", "color", "fields",
-                "thumbnail", "footer",
+                "thumbnail", "footer", "buttons",
             )
         }
         return json.dumps(visual, sort_keys=True, separators=(",", ":"))
 
-    def _load_staff_board_state(self, guild_id):
+    def _load_tracked_message_state(self, guild_id, message_key):
         try:
             with db_session_scope() as session:
                 row = session.execute(
                     text("SELECT value FROM web_site_config WHERE `key` = :key LIMIT 1"),
-                    {"key": self._staff_board_state_key(guild_id)},
+                    {"key": self._tracked_message_state_key(guild_id, message_key)},
                 ).fetchone()
             return json.loads(row[0]) if row and row[0] else {}
         except Exception as error:
             logger.warning(
-                f"[NetworkBroadcasts] Could not load staff board state "
+                f"[NetworkBroadcasts] Could not load tracked message state "
                 f"for guild {guild_id}: {error}"
             )
             return {}
 
-    def _save_staff_board_state(self, guild_id, channel_id, message_id, signature):
+    def _save_tracked_message_state(
+        self, guild_id, channel_id, message_id, signature, message_key
+    ):
         state = json.dumps({
             "channel_id": str(channel_id),
             "message_id": str(message_id),
@@ -1072,16 +1158,17 @@ class NetworkBroadcastsCog(commands.Cog):
                     "value = :value, updated_at = :updated_at"
                 ),
                 {
-                    "key": self._staff_board_state_key(guild_id),
+                    "key": self._tracked_message_state_key(guild_id, message_key),
                     "value": state,
                     "updated_at": now,
                 },
             )
 
     async def _upsert_direct_embed(self, guild, channel, embed_data):
-        """Create a direct embed once, then edit that same channel message."""
+        """Create a keyed direct embed once, then edit that same message."""
+        message_key = self._tracked_message_key(embed_data)
         signature = self._embed_signature(embed_data)
-        state = self._load_staff_board_state(guild.id)
+        state = self._load_tracked_message_state(guild.id, message_key)
         message = None
 
         if (
@@ -1094,7 +1181,7 @@ class NetworkBroadcastsCog(commands.Cog):
                 message = None
 
         # Adopt a direct board posted before message tracking was added.
-        if message is None:
+        if message is None and message_key == STAFF_BOARD_MESSAGE_KEY:
             expected_title = embed_data.get("title", "")
             expected_footer = embed_data.get("footer", "QuestLog Network")
             try:
@@ -1113,21 +1200,22 @@ class NetworkBroadcastsCog(commands.Cog):
                 pass
 
         embed = self._build_embed(embed_data)
+        view = self._build_link_view(embed_data)
         if message is None:
-            message = await channel.send(embed=embed)
+            message = await channel.send(embed=embed, view=view)
             logger.info(
-                f"[NetworkBroadcasts] Created staff board in "
+                f"[NetworkBroadcasts] Created tracked message {message_key} in "
                 f"{guild.name} #{channel.name}"
             )
         elif state.get("signature") != signature:
-            await message.edit(embed=embed)
+            await message.edit(embed=embed, view=view)
             logger.info(
-                f"[NetworkBroadcasts] Updated staff board in "
+                f"[NetworkBroadcasts] Updated tracked message {message_key} in "
                 f"{guild.name} #{channel.name}"
             )
 
-        self._save_staff_board_state(
-            guild.id, channel.id, message.id, signature
+        self._save_tracked_message_state(
+            guild.id, channel.id, message.id, signature, message_key
         )
         return message
 
@@ -1322,6 +1410,50 @@ class NetworkBroadcastsCog(commands.Cog):
         thread = None
         nonce = self._delivery_nonce(delivery_job_id)
         try:
+            action = embed_data.get("action", "post")
+            if action == "dm_user":
+                try:
+                    target_user_id = int(str(embed_data.get("target_user_id") or ""))
+                    if target_user_id <= 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    return DeliveryOutcome(
+                        "failed",
+                        error_code="invalid_user_id",
+                        error_message="QuestLog supplied an invalid Discord user ID",
+                    )
+                with db_session_scope() as session:
+                    authorized = session.execute(
+                        text(
+                            "SELECT 1 FROM web_users "
+                            "WHERE discord_id=:user_id "
+                            "AND notify_play_together_discord=1 "
+                            "AND is_banned=0 AND is_disabled=0 LIMIT 1"
+                        ),
+                        {"user_id": str(target_user_id)},
+                    ).fetchone()
+                if not authorized:
+                    return DeliveryOutcome(
+                        "failed",
+                        error_code="dm_not_authorized",
+                        error_message="The linked Discord user did not authorize Play Together DMs",
+                    )
+                target_user = self.bot.get_user(target_user_id)
+                if target_user is None:
+                    try:
+                        target_user = await self.bot.fetch_user(target_user_id)
+                    except discord.NotFound:
+                        return DeliveryOutcome(
+                            "destination_missing",
+                            error_code="user_not_found",
+                            error_message="The linked Discord user was not found",
+                        )
+                sent = await target_user.send(embed=self._build_embed(embed_data))
+                self._record_delivery_progress(
+                    delivery_job_id, message_id=sent.id,
+                )
+                return DeliveryOutcome("delivered", message_id=sent.id)
+
             guild = self.bot.get_guild(guild_id)
             if not guild:
                 return DeliveryOutcome(
@@ -1330,7 +1462,6 @@ class NetworkBroadcastsCog(commands.Cog):
                     error_message=f"Discord bot is not installed in guild {guild_id}",
                 )
 
-            action = embed_data.get("action", "post")
             track_group_id = embed_data.get("track_group_id")
             track_group_platform = embed_data.get("track_group_platform", "web")
 
@@ -1709,6 +1840,53 @@ class NetworkBroadcastsCog(commands.Cog):
         except Exception as e:
             logger.error(f"[NetworkBroadcasts] setup error for guild {guild_id}: {e}", exc_info=True)
             await ctx.respond("Something went wrong setting up network broadcasts. Please try again.", ephemeral=True)
+
+    @ql_network.command(name="presence-setup", description="Choose the channel for opt-in member game launch cards")
+    @discord.default_permissions(administrator=True)
+    @discord.option("channel", discord.TextChannel, description="Channel to receive game launch cards", required=True)
+    async def presence_setup(self, ctx: discord.ApplicationContext, channel: discord.TextChannel):
+        """Enable member-approved game presence cards for this Discord guild."""
+        await ctx.defer(ephemeral=True)
+        now_ts = int(time.time())
+        try:
+            with db_session_scope() as session:
+                session.execute(text(
+                    "INSERT INTO web_community_bot_configs "
+                    "(platform,guild_id,guild_name,channel_id,channel_name,event_type,is_enabled,created_at,updated_at) "
+                    "VALUES ('discord',:guild,:guild_name,:channel,:channel_name,'game_presence',1,:now,:now) "
+                    "ON DUPLICATE KEY UPDATE guild_name=:guild_name,channel_id=:channel,"
+                    "channel_name=:channel_name,is_enabled=1,updated_at=:now"
+                ), {
+                    "guild": str(ctx.guild.id), "guild_name": ctx.guild.name,
+                    "channel": str(channel.id), "channel_name": channel.name,
+                    "now": now_ts,
+                })
+            await ctx.respond(
+                f"Opt-in QuestLog game launch cards will be posted in {channel.mention}.\n"
+                "Only members who enable **Announce when I start a game** on QuestLog are included.",
+                ephemeral=True,
+            )
+        except Exception as error:
+            logger.error("[NetworkBroadcasts] presence setup failed: %s", error, exc_info=True)
+            await ctx.respond("Could not save the game presence channel.", ephemeral=True)
+
+    @ql_network.command(name="presence-disable", description="Stop member game launch cards in this server")
+    @discord.default_permissions(administrator=True)
+    async def presence_disable(self, ctx: discord.ApplicationContext):
+        await ctx.defer(ephemeral=True)
+        try:
+            with db_session_scope() as session:
+                result = session.execute(text(
+                    "UPDATE web_community_bot_configs SET is_enabled=0,updated_at=:now "
+                    "WHERE platform='discord' AND guild_id=:guild AND event_type='game_presence'"
+                ), {"guild": str(ctx.guild.id), "now": int(time.time())})
+            await ctx.respond(
+                "Game presence cards are disabled." if result.rowcount else "No game presence channel was configured.",
+                ephemeral=True,
+            )
+        except Exception as error:
+            logger.error("[NetworkBroadcasts] presence disable failed: %s", error, exc_info=True)
+            await ctx.respond("Could not disable game presence cards.", ephemeral=True)
 
     @ql_network.command(name="status", description="Check this server's QuestLog Network subscription status")
     @discord.default_permissions(administrator=True)

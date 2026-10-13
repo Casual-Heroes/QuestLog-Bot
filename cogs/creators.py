@@ -38,23 +38,29 @@ def _next_first_ts() -> int:
     return int(datetime(year, month, 1, tzinfo=timezone.utc).timestamp())
 
 
-def _get_creator(is_cotw: bool):
-    """Fetch current cotw or cotm from DB. Returns row or None."""
-    select_prefix = (
+_CREATOR_SELECT_PREFIX = (
         "SELECT cp.display_name, cp.bio, cp.avatar_url, cp.twitch_url, "
         "cp.youtube_url, cp.kick_url, cp.twitter_url, "
         "cp.cotw_last_featured, cp.cotm_last_featured, wu.username "
         "FROM web_creator_profiles cp "
         "JOIN web_users wu ON wu.id = cp.user_id "
-    )
-    query = (
-        select_prefix + "WHERE cp.is_current_cotw = 1 LIMIT 1"
-        if is_cotw
-        else select_prefix + "WHERE cp.is_current_cotm = 1 LIMIT 1"
-    )
+)
+_CURRENT_COTW_QUERY = sa_text(  # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
+    # Static SQL only: no request or user-controlled text is interpolated.
+    _CREATOR_SELECT_PREFIX + "WHERE cp.is_current_cotw = 1 LIMIT 1"
+)
+_CURRENT_COTM_QUERY = sa_text(  # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
+    # Static SQL only: no request or user-controlled text is interpolated.
+    _CREATOR_SELECT_PREFIX + "WHERE cp.is_current_cotm = 1 LIMIT 1"
+)
+
+
+def _get_creator(is_cotw: bool):
+    """Fetch current cotw or cotm from DB. Returns row or None."""
+    query = _CURRENT_COTW_QUERY if is_cotw else _CURRENT_COTM_QUERY
     try:
         with db_session_scope() as db:
-            return db.execute(sa_text(query)).fetchone()
+            return db.execute(query).fetchone()
     except Exception as e:
         logger.error(f"CreatorsCog: DB error: {e}")
         return None

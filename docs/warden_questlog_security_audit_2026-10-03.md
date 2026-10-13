@@ -2,8 +2,36 @@
 
 Date: 2026-10-03
 
-Status: source and production-aggregate review complete; remediation is not yet
-deployed.
+Status updated 2026-10-13: final source review complete and project frozen;
+production deployment remains a separate operator action.
+
+## Final closure review - 2026-10-13
+
+The owner requested a manual final security review without a Codex Security
+scan. The final source candidate includes the earlier hardening plus these
+additional corrections:
+
+- signed synchronization requires a current Discord guild administrator;
+- deleted-message actors are reported only when a recent matching Discord
+  audit record provides positive evidence;
+- welcome templates may ping only the member being welcomed, preventing a
+  crafted display name or template from producing broad mentions;
+- database-backed scheduled messages cannot produce Discord mentions;
+- the root-owned AMP registry lock must not be group/world writable; and
+- AMP instance ownership, role grants, cross-guild resources, privileged API
+  calls, bridge destinations, RSS fetches, payload sizes, and replay controls
+  fail closed at their execution boundaries.
+
+Final validation uses the repository's complete unit/regression suite, Python
+compilation, `pip check`, `git diff --check`, manual source review, and a
+dependency audit of `requirements.txt`. The locked dependency set has no known
+published vulnerabilities at the time of closure. The existing local virtual
+environment is older than that lock and must not be treated as the final
+runtime until the lock is installed in a controlled deployment.
+
+No deployment or Discord mutation is implied by this source closure. Because
+the repository is frozen, leaving the service online indefinitely without an
+external dependency-maintenance owner is an explicitly accepted residual risk.
 
 ## Remediation implementation update
 
@@ -398,3 +426,50 @@ No security remediation is complete until it has:
    never replayed automatically: recommended yes.
 4. Confirm that Full Coverage/Administrator remains an explicit opt-in while
    Named Permissions becomes the normal recommendation: recommended yes.
+
+## 2026-10-07 hardening addendum
+
+The follow-up review remediated the repository-local findings discovered during
+implementation:
+
+- self-service role requests and templates now fail closed for privileged,
+  managed, default, cross-guild, and out-of-hierarchy roles;
+- role approval has an atomic claim and rollback path;
+- RSS fetching is HTTPS-only, fails closed on DNS errors, pins validated public
+  IPs, preserves TLS hostname validation, and revalidates redirects;
+- legacy queued mutations are never automatically replayed once execution may
+  have started;
+- legacy LFG operations are scoped to their guild, configured channel, thread,
+  and group membership, with controlled mentions;
+- Warden no longer caches game-server passwords in the shared database and
+  never publishes them in channels visible to `@everyone`;
+- disabled Soulmask RCON commands have administrator checks if re-enabled.
+
+Post-fix verification:
+
+- 84 unit/regression tests passed;
+- Semgrep ran 293 rules on 81 tracked files with 0 findings;
+- Bandit reported 0 high and 0 medium findings across 34,675 lines;
+- `pip-audit` reported no known vulnerabilities in the locked dependencies;
+- `detect-secrets` reported 0 findings;
+- Python compilation and `git diff --check` passed.
+
+Deployment work that cannot be completed from the Warden repository alone:
+
+1. Install `logrotate` with host-administrator access and install
+   `deploy/logrotate/wardenbot` as `/etc/logrotate.d/wardenbot`.
+2. Deploy and configure the implemented Ed25519 website-to-bot protocol using
+   `docs/signed_api_auth_migration.md`. Code support is complete in both
+   repositories, but the legacy credential must remain until the public/private
+   key pair is placed in the production secret stores and signed traffic is
+   verified.
+
+Codex Security was installed and enabled on 2026-10-07. Its tools are loaded
+when a new Codex chat starts, so this already-open review used Semgrep, Bandit,
+`pip-audit`, regression tests, and manual threat modeling for its final pass.
+
+This code review found no evidence of Warden credential compromise. That does
+not replace production forensics of Discord, host, database, cloud, and payment
+provider audit logs. If independent evidence suggests compromise, rotate all
+authoritative credentials from their provider consoles and do not commit the
+replacements to this repository.

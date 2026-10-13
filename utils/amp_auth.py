@@ -8,6 +8,8 @@ import aiohttp
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
 
+from utils.amp_security import validate_amp_url
+
 logger = logging.getLogger("warden.amp_auth")
 
 
@@ -18,7 +20,9 @@ class AMPSession:
     """
 
     def __init__(self, base_url: str, username: str, password: str):
-        self.base_url = base_url.rstrip('/')
+        self.base_url = validate_amp_url(base_url)
+        if not self.base_url:
+            raise ValueError("AMP base URL is required")
         self.username = username
         self.password = password
         self.session_id: Optional[str] = None
@@ -217,7 +221,7 @@ async def get_amp_session(base_url: str, username: str, password: str) -> AMPSes
     Get or create AMP session (connection pooling).
 
     Usage:
-        session = await get_amp_session("http://192.168.1.154:8080", "admin", "password")
+        session = await get_amp_session("https://amp.example.com", "admin", "password")
         status = await session.get_instance_status("my-instance-id")
     """
     cache_key = f"{base_url}:{username}"

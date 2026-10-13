@@ -33,6 +33,7 @@ from config import (
     get_debug_guilds,
 )
 from models import Guild, GuildMember, AuditLog, AuditAction
+from utils.guild_resources import resolve_guild_channel
 
 
 def _positive_env_int(name: str, default: int) -> int:
@@ -53,6 +54,44 @@ AUDIT_DELETED_CONTENT_ENABLED = (
 AUDIT_DELETED_CONTENT_RETENTION_DAYS = _positive_env_int(
     "AUDIT_DELETED_CONTENT_RETENTION_DAYS", 7
 )
+
+
+def _deleted_message_details(
+    message: discord.Message,
+    *,
+    include_content: bool | None = None,
+) -> str:
+    """Build useful deletion context while keeping content capture opt-in."""
+    if include_content is None:
+        include_content = AUDIT_DELETED_CONTENT_ENABLED
+
+    details = [
+        f"Channel: <#{message.channel.id}>",
+        f"Message ID: {message.id}",
+    ]
+
+    attachments = getattr(message, "attachments", ())
+    if attachments:
+        filenames = [getattr(item, "filename", "attachment") for item in attachments]
+        details.append(f"Attachments ({len(filenames)}): {', '.join(filenames)[:500]}")
+
+    embeds = getattr(message, "embeds", ())
+    if embeds:
+        details.append(f"Embeds: {len(embeds)}")
+
+    stickers = getattr(message, "stickers", ())
+    if stickers:
+        details.append(f"Stickers: {len(stickers)}")
+
+    if include_content:
+        content = message.content or "[No text content]"
+        if len(content) > 500:
+            content = content[:500] + "..."
+        details.append(f"Content: {content}")
+    else:
+        details.append("Content: not retained (server privacy setting)")
+
+    return "\n".join(details)
 
 
 # Action type to emoji mapping for display
@@ -168,7 +207,7 @@ class AuditCog(commands.Cog):
         # Send to log channel if configured
         if log_channel_id:
             await self._send_log_embed(
-                log_channel_id, action, actor_id, actor_name,
+                guild_id, log_channel_id, action, actor_id, actor_name,
                 target_id, target_name, target_type, reason, details
             )
 
@@ -183,6 +222,52 @@ class AuditCog(commands.Cog):
             return cfg.get(action.value, True)
         except Exception:
             return True
+
+    async def _resolve_message_delete_actor(
+        self,
+        message: discord.Message,
+    ) -> tuple[int | None, str | None]:
+        """Resolve a moderator deletion without guessing who deleted it.
+
+        Discord does not create an audit-log entry for a self-deletion, but a
+        missing entry is not proof of one: audit-log delivery can lag and bot
+        deletions are not guaranteed to be attributable here.  Leave the actor
+        unknown unless a recent matching entry provides positive evidence.
+        """
+        now = discord.utils.utcnow()
+
+        try:
+            # Audit-log delivery can lag behind the gateway deletion event.
+            for delay in (0.75, 1.25):
+                await asyncio.sleep(delay)
+                entries = message.guild.audit_logs(
+                    action=discord.AuditLogAction.message_delete,
+                    limit=8,
+                )
+                async for entry in entries:
+                    if not entry.target or entry.target.id != message.author.id:
+                        continue
+
+                    entry_channel = getattr(entry.extra, "channel", None)
+                    if entry_channel and entry_channel.id != message.channel.id:
+                        continue
+
+                    created_at = getattr(entry, "created_at", None)
+                    if created_at:
+                        age_seconds = (now - created_at).total_seconds()
+                        if age_seconds < -2 or age_seconds > 15:
+                            continue
+
+                    return entry.user.id, str(entry.user)
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException) as exc:
+            logger.warning(
+                "Could not resolve message-delete actor in guild %s: %s",
+                message.guild.id,
+                exc,
+            )
+            return None, None
+
+        return None, None
 
     def _member_join_logging_enabled(self, guild_id: int) -> bool:
         """Check whether this guild needs invite attribution."""
@@ -358,6 +443,7 @@ class AuditCog(commands.Cog):
 
     async def _send_log_embed(
         self,
+        guild_id: int,
         channel_id: int,
         action: AuditAction,
         actor_id: int,
@@ -369,8 +455,13 @@ class AuditCog(commands.Cog):
         details: str
     ):
         """Send a formatted embed to the log channel."""
-        channel = self.bot.get_channel(channel_id)
+        channel = await resolve_guild_channel(self.bot, guild_id, channel_id)
         if not channel:
+            logger.warning(
+                "AuditCog: channel %s is not available in guild %s",
+                channel_id,
+                guild_id,
+            )
             return
 
         emoji = ACTION_EMOJIS.get(action, "📋")
@@ -455,15 +546,17 @@ class AuditCog(commands.Cog):
             ).delete(synchronize_session=False)
 
             redacted = 0
-            if AUDIT_DELETED_CONTENT_ENABLED:
-                content_logs = session.query(AuditLog).filter(
-                    AuditLog.action == AuditAction.MESSAGE_DELETE,
-                    AuditLog.timestamp < content_cutoff,
-                    AuditLog.details.like("%\nContent:%"),
-                ).all()
-                for log in content_logs:
-                    log.details = log.details.split("\nContent:", 1)[0] + "\nContent: [expired]"
-                    redacted += 1
+            content_logs = session.query(AuditLog).filter(
+                AuditLog.action == AuditAction.MESSAGE_DELETE,
+                AuditLog.timestamp < content_cutoff,
+                AuditLog.details.like("%\nContent:%"),
+            ).all()
+            for log in content_logs:
+                prefix, content = log.details.split("\nContent:", 1)
+                if content.strip() == "not retained (server privacy setting)":
+                    continue
+                log.details = prefix + "\nContent: [expired]"
+                redacted += 1
 
         if deleted or redacted:
             logger.info(
@@ -918,42 +1011,55 @@ class AuditCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message_delete(self, message: discord.Message):
-        """Log message deletion."""
+        """Log a deletion when Discord still has the message in cache."""
         if not message.guild or message.author.bot:
             return
 
-        # Don't log if content is empty (embeds only, etc.)
-        if not message.content:
-            return
+        actor_id, actor_name = await self._resolve_message_delete_actor(message)
 
-        actor_id = None
-        actor_name = None
-
-        try:
-            await asyncio.sleep(0.5)
-            async for entry in message.guild.audit_logs(action=discord.AuditLogAction.message_delete, limit=5):
-                if entry.target and entry.target.id == message.author.id:
-                    actor_id = entry.user.id
-                    actor_name = str(entry.user)
-                    break
-        except (discord.Forbidden, discord.NotFound):
-            pass
-
-        details = f"Channel: <#{message.channel.id}>"
-        if AUDIT_DELETED_CONTENT_ENABLED:
-            content = message.content[:500] + "..." if len(message.content) > 500 else message.content
-            details += f"\nContent: {content}"
+        details = _deleted_message_details(message)
 
         await self.log_event(
             guild_id=message.guild.id,
             action=AuditAction.MESSAGE_DELETE,
             actor_id=actor_id,
-            actor_name=actor_name or "Unknown (self or bot)",
+            actor_name=actor_name or "Unknown (audit log unavailable)",
             target_id=message.author.id,
             target_name=str(message.author),
             target_type="user",
             details=details,
             category="message"
+        )
+
+    @commands.Cog.listener()
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
+        """Log deletions that Discord reports after the message left cache.
+
+        ``on_message_delete`` is only dispatched with usable message context
+        when the deleted message is cached.  The raw event is always emitted.
+        Cached raw events are ignored here because the regular listener will
+        record them with the author and any permitted content metadata.
+        """
+        if payload.guild_id is None or payload.cached_message is not None:
+            return
+
+        details = "\n".join(
+            (
+                f"Channel: <#{payload.channel_id}>",
+                f"Message ID: {payload.message_id}",
+                "Content: unavailable (message predates this bot session or left the bounded in-memory cache)",
+            )
+        )
+
+        await self.log_event(
+            guild_id=payload.guild_id,
+            action=AuditAction.MESSAGE_DELETE,
+            actor_name="Unknown (self, moderator, or bot)",
+            target_id=payload.message_id,
+            target_name="Deleted message (author unavailable)",
+            target_type="message",
+            details=details,
+            category="message",
         )
 
     @commands.Cog.listener()

@@ -45,6 +45,7 @@ TICKETING_SYSTEM_SPEC.md
 !/migrations/canonical_lfg_adapter.sql
 !/migrations/flair_delivery_receipts.sql
 !/migrations/progression_outbox.sql
+!/migrations/automatic_role_approvers.sql
 /docs/*
 !/docs/lfg_adapter_migration.md
 !/docs/product_boundary_review.md
@@ -81,6 +82,7 @@ teststats.py
 !/migrations/canonical_lfg_adapter.sql
 !/migrations/flair_delivery_receipts.sql
 !/migrations/progression_outbox.sql
+!/migrations/automatic_role_approvers.sql
 !/docs/lfg_adapter_migration.md
 !/docs/product_boundary_review.md
 !/docs/warden_questlog_engagement_audit_2026-10-03.md
