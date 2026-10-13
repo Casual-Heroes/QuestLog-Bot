@@ -29,6 +29,7 @@ from discord.ext import commands
 from sqlalchemy import text as sa_text
 
 from config import db_session_scope, logger, QUESTLOG_PROGRESSION_API_ENABLED
+from utils.guild_resources import resolve_guild_channel
 
 STAR_EMOJI = '⭐'  # ⭐
 
@@ -195,9 +196,13 @@ class LegacyCog(commands.Cog):
 
         # Fetch the message to get the author
         try:
-            channel = self.bot.get_channel(payload.channel_id)
+            channel = await resolve_guild_channel(
+                self.bot,
+                payload.guild_id,
+                payload.channel_id,
+            )
             if channel is None:
-                channel = await self.bot.fetch_channel(payload.channel_id)
+                return
             message = await channel.fetch_message(payload.message_id)
         except Exception as e:
             logger.debug(f"LegacyCog: could not fetch message {payload.message_id}: {e}")

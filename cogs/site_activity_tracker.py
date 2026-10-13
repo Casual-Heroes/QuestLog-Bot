@@ -15,10 +15,10 @@ import logging
 import mysql.connector
 from mysql.connector import Error
 import os
-from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# bot.py imports config before loading extensions.  config is the single owner
+# of dotenv loading, so this cog must not reopen the repository .env (which is
+# intentionally unreadable by the production service account).
 
 # Data file path - shared with Django website
 DATA_FILE = Path("/srv/ch-webserver/gamingactivity/activity_data.json")

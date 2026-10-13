@@ -54,35 +54,16 @@ SEASONAL_FLAIRS = {
 }
 
 
-def get_flair_role(guild: discord.Guild, flair_name: str) -> discord.Role:
-    """
-    Builds the Discord role name as: Flair: {flair_name}
-    Then retrieves that role from the guild.
-    e.g., if flair_name = "[🎮 Casual Legend]", role_name = "Flair: [🎮 Casual Legend]"
-    """
-    role_name = f"Flair: {flair_name}"
-    return discord.utils.get(guild.roles, name=role_name)
-
-
-async def assign_flair_role(member: discord.Member, flair_name: str):
-    """
-    Removes any old flair roles from the user and assigns the new one (if found).
-    The new role is "Flair: {flair_name}".
-    Example: "Flair: [🎮 Casual Legend]"
-    """
-    # Remove any existing flair roles that start with "Flair: "
-    old_flair_roles = [r for r in member.roles if r.name.startswith("Flair: ")]
-    if old_flair_roles:
-        await member.remove_roles(*old_flair_roles, reason="Removing old flair roles")
-        logger.debug(f"Removed old flair roles from {member.display_name}: {[r.name for r in old_flair_roles]}")
-
-    # Find the new role
-    new_role = get_flair_role(member.guild, flair_name)
-    if new_role:
-        await member.add_roles(new_role, reason=f"Assigned flair role {new_role.name}")
-        logger.info(f"Assigned flair {new_role.name} to {member.display_name}")
-    else:
-        logger.warning(f"No role named 'Flair: {flair_name}' found in {member.guild.name}.")
+async def assign_flair_role(member: discord.Member, flair_name: str, flair_sync):
+    """Assign a flair only through Warden's ID-bound ownership adapter."""
+    if flair_sync is None:
+        raise RuntimeError("Scoped flair delivery adapter is unavailable")
+    status, role_id = await flair_sync._sync_guild_flair(
+        member.guild, member.id, "set_flair", "", flair_name
+    )
+    if status != "delivered":
+        raise RuntimeError(f"Flair assignment was not delivered: {status}")
+    logger.info("Assigned owned flair role %s to %s", role_id, member.display_name)
 
 
 class NormalFlairSelect(ui.Select):
@@ -147,7 +128,11 @@ class NormalFlairSelect(ui.Select):
             # Assign the flair role
             member = interaction.guild.get_member(interaction.user.id)
             if member:
-                await assign_flair_role(member, flair_name)
+                await assign_flair_role(
+                    member,
+                    flair_name,
+                    interaction.client.get_cog("FlairSyncCog"),
+                )
 
             await interaction.response.send_message(
                 f"Success! Your Normal Flair is now **{flair_name}**. Check your roles!",
@@ -222,7 +207,11 @@ class SeasonalFlairSelect(ui.Select):
             # Assign the flair role
             member = interaction.guild.get_member(interaction.user.id)
             if member:
-                await assign_flair_role(member, flair_name)
+                await assign_flair_role(
+                    member,
+                    flair_name,
+                    interaction.client.get_cog("FlairSyncCog"),
+                )
 
             await interaction.response.send_message(
                 f"Success! Your Seasonal Flair is now **{flair_name}**. Check your roles!",

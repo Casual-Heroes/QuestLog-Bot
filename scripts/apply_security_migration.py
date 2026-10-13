@@ -17,6 +17,7 @@ from config import get_engine  # noqa: E402
 
 
 ALLOWED_MIGRATIONS = {
+    "automatic_role_approvers.sql",
     "flair_delivery_receipts.sql",
     "progression_outbox.sql",
 }

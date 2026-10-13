@@ -22,10 +22,10 @@ logger = logging.getLogger("api_server")
 # Store bot reference (set by bot.py on startup)
 bot_instance = None
 
-# Signed authentication is rolled out in dual mode so the website and bot can
-# be deployed independently. Set WARDEN_API_AUTH_MODE=signed after the website
-# is signing every request, then remove the legacy token from this service.
-API_AUTH_MODE = os.getenv("WARDEN_API_AUTH_MODE", "dual").strip().lower()
+# Signed authentication is the secure default.  Dual/legacy modes are limited
+# to read-only guild discovery and loopback-style synchronization; a broad
+# bearer token can never authorize a human privileged action.
+API_AUTH_MODE = os.getenv("WARDEN_API_AUTH_MODE", "signed").strip().lower()
 if API_AUTH_MODE not in {"legacy", "dual", "signed"}:
     raise RuntimeError("WARDEN_API_AUTH_MODE must be legacy, dual, or signed")
 
@@ -47,6 +47,33 @@ REQUIRED_SIGNED_SCOPES = {
     "creator.write",
     "creator.network.write",
 }
+LEGACY_ALLOWED_SCOPES = frozenset({"guilds.read"})
+
+
+def _load_snowflake_set(raw: str | None, name: str) -> frozenset[int]:
+    values = set()
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            value = int(item)
+        except ValueError as exc:
+            raise RuntimeError(f"{name} must contain comma-separated Discord user IDs") from exc
+        if value <= 0:
+            raise RuntimeError(f"{name} must contain positive Discord user IDs")
+        values.add(value)
+    return frozenset(values)
+
+
+DISCOVERY_APPROVER_IDS = _load_snowflake_set(
+    os.getenv("DISCOVERY_APPROVERS"),
+    "DISCOVERY_APPROVERS",
+)
+BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or "0")
+NETWORK_CREATOR_APPROVER_IDS = DISCOVERY_APPROVER_IDS | (
+    frozenset({BOT_OWNER_ID}) if BOT_OWNER_ID > 0 else frozenset()
+)
 if API_AUTH_MODE == "legacy" and not API_TOKEN:
     raise RuntimeError("DISCORD_BOT_API_TOKEN is required in legacy authentication mode")
 if API_AUTH_MODE == "dual" and not API_TOKEN and not TRUSTED_SIGNERS:
@@ -136,8 +163,16 @@ def _signed_actor_is_authorized(request, scope, actor_id, body):
         actor = guild.get_member(actor_snowflake) if guild else None
         if not actor:
             return False, "Signed actor is not a current member of the guild"
-        if scope == "creator.write" and not actor.guild_permissions.administrator:
+        if not actor.guild_permissions.administrator:
             return False, "Signed actor is not a current guild administrator"
+
+    if scope == "creator.network.write":
+        try:
+            actor_snowflake = int(actor_id)
+        except (TypeError, ValueError):
+            return False, "Signed network creator request has an invalid actor"
+        if actor_snowflake not in NETWORK_CREATOR_APPROVER_IDS:
+            return False, "Signed actor is not a current Discovery network approver"
 
     return True, ""
 
@@ -190,6 +225,12 @@ async def auth_middleware(request, handler):
         return await handler(request)
 
     if API_AUTH_MODE != "signed" and _legacy_token_is_valid(request):
+        if not policy or policy[1] or policy[0] not in LEGACY_ALLOWED_SCOPES:
+            logger.warning(
+                "Legacy bearer rejected for privileged route %s",
+                request.path,
+            )
+            return web.json_response({'error': 'Signed authentication required'}, status=403)
         request["auth_method"] = "legacy"
         request["auth_actor_id"] = None
         logger.warning("Legacy bearer authentication used for %s", request.path)

@@ -26,9 +26,15 @@ from discord.ext import commands
 from sqlalchemy import text as sa_text
 
 from config import db_session_scope, logger, get_debug_guilds
+from utils.guild_resources import resolve_guild_channel
+from utils.amp_security import validate_amp_url
 
 # ---- AMP credentials ----
-AMP_URL      = os.getenv('AMP_URL', '')
+try:
+    AMP_URL = validate_amp_url(os.getenv('AMP_URL', ''))
+except ValueError as exc:
+    logger.critical('SoulmaskCog: %s; AMP-backed features are disabled', exc)
+    AMP_URL = ''
 AMP_USER     = os.getenv('AMP_USER', '')
 AMP_PASSWORD = os.getenv('AMP_PASSWORD', '')
 
@@ -96,6 +102,8 @@ def _next_mode_change(instance_cfg: dict, now: datetime.datetime):
 # ---------------------------------------------------------------------------
 
 async def _get_amp_instance(instance_name: str):
+    if not AMP_URL or not AMP_USER or not AMP_PASSWORD:
+        return None
     try:
         from ampapi.dataclass import APIParams
         from ampapi.bridge import Bridge
@@ -180,15 +188,15 @@ def _status_embed(instance_name: str, mode_name: str, mode: dict,
 # DB helper - get announce channel for a guild
 # ---------------------------------------------------------------------------
 
-def _get_announce_channels() -> list[int]:
-    """Return all configured soulmask announce channel IDs."""
+def _get_announce_channels() -> list[tuple[int, int]]:
+    """Return guild-bound Soulmask announcement destinations."""
     try:
         with db_session_scope() as db:
             rows = db.execute(sa_text(
-                "SELECT soulmask_announce_channel_id FROM guilds "
+                "SELECT guild_id, soulmask_announce_channel_id FROM guilds "
                 "WHERE soulmask_announce_channel_id IS NOT NULL AND bot_present = 1"
             )).fetchall()
-            return [r[0] for r in rows]
+            return [(r[0], r[1]) for r in rows]
     except Exception as e:
         logger.error(f'SoulmaskCog: DB error: {e}')
         return []
@@ -243,8 +251,8 @@ class SoulmaskCog(commands.Cog):
                     logger.info(f'SoulmaskCog: applying [{mode_name}] to {instance_name}')
 
                     # Announce upcoming change
-                    for ch_id in _get_announce_channels():
-                        channel = self.bot.get_channel(ch_id)
+                    for guild_id, ch_id in _get_announce_channels():
+                        channel = await resolve_guild_channel(self.bot, guild_id, ch_id)
                         if channel:
                             try:
                                 await channel.send(embed=_mode_embed(instance_name, mode_name, mode, 'Activating'))
@@ -259,8 +267,8 @@ class SoulmaskCog(commands.Cog):
                     # Confirm
                     label = mode.get('label', mode_name.title())
                     result = f'{ok} coefficients applied' + (f', {fail} failed' if fail else '')
-                    for ch_id in _get_announce_channels():
-                        channel = self.bot.get_channel(ch_id)
+                    for guild_id, ch_id in _get_announce_channels():
+                        channel = await resolve_guild_channel(self.bot, guild_id, ch_id)
                         if channel:
                             try:
                                 await channel.send(f'**{label}** mode is now active on `{instance_name}`. {result}.')

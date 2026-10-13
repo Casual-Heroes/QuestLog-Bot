@@ -22,6 +22,7 @@ from discord.ext import commands
 from sqlalchemy import text as sa_text
 
 from config import db_session_scope, logger
+from utils.guild_resources import resolve_guild_channel
 
 # ---------------------------------------------------------------------------
 # Eorzea time constants
@@ -140,13 +141,17 @@ class FFXIVTimersCog(commands.Cog):
             self._t_resets = asyncio.ensure_future(self._loop_resets())
         logger.info("FFXIVTimers: all loops started")
 
-    async def _send(self, channel_id: int, embed: discord.Embed):
-        channel = self.bot.get_channel(channel_id)
+    async def _send(self, guild_id: int, channel_id: int, embed: discord.Embed):
+        channel = await resolve_guild_channel(self.bot, guild_id, channel_id)
         if channel:
             try:
                 await channel.send(embed=embed)
             except Exception as e:
                 logger.warning(f"FFXIVTimers: send to {channel_id} failed: {e}")
+        else:
+            logger.warning(
+                f"FFXIVTimers: channel {channel_id} is not available in guild {guild_id}"
+            )
 
     # ------------------------------------------------------------------
     # Gathering loop
@@ -181,12 +186,12 @@ class FFXIVTimersCog(commands.Cog):
                 if warn_et <= et_min < warn_et + 1:
                     embed = self._gathering_warn_embed(node, spawn_et_hour, warn_min)
                     for g in guilds:
-                        await self._send(g['channel_id'], embed)
+                        await self._send(g['guild_id'], g['channel_id'], embed)
 
                 if int(et_min) == spawn_et:
                     embed = self._gathering_active_embed(node, spawn_et_hour, uptime)
                     for g in guilds:
-                        await self._send(g['channel_id'], embed)
+                        await self._send(g['guild_id'], g['channel_id'], embed)
 
     def _gathering_warn_embed(self, node, spawn_et_hour, warn_min) -> discord.Embed:
         job = node.get('job', '')
@@ -257,7 +262,7 @@ class FFXIVTimersCog(commands.Cog):
             route = _OF_ROUTES[next_wnum % 8]
             embed = self._ocean_embed(route, next_start)
             for g in guilds:
-                await self._send(g['channel_id'], embed)
+                await self._send(g['guild_id'], g['channel_id'], embed)
 
     def _ocean_embed(self, route, departure_ts) -> discord.Embed:
         dep_dt = datetime.fromtimestamp(departure_ts, tz=timezone.utc)
@@ -303,12 +308,12 @@ class FFXIVTimersCog(commands.Cog):
         if is_daily:
             embed = self._daily_reset_embed(now)
             for g in guilds:
-                await self._send(g['channel_id'], embed)
+                await self._send(g['guild_id'], g['channel_id'], embed)
 
         if is_weekly:
             embed = self._weekly_reset_embed(now)
             for g in guilds:
-                await self._send(g['channel_id'], embed)
+                await self._send(g['guild_id'], g['channel_id'], embed)
 
     def _daily_reset_embed(self, dt) -> discord.Embed:
         e = discord.Embed(

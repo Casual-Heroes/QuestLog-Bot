@@ -8,13 +8,22 @@ picked up by the bot.
 """
 
 import os
+from pathlib import Path
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from contextlib import contextmanager
 from dotenv import load_dotenv
 from urllib.parse import quote_plus
 
-load_dotenv()
+# Match config.py's environment boundary.  Production callers must never fall
+# through to the repository .env, which is deliberately owner-only.  Keeping
+# this module usable by standalone maintenance scripts avoids requiring every
+# caller to import the Discord bot configuration first.
+_secrets_path = Path("/etc/casual-heroes/warden.env")
+if _secrets_path.exists():
+    load_dotenv(_secrets_path, override=False)
+else:
+    load_dotenv(override=False)
 
 # Build database URL from environment variables
 DB_SOCKET = os.getenv("DB_SOCKET")  # Unix socket path (preferred)

@@ -933,7 +933,7 @@ class ActionProcessorCog(commands.Cog):
                     raise ValueError("Welcome channel not found")
 
                 # Format message
-                from cogs.welcome import format_message
+                from cogs.welcome import format_message, _welcome_allowed_mentions
                 formatted_message = format_message(config.channel_message, member)
 
                 # Send with embed if enabled
@@ -951,7 +951,10 @@ class ActionProcessorCog(commands.Cog):
 
                     msg = await channel.send(content="**[TEST WELCOME]** This is a test welcome message:", embed=embed)
                 else:
-                    msg = await channel.send(f"**[TEST WELCOME]** {formatted_message}")
+                    msg = await channel.send(
+                        f"**[TEST WELCOME]** {formatted_message}",
+                        allowed_mentions=_welcome_allowed_mentions(member),
+                    )
 
                 return {"success": True, "message_id": msg.id, "channel_id": channel_id}
 
@@ -1113,7 +1116,7 @@ class ActionProcessorCog(commands.Cog):
                 # Try to delete the featured message
                 if entry.featured_message_id:
                     try:
-                        channel = self.bot.get_channel(config.selfpromo_channel_id)
+                        channel = guild.get_channel(config.selfpromo_channel_id)
                         if channel:
                             msg = await channel.fetch_message(entry.featured_message_id)
                             await msg.delete()
@@ -1145,9 +1148,9 @@ class ActionProcessorCog(commands.Cog):
         if not channel_id:
             raise ValueError("No channel_id provided in payload")
 
-        channel = self.bot.get_channel(int(channel_id))
+        channel = guild.get_channel(int(channel_id))
         if not channel:
-            raise ValueError(f"Channel {channel_id} not found")
+            raise ValueError(f"Channel {channel_id} not found in guild {guild.id}")
 
         # Create test embed
         embed = discord.Embed(
@@ -1173,9 +1176,9 @@ class ActionProcessorCog(commands.Cog):
         if not channel_id:
             raise ValueError("No channel_id provided in payload")
 
-        channel = self.bot.get_channel(int(channel_id))
+        channel = guild.get_channel(int(channel_id))
         if not channel:
-            raise ValueError(f"Channel {channel_id} not found")
+            raise ValueError(f"Channel {channel_id} not found in guild {guild.id}")
 
         # Create test embed
         embed = discord.Embed(
@@ -1733,13 +1736,35 @@ class ActionProcessorCog(commands.Cog):
         moved_roles = []
         now = int(time.time())
         renames = payload.get("renames") or []
+        rename_map = {
+            item.get("old_name"): item.get("new_name")
+            for item in renames
+            if item.get("old_name") and item.get("new_name")
+            and item.get("old_name") != item.get("new_name")
+        }
+
+        reverse_rename_map = {new: old for old, new in rename_map.items()}
 
         # Use current DB flairs if present (so renamed defaults are respected), otherwise fall back to built-in lists
         # Only use normal/seasonal flairs, not custom flairs (custom flairs have their own creation flow)
         try:
             with db_session_scope() as session:
+                for old_name, new_name in rename_map.items():
+                    old_flair = session.query(GuildFlair).filter_by(
+                        guild_id=guild.id, flair_name=old_name
+                    ).first()
+                    new_flair = session.query(GuildFlair).filter_by(
+                        guild_id=guild.id, flair_name=new_name
+                    ).first()
+                    if old_flair and not new_flair:
+                        old_flair.flair_name = new_name
+                        old_flair.updated_at = now
+                    elif old_flair and new_flair:
+                        old_flair.enabled = False
+                        old_flair.updated_at = now
                 db_flairs = session.query(GuildFlair).filter_by(guild_id=guild.id).filter(
-                    GuildFlair.flair_type.in_(['normal', 'seasonal'])
+                    GuildFlair.flair_type.in_(['normal', 'seasonal']),
+                    GuildFlair.enabled == True,
                 ).all()
                 if db_flairs:
                     default_flairs = [(f.flair_name, f.cost, f.flair_type) for f in db_flairs]
@@ -1750,29 +1775,14 @@ class ActionProcessorCog(commands.Cog):
             logger.warning(f"Failed to load guild flairs for seed in {guild.name}: {e}")
             default_flairs = [(name, cost, "normal") for name, cost in NORMAL_FLAIRS.items()] + \
                              [(name, cost, "seasonal") for name, cost in SEASONAL_FLAIRS.items()]
+        default_flairs = [
+            (rename_map.get(name, name), cost, flair_type)
+            for name, cost, flair_type in default_flairs
+        ]
 
-        # First handle renames (e.g., admin renamed a flair in the dashboard)
-        for rename in renames:
-            old = rename.get("old_name")
-            new = rename.get("new_name")
-            if not old or not new or old == new:
-                continue
-            try:
-                role = discord.utils.get(guild.roles, name=f"Flair: {old}")
-                if role:
-                    await role.edit(name=f"Flair: {new}", reason="Rename flair role")
-                    moved_roles.append(f"Renamed {old} -> {new}")
-                else:
-                    # If missing, create with new name
-                    role = await guild.create_role(
-                        name=f"Flair: {new}",
-                        hoist=True,
-                        mentionable=False,
-                        reason="Create renamed flair role"
-                    )
-                    created_roles.append(f"Flair: {new}")
-            except Exception as e:
-                logger.warning(f"Failed to rename/create flair role {old}->{new} in {guild.name}: {e}")
+        flair_sync = self.bot.get_cog("FlairSyncCog")
+        if flair_sync is None:
+            raise RuntimeError("Scoped flair delivery adapter is unavailable")
 
         # Find the bot's highest role position (flair roles should go just below this)
         bot_member = guild.get_member(self.bot.user.id)
@@ -1787,26 +1797,34 @@ class ActionProcessorCog(commands.Cog):
         logger.info(f"Creating/moving {len(default_flairs)} flair roles to position {target_position} in {guild.name}")
 
         # Create missing roles first, then batch position them
-        new_roles = []
+        seeded_roles = []
         for flair_name, cost, flair_type in default_flairs:
             role_name = f"Flair: {flair_name}"
-            role = discord.utils.get(guild.roles, name=role_name)
-
-            if not role:
-                try:
-                    role = await guild.create_role(
-                        name=role_name,
-                        hoist=True,
-                        mentionable=False,
-                        color=discord.Color.default(),  # No color by default (users see their flair color)
-                        reason="Create default flair role (vanity role for display)"
-                    )
-                    created_roles.append(role_name)
-                    new_roles.append(role)
-                    logger.info(f"Created flair role: {role_name} in {guild.name}")
-                except Exception as e:
-                    logger.warning(f"Failed to create flair role {role_name} in {guild.name}: {e}")
-                    continue
+            flair_key = flair_sync._flair_key("", flair_name)
+            old_name = reverse_rename_map.get(flair_name)
+            if old_name:
+                flair_sync._migrate_role_binding(
+                    guild.id,
+                    flair_sync._flair_key("", old_name),
+                    flair_key,
+                    role_name,
+                )
+            was_bound = flair_sync._bound_role_id(guild.id, flair_key) is not None
+            try:
+                role = await flair_sync._target_role(guild, "", flair_name)
+            except Exception as e:
+                logger.warning("Failed to create/resolve owned flair role %s in %s: %s", role_name, guild.name, e)
+                continue
+            if role is None:
+                continue
+            if not role.hoist:
+                await role.edit(
+                    hoist=True,
+                    reason="Display owned flair role separately",
+                )
+            seeded_roles.append(role)
+            if not was_bound:
+                created_roles.append(role_name)
 
             # Sync GuildFlair record for this flair
             try:
@@ -1835,9 +1853,9 @@ class ActionProcessorCog(commands.Cog):
             except Exception as e:
                 logger.warning(f"Failed to sync GuildFlair for {flair_name} in {guild.name}: {e}")
 
-        # Batch move all flair roles to the top
-        # Get all existing flair roles
-        all_flair_roles = [r for r in guild.roles if r.name.startswith("Flair: ")]
+        # Move only roles proven to be owned by Warden. Prefix/name matches are
+        # not ownership evidence because Discord role names are not unique.
+        all_flair_roles = list({role.id: role for role in seeded_roles}.values())
 
         if all_flair_roles:
             try:

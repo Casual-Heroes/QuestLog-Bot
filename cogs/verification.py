@@ -36,6 +36,10 @@ from models import (
     Guild, GuildMember, VerificationConfig, VerificationType,
     AuditLog, AuditAction
 )
+from utils.role_security import (
+    automatic_role_execution_error,
+    delegated_role_grant_error,
+)
 
 
 def generate_captcha(length: int = 6) -> str:
@@ -448,10 +452,14 @@ async def process_verification(interaction: discord.Interaction, method: str):
     if verified_role_id:
         verified_role = guild.get_role(verified_role_id)
         if verified_role:
-            try:
-                await member.add_roles(verified_role, reason=f"Verified via {method}")
-            except discord.Forbidden:
-                logger.warning(f"Cannot add verified role in {guild.name}")
+            role_error = automatic_role_execution_error(guild, verified_role)
+            if role_error:
+                logger.warning("[VERIFY] Refusing unsafe verified role %s: %s", verified_role.id, role_error)
+            else:
+                try:
+                    await member.add_roles(verified_role, reason=f"Verified via {method}")
+                except discord.Forbidden:
+                    logger.warning(f"Cannot add verified role in {guild.name}")
 
     # Remove quarantine role
     if quarantine_role_id:
@@ -464,29 +472,6 @@ async def process_verification(interaction: discord.Interaction, method: str):
 
     # Restore saved roles for returning members (role persistence)
     if saved_role_ids:
-        # Dangerous permissions that should NEVER be auto-restored
-        DANGEROUS_PERMISSIONS = (
-            # Admin-level
-            'administrator',
-            'manage_guild',
-            'manage_roles',
-            'manage_channels',
-            'ban_members',
-            'kick_members',
-            'manage_webhooks',
-            'manage_expressions',
-            'mention_everyone',
-            # Mod-level
-            'moderate_members',
-            'mute_members',
-            'deafen_members',
-            'move_members',
-            'manage_nicknames',
-            'manage_events',
-            'view_audit_log',
-            'view_guild_insights',
-        )
-
         roles_to_add = []
         for role_id in saved_role_ids:
             # Skip excluded roles
@@ -494,17 +479,11 @@ async def process_verification(interaction: discord.Interaction, method: str):
                 continue
 
             role = guild.get_role(role_id)
-            if not role or role.managed or role.id == guild.id:
+            role_error = automatic_role_execution_error(guild, role)
+            if role_error:
+                logger.warning("[ROLE PERSIST] Skipping unsafe role %s for %s: %s", role_id, member, role_error)
                 continue
-
-            # Skip roles with dangerous permissions
-            if any(getattr(role.permissions, perm, False) for perm in DANGEROUS_PERMISSIONS):
-                logger.warning(f"[ROLE PERSIST] Skipping dangerous role '{role.name}' for {member} after verification")
-                continue
-
-            # Don't restore roles higher than bot's top role
-            if role < guild.me.top_role:
-                roles_to_add.append(role)
+            roles_to_add.append(role)
 
         if roles_to_add:
             try:
@@ -760,30 +739,6 @@ class VerificationCog(commands.Cog):
                         except (json.JSONDecodeError, TypeError):
                             pass
 
-                    # Dangerous permissions that should NEVER be auto-restored
-                    # These could allow a kicked admin/mod to regain control
-                    DANGEROUS_PERMISSIONS = (
-                        # Admin-level
-                        'administrator',
-                        'manage_guild',
-                        'manage_roles',
-                        'manage_channels',
-                        'ban_members',
-                        'kick_members',
-                        'manage_webhooks',
-                        'manage_expressions',  # Emojis/stickers
-                        'mention_everyone',
-                        # Mod-level
-                        'moderate_members',  # Timeout
-                        'mute_members',  # Voice mute
-                        'deafen_members',  # Voice deafen
-                        'move_members',  # Move between voice channels
-                        'manage_nicknames',
-                        'manage_events',
-                        'view_audit_log',
-                        'view_guild_insights',
-                    )
-
                     try:
                         saved_role_ids = json.loads(saved_roles)
                         roles_to_add = []
@@ -796,18 +751,12 @@ class VerificationCog(commands.Cog):
                                 continue
 
                             role = member.guild.get_role(role_id)
-                            if not role or role.managed or role.id == member.guild.id:
+                            role_error = automatic_role_execution_error(member.guild, role)
+                            if role_error:
+                                skipped_dangerous.append(getattr(role, "name", str(role_id)))
+                                logger.warning("[ROLE PERSIST] Skipping unsafe role %s for %s: %s", role_id, member, role_error)
                                 continue
-
-                            # Skip roles with dangerous permissions
-                            if any(getattr(role.permissions, perm, False) for perm in DANGEROUS_PERMISSIONS):
-                                skipped_dangerous.append(role.name)
-                                logger.warning(f"[ROLE PERSIST] Skipping dangerous role '{role.name}' for {member} (has elevated permissions)")
-                                continue
-
-                            # Don't restore roles higher than bot's top role
-                            if role < member.guild.me.top_role:
-                                roles_to_add.append(role)
+                            roles_to_add.append(role)
 
                         if roles_to_add:
                             await member.add_roles(*roles_to_add, reason="Role persistence - returning member")
@@ -950,7 +899,10 @@ class VerificationCog(commands.Cog):
                         quarantine_role = member.guild.get_role(quarantine_role_id)
                         logger.info(f"[VERIFY] Quarantine role object: {quarantine_role}")
 
-                        if quarantine_role:
+                        role_error = automatic_role_execution_error(member.guild, quarantine_role)
+                        if role_error:
+                            logger.warning("[VERIFY] Refusing unsafe quarantine role %s: %s", quarantine_role_id, role_error)
+                        elif quarantine_role:
                             try:
                                 await member.add_roles(quarantine_role, reason="Pending verification")
                                 logger.info(f"[VERIFY] Successfully assigned quarantine role to {member} in {member.guild.name}")
@@ -1117,6 +1069,17 @@ class VerificationCog(commands.Cog):
         reason: str = None
     ):
         """Manually verify a member."""
+        verification_warnings = []
+        if (
+            ctx.author.id != ctx.guild.owner_id
+            and member.top_role >= ctx.author.top_role
+        ):
+            await ctx.respond(
+                "You cannot verify a member with an equal or higher role.",
+                ephemeral=True,
+            )
+            return
+
         with db_session_scope() as session:
             db_guild = session.get(Guild, ctx.guild.id)
 
@@ -1143,25 +1106,6 @@ class VerificationCog(commands.Cog):
                 await ctx.respond(f"{member.mention} is already verified.", ephemeral=True)
                 return
 
-            # Verify the member
-            db_member.is_verified = True
-            db_member.verified_at = int(time.time())
-            db_member.verification_method = f"manual:{ctx.author.id}"
-            db_member.is_quarantined = False
-
-            # Log
-            audit = AuditLog(
-                guild_id=ctx.guild.id,
-                action=AuditAction.VERIFICATION_PASSED,
-                actor_id=ctx.author.id,
-                actor_name=str(ctx.author),
-                target_id=member.id,
-                target_name=str(member),
-                reason=reason,
-                details=f"Manually verified by {ctx.author}"
-            )
-            session.add(audit)
-
             verified_role_id = db_guild.verified_role_id
             quarantine_role_id = db_guild.quarantine_role_id
 
@@ -1170,50 +1114,122 @@ class VerificationCog(commands.Cog):
             if db_guild.role_persistence_enabled and db_member.saved_roles:
                 try:
                     saved_role_ids = json.loads(db_member.saved_roles)
-                    # Clear saved roles now that we're restoring them
-                    db_member.saved_roles = None
-                    db_member.left_at = None
                 except (json.JSONDecodeError, TypeError):
                     saved_role_ids = []
 
-        # Update roles
-        if verified_role_id:
-            verified_role = ctx.guild.get_role(verified_role_id)
-            if verified_role:
+            # Fail before recording verification when its required Discord role
+            # cannot be granted safely. This avoids a verified database record
+            # whose Discord permissions never changed.
+            verified_role = (
+                ctx.guild.get_role(verified_role_id) if verified_role_id else None
+            )
+            if verified_role_id and verified_role is None:
+                await ctx.respond(
+                    "Verification is misconfigured: the verified role no longer exists.",
+                    ephemeral=True,
+                )
+                return
+            if verified_role is not None:
+                role_error = delegated_role_grant_error(
+                    ctx.guild, verified_role, actor=ctx.author, target=member
+                )
+                if role_error:
+                    await ctx.respond(
+                        f"Verification was blocked because the verified role is unsafe: {role_error}",
+                        ephemeral=True,
+                    )
+                    return
                 try:
-                    await member.add_roles(verified_role, reason=f"Manually verified by {ctx.author}")
-                except discord.Forbidden:
-                    pass
+                    await member.add_roles(
+                        verified_role,
+                        reason=f"Manually verified by {ctx.author}",
+                    )
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    logger.warning(
+                        "[VERIFY] Failed to add verified role to %s: %s",
+                        member,
+                        exc,
+                    )
+                    await ctx.respond(
+                        "Verification was not recorded because Discord rejected the verified-role update.",
+                        ephemeral=True,
+                    )
+                    return
 
+            db_member.is_verified = True
+            db_member.verified_at = int(time.time())
+            db_member.verification_method = f"manual:{ctx.author.id}"
+            db_member.is_quarantined = False
+            session.add(AuditLog(
+                guild_id=ctx.guild.id,
+                action=AuditAction.VERIFICATION_PASSED,
+                actor_id=ctx.author.id,
+                actor_name=str(ctx.author),
+                target_id=member.id,
+                target_name=str(member),
+                reason=reason,
+                details=f"Manually verified by {ctx.author}"
+            ))
+
+        # Update roles
         if quarantine_role_id:
             quarantine_role = ctx.guild.get_role(quarantine_role_id)
             if quarantine_role and quarantine_role in member.roles:
                 try:
                     await member.remove_roles(quarantine_role, reason="Manually verified")
                 except discord.Forbidden:
-                    pass
+                    logger.warning("[VERIFY] Cannot remove quarantine role from %s", member)
+                    verification_warnings.append("I could not remove the quarantine role.")
+                except discord.HTTPException as exc:
+                    logger.warning("[VERIFY] Failed to remove quarantine role from %s: %s", member, exc)
+                    verification_warnings.append("Discord rejected the quarantine-role update.")
 
         # Restore saved roles for returning members (role persistence)
         if saved_role_ids:
             roles_to_add = []
+            refused_role_ids = []
             for role_id in saved_role_ids:
                 role = ctx.guild.get_role(role_id)
-                if role and not role.managed and role.id != ctx.guild.id:
-                    if role < ctx.guild.me.top_role:
-                        roles_to_add.append(role)
+                role_error = delegated_role_grant_error(
+                    ctx.guild, role, actor=ctx.author, target=member
+                )
+                if role_error:
+                    logger.warning("[ROLE PERSIST] Refusing unsafe manual restore role %s: %s", role_id, role_error)
+                    refused_role_ids.append(role_id)
+                    continue
+                roles_to_add.append(role)
 
+            restore_completed = True
             if roles_to_add:
                 try:
                     await member.add_roles(*roles_to_add, reason="Role persistence - restored on manual verification")
                     logger.info(f"[ROLE PERSIST] Restored {len(roles_to_add)} roles for {member} on manual verify in {ctx.guild.name}")
                 except discord.Forbidden:
                     logger.warning(f"[ROLE PERSIST] Cannot restore roles for {member} in {ctx.guild.name}")
+                    restore_completed = False
+                    verification_warnings.append("I could not restore the member's saved roles.")
                 except Exception as e:
                     logger.error(f"[ROLE PERSIST] Error restoring roles on manual verify: {e}")
+                    restore_completed = False
+                    verification_warnings.append("Discord rejected the saved-role restoration.")
+
+            remaining_role_ids = refused_role_ids if restore_completed else saved_role_ids
+            with db_session_scope() as session:
+                db_member = session.get(GuildMember, (ctx.guild.id, member.id))
+                if db_member:
+                    db_member.saved_roles = (
+                        json.dumps(remaining_role_ids) if remaining_role_ids else None
+                    )
+                    db_member.left_at = None
+            if refused_role_ids:
+                verification_warnings.append(
+                    f"{len(refused_role_ids)} saved role(s) were retained for administrator review because they are no longer safe to restore."
+                )
 
         await ctx.respond(
             f"✅ **{member.mention}** has been manually verified." +
-            (f"\nReason: {reason}" if reason else ""),
+            (f"\nReason: {reason}" if reason else "") +
+            ("\n⚠️ " + " ".join(verification_warnings) if verification_warnings else ""),
             ephemeral=True
         )
         logger.info(f"Manually verified {member} in {ctx.guild.name} by {ctx.author}")

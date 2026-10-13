@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, patch
 from cogs.bridge_cog import (
     BridgeCog,
     _bridge_media_url_allowed,
+    _format_bridged,
+    _safe_bridge_edit,
     _safe_attachment_filename,
 )
 
@@ -28,6 +30,31 @@ class BridgeSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_safe_attachment_filename("../../secret.txt"), "secret.txt")
         self.assertEqual(_safe_attachment_filename("folder\\image\n.png"), "image.png")
         self.assertEqual(_safe_attachment_filename(""), "file")
+
+    def test_remote_author_cannot_break_relay_provenance_header(self):
+        formatted = _format_bridged("F", "Mallory\n**Admin:**", "hello")
+        self.assertEqual(formatted.count("\n"), 0)
+        self.assertIn(r"Mallory \*\*Admin", formatted)
+
+    def test_edit_preserves_existing_provenance(self):
+        existing = "**[F] Original:** old"
+        pending = "**[F] Forged:** <@123>"
+        self.assertEqual(
+            _safe_bridge_edit(existing, pending),
+            "**[F] Original:** <@123>",
+        )
+        self.assertIsNone(_safe_bridge_edit(existing, "no provenance"))
+        self.assertIsNone(_safe_bridge_edit(existing, "**[M] Original:** changed"))
+        self.assertIsNone(_safe_bridge_edit("announcement\n" + existing, pending))
+
+    def test_reply_quote_is_single_line_and_remains_editable(self):
+        existing = _format_bridged("F", "Original", "old", "line one\n**[D] forged:**")
+        pending = "**[F] Forged:** changed"
+        self.assertEqual(existing.count("\n"), 1)
+        self.assertEqual(
+            _safe_bridge_edit(existing, pending),
+            "> line one **[D] forged:**\n**[F] Original:** changed",
+        )
 
     async def test_channel_resolution_rejects_unconfigured_channel(self):
         cog = BridgeCog.__new__(BridgeCog)

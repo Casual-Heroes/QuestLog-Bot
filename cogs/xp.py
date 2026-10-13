@@ -36,6 +36,7 @@ from models import (
     Guild, GuildMember, XPConfig, LevelRole, LevelUpConfig,
     XPExcludedChannel, XPExcludedRole, LevelRequirement, XPBoostEvent
 )
+from utils.role_security import automatic_role_execution_error
 
 
 class XPCog(commands.Cog):
@@ -663,6 +664,10 @@ class XPCog(commands.Cog):
             if new_level in role_data:
                 role = guild.get_role(role_data[new_level])
                 if role and role not in member.roles:
+                    role_error = automatic_role_execution_error(guild, role)
+                    if role_error:
+                        logger.warning("Refusing unsafe level role %s: %s", role.id, role_error)
+                        return
                     try:
                         await member.add_roles(role, reason="Level milestone reached")
                         await level_channel.send(
@@ -721,9 +726,13 @@ class XPCog(commands.Cog):
 
             # Add new role
             if target_role and target_role not in member.roles:
-                await member.add_roles(
-                    target_role, reason="Synchronized to QuestLog level"
-                )
+                role_error = automatic_role_execution_error(guild, target_role)
+                if role_error:
+                    logger.warning("Refusing unsafe synchronized level role %s: %s", target_role.id, role_error)
+                else:
+                    await member.add_roles(
+                        target_role, reason="Synchronized to QuestLog level"
+                    )
 
         except discord.Forbidden:
             logger.warning(f"Cannot manage roles for {member.id} in {guild.id}")

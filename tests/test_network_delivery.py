@@ -9,6 +9,7 @@ from cogs.network_broadcasts import (
     DeliveryOutcome,
     NetworkBroadcastsCog,
     _discord_http_url,
+    _validated_link_buttons,
 )
 from utils.lfg_api import LFGAPIError
 
@@ -43,6 +44,49 @@ class NetworkDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(outcome.status, "destination_missing")
         self.assertEqual(outcome.error_code, "bot_not_installed")
+
+    async def test_direct_user_delivery_does_not_require_a_guild(self):
+        cog = self.make_cog(FakeDeliveryClient())
+        sent = SimpleNamespace(id=777)
+        user = SimpleNamespace(send=AsyncMock(return_value=sent))
+        cog.bot.get_user = Mock(return_value=user)
+        cog.bot.fetch_user = AsyncMock()
+        cog._record_delivery_progress = Mock()
+
+        with patch("cogs.network_broadcasts.db_session_scope") as scope:
+            scope.return_value.__enter__.return_value.execute.return_value.fetchone.return_value = (1,)
+            outcome = await cog._post_embed(
+                1, 0, 0,
+                {"action": "dm_user", "target_user_id": "42", "title": "Join request"},
+            )
+
+        self.assertEqual(outcome.status, "delivered")
+        self.assertEqual(outcome.message_id, 777)
+        user.send.assert_awaited_once()
+        cog.bot.fetch_user.assert_not_awaited()
+
+    async def test_direct_user_delivery_rejects_invalid_target(self):
+        cog = self.make_cog(FakeDeliveryClient())
+
+        outcome = await cog._post_embed(
+            1, 0, 0, {"action": "dm_user", "target_user_id": "not-an-id"},
+        )
+
+        self.assertEqual(outcome.status, "failed")
+        self.assertEqual(outcome.error_code, "invalid_user_id")
+
+    async def test_direct_user_delivery_requires_questlog_opt_in(self):
+        cog = self.make_cog(FakeDeliveryClient())
+        cog.bot.get_user = Mock()
+        with patch("cogs.network_broadcasts.db_session_scope") as scope:
+            scope.return_value.__enter__.return_value.execute.return_value.fetchone.return_value = None
+            outcome = await cog._post_embed(
+                1, 0, 0, {"action": "dm_user", "target_user_id": "42"},
+            )
+
+        self.assertEqual(outcome.status, "failed")
+        self.assertEqual(outcome.error_code, "dm_not_authorized")
+        cog.bot.get_user.assert_not_called()
 
     def test_discord_http_url_accepts_absolute_web_urls(self):
         self.assertEqual(
@@ -94,6 +138,88 @@ class NetworkDeliveryTests(unittest.IsolatedAsyncioTestCase):
             embed.to_dict()["thumbnail"]["url"],
             "https://cdn.example.com/cover.png",
         )
+
+    async def test_game_presence_links_become_native_buttons(self):
+        cog = self.make_cog(FakeDeliveryClient())
+        payload = {
+            "fields": [
+                {"name": "Steam", "value": "fallback", "inline": True},
+                {"name": "Play Together", "value": "fallback", "inline": True},
+                {"name": "QuestLog", "value": "fallback", "inline": True},
+            ],
+            "buttons": [
+                {"kind": "steam", "url": "https://store.steampowered.com/app/1245620/"},
+                {"kind": "play_together", "url": "https://questlog.casual-heroes.com/play-together/request/42/?game=ELDEN%20RING"},
+                {"kind": "questlog", "url": "https://questlog.casual-heroes.com/u/ryven/"},
+            ],
+        }
+
+        view = cog._build_link_view(payload)
+        embed = cog._build_embed(payload)
+
+        self.assertEqual(
+            [button.label for button in view.children],
+            ["Steam", "Play Together", "QuestLog"],
+        )
+        self.assertEqual(embed.fields, [])
+
+    async def test_game_presence_buttons_reject_untrusted_destinations(self):
+        payload = {
+            "buttons": [
+                {"kind": "steam", "url": "https://evil.example/app/1245620/"},
+                {"kind": "play_together", "url": "javascript:alert(1)"},
+                {"kind": "questlog", "url": "https://questlog.casual-heroes.com.evil.example/u/ryven/"},
+            ],
+        }
+
+        self.assertEqual(_validated_link_buttons(payload), [])
+        self.assertIsNone(self.make_cog(FakeDeliveryClient())._build_link_view(payload))
+
+    async def test_tracked_game_presence_send_includes_link_button_view(self):
+        cog = self.make_cog(FakeDeliveryClient())
+        cog._load_tracked_message_state = Mock(return_value={})
+        cog._save_tracked_message_state = Mock()
+        sent = SimpleNamespace(id=321)
+        channel = SimpleNamespace(
+            id=100,
+            name="game-presence",
+            send=AsyncMock(return_value=sent),
+        )
+        guild = SimpleNamespace(id=99, name="Casual Heroes")
+        payload = {
+            "message_key": "game_presence:42:1245620:1700000000",
+            "buttons": [
+                {"kind": "steam", "url": "https://store.steampowered.com/app/1245620/"},
+                {"kind": "questlog", "url": "https://questlog.casual-heroes.com/u/ryven/"},
+            ],
+        }
+
+        await cog._upsert_direct_embed(guild, channel, payload)
+
+        view = channel.send.await_args.kwargs["view"]
+        self.assertEqual([item.label for item in view.children], ["Steam", "QuestLog"])
+
+    def test_tracked_message_keys_isolate_sessions_from_staff_board(self):
+        staff = NetworkBroadcastsCog._tracked_message_state_key(
+            99, "community_staff_board"
+        )
+        first = NetworkBroadcastsCog._tracked_message_state_key(
+            99, "game_presence:42:1245620:1700000000"
+        )
+        second = NetworkBroadcastsCog._tracked_message_state_key(
+            99, "game_presence:42:1245620:1700003600"
+        )
+        self.assertEqual(staff, "community_staff_board_discord_99")
+        self.assertNotEqual(first, staff)
+        self.assertNotEqual(first, second)
+
+    def test_tracked_message_key_rejects_unbounded_or_unsafe_values(self):
+        for value in ("", "bad key", "../state", "x" * 161):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    NetworkBroadcastsCog._tracked_message_key({
+                        "message_key": value,
+                    })
 
     async def test_missing_bound_channel_is_destination_missing(self):
         guild = SimpleNamespace(
