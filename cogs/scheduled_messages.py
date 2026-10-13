@@ -10,6 +10,7 @@ import time
 import json
 from config import db_session_scope, logger
 from models import ScheduledMessage
+from utils.guild_resources import resolve_guild_channel
 
 
 class ScheduledMessageProcessor(commands.Cog):
@@ -80,23 +81,24 @@ class ScheduledMessageProcessor(commands.Cog):
 
     async def send_message(self, msg: ScheduledMessage, content_data: dict):
         """Send a plain message to a channel."""
-        channel = self.bot.get_channel(msg.channel_id)
+        channel = await resolve_guild_channel(self.bot, msg.guild_id, msg.channel_id)
         if not channel:
-            raise ValueError(f"Channel {msg.channel_id} not found")
+            raise ValueError(f"Channel {msg.channel_id} is not available in guild {msg.guild_id}")
 
         content = content_data.get('content', '')
         silent = content_data.get('silent', False)
 
         await channel.send(
             content=content,
-            silent=silent
+            silent=silent,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
 
     async def send_embed(self, msg: ScheduledMessage, content_data: dict):
         """Send an embed to a channel."""
-        channel = self.bot.get_channel(msg.channel_id)
+        channel = await resolve_guild_channel(self.bot, msg.guild_id, msg.channel_id)
         if not channel:
-            raise ValueError(f"Channel {msg.channel_id} not found")
+            raise ValueError(f"Channel {msg.channel_id} is not available in guild {msg.guild_id}")
 
         embed = discord.Embed(
             title=content_data.get('title', ''),
@@ -112,14 +114,15 @@ class ScheduledMessageProcessor(commands.Cog):
 
         await channel.send(
             embed=embed,
-            silent=silent
+            silent=silent,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
 
     async def send_broadcast(self, msg: ScheduledMessage, content_data: dict):
         """Send a message to all text channels under a category."""
-        category = self.bot.get_channel(msg.category_id)
+        category = await resolve_guild_channel(self.bot, msg.guild_id, msg.category_id)
         if not category:
-            raise ValueError(f"Category {msg.category_id} not found")
+            raise ValueError(f"Category {msg.category_id} is not available in guild {msg.guild_id}")
 
         if not isinstance(category, discord.CategoryChannel):
             raise ValueError(f"Channel {msg.category_id} is not a category")
@@ -133,7 +136,11 @@ class ScheduledMessageProcessor(commands.Cog):
         # Send to all text channels in the category
         for channel in category.text_channels:
             try:
-                await channel.send(content=content, silent=silent)
+                await channel.send(
+                    content=content,
+                    silent=silent,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
                 sent_count += 1
             except discord.Forbidden:
                 failed_channels.append(channel.name)

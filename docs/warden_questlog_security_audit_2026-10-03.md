@@ -2,8 +2,36 @@
 
 Date: 2026-10-03
 
-Status: source and production-aggregate review complete; remediation is not yet
-deployed.
+Status updated 2026-10-13: final source review complete and project frozen;
+production deployment remains a separate operator action.
+
+## Final closure review - 2026-10-13
+
+The owner requested a manual final security review without a Codex Security
+scan. The final source candidate includes the earlier hardening plus these
+additional corrections:
+
+- signed synchronization requires a current Discord guild administrator;
+- deleted-message actors are reported only when a recent matching Discord
+  audit record provides positive evidence;
+- welcome templates may ping only the member being welcomed, preventing a
+  crafted display name or template from producing broad mentions;
+- database-backed scheduled messages cannot produce Discord mentions;
+- the root-owned AMP registry lock must not be group/world writable; and
+- AMP instance ownership, role grants, cross-guild resources, privileged API
+  calls, bridge destinations, RSS fetches, payload sizes, and replay controls
+  fail closed at their execution boundaries.
+
+Final validation uses the repository's complete unit/regression suite, Python
+compilation, `pip check`, `git diff --check`, manual source review, and a
+dependency audit of `requirements.txt`. The locked dependency set has no known
+published vulnerabilities at the time of closure. The existing local virtual
+environment is older than that lock and must not be treated as the final
+runtime until the lock is installed in a controlled deployment.
+
+No deployment or Discord mutation is implied by this source closure. Because
+the repository is frozen, leaving the service online indefinitely without an
+external dependency-maintenance owner is an explicitly accepted residual risk.
 
 ## Remediation implementation update
 

@@ -48,6 +48,7 @@ from models import (
     RSSFeedEntry,
     Guild,
 )
+from utils.guild_resources import resolve_guild_channel
 
 # urllib3 lets the fetcher connect to the exact IP address that was validated.
 # A normal hostname request would perform a second DNS lookup and permit DNS
@@ -686,9 +687,12 @@ class RSSFeedsCog(commands.Cog):
         feed.last_polled_at = current_time
 
         # Get the channel
-        channel = self.bot.get_channel(feed.channel_id)
+        channel = await resolve_guild_channel(self.bot, feed.guild_id, feed.channel_id)
         if not channel:
-            logger.debug(f"RSSFeeds: Channel {feed.channel_id} not found for feed {feed.id}")
+            logger.warning(
+                f"RSSFeeds: Channel {feed.channel_id} is not available "
+                f"in guild {feed.guild_id} for feed {feed.id}"
+            )
             return 0
 
         # Poll the feed

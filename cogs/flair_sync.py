@@ -10,6 +10,7 @@ import discord
 from discord.ext import commands
 from sqlalchemy import text
 from config import db_session_scope, logger
+from utils.role_security import automatic_role_execution_error
 
 POLL_INTERVAL = 10    # seconds between polls
 FLAIR_ROLE_PREFIX = 'Flair: '
@@ -195,6 +196,49 @@ class FlairSyncCog(commands.Cog):
                 'now': now,
             })
 
+    def _migrate_role_binding(
+        self,
+        guild_id: int,
+        old_flair_key: str,
+        new_flair_key: str,
+        new_role_name: str,
+    ) -> int | None:
+        """Move an existing ID-backed ownership record during a flair rename."""
+        if old_flair_key == new_flair_key:
+            return self._bound_role_id(guild_id, new_flair_key)
+        now = int(time.time())
+        with db_session_scope() as db:
+            existing = db.execute(text(
+                "SELECT role_id FROM warden_flair_role_bindings "
+                "WHERE guild_id=:guild AND flair_key=:flair LIMIT 1"
+            ), {'guild': guild_id, 'flair': new_flair_key}).fetchone()
+            if existing:
+                return int(existing[0])
+            old = db.execute(text(
+                "SELECT role_id FROM warden_flair_role_bindings "
+                "WHERE guild_id=:guild AND flair_key=:flair LIMIT 1"
+            ), {'guild': guild_id, 'flair': old_flair_key}).fetchone()
+            if not old:
+                return None
+            db.execute(text(
+                "UPDATE warden_flair_role_bindings "
+                "SET flair_key=:new_flair,role_name=:name,updated_at=:now "
+                "WHERE guild_id=:guild AND flair_key=:old_flair"
+            ), {
+                'guild': guild_id,
+                'old_flair': old_flair_key,
+                'new_flair': new_flair_key,
+                'name': new_role_name[:100],
+                'now': now,
+            })
+            return int(old[0])
+
+    @staticmethod
+    def _flair_key(flair_emoji: str, flair_name: str) -> str:
+        return hashlib.sha256(
+            f'{flair_emoji.strip()}\0{flair_name.strip()}'.encode('utf-8')
+        ).hexdigest()
+
     @staticmethod
     def _safe_role_name(flair_emoji: str, flair_name: str) -> str:
         visible = ' '.join(
@@ -208,12 +252,13 @@ class FlairSyncCog(commands.Cog):
         if target_name == FLAIR_ROLE_PREFIX.strip():
             return None
 
-        flair_key = hashlib.sha256(
-            f'{flair_emoji.strip()}\0{flair_name.strip()}'.encode('utf-8')
-        ).hexdigest()
+        flair_key = self._flair_key(flair_emoji, flair_name)
         bound_role_id = self._bound_role_id(guild.id, flair_key)
         role = guild.get_role(bound_role_id) if bound_role_id else None
         if role:
+            role_error = automatic_role_execution_error(guild, role)
+            if role_error:
+                raise RuntimeError(f'Bound flair role {role.id} is unsafe: {role_error}')
             if role.name != target_name:
                 await role.edit(name=target_name, reason='QuestLog flair name refresh')
             return role
@@ -261,6 +306,9 @@ class FlairSyncCog(commands.Cog):
             await member.remove_roles(*old_flair_roles, reason='QuestLog flair update')
 
         if target_role and target_role not in member.roles:
+            role_error = automatic_role_execution_error(guild, target_role)
+            if role_error:
+                raise RuntimeError(f'Flair role {target_role.id} is unsafe: {role_error}')
             await member.add_roles(target_role, reason='QuestLog flair update')
 
         return 'delivered', target_role.id if target_role else None

@@ -50,6 +50,7 @@ from config import (
     QUESTLOG_INTERNAL_API_URL,
     logger,
 )
+from utils.guild_resources import resolve_guild_channel, resource_belongs_to_guild
 
 _BASE = QUESTLOG_INTERNAL_API_URL.rstrip('/')
 _RELAY_URL              = _BASE + '/api/internal/bridge/relay/'
@@ -74,6 +75,10 @@ _CUSTOM_EMOJI_RE = re.compile(r'<a?:(\w+):\d+>')
 # Matches a string that is purely one or more URLs (possibly separated by whitespace)
 _URL_ONLY_RE = re.compile(r'^(https?://\S+\s*)+$')
 _MAX_MEDIA_BYTES = 25 * 1024 * 1024
+_NO_MENTIONS = discord.AllowedMentions.none()
+_PROVENANCE_HEADER_RE = re.compile(
+    r'^(?:> [^\r\n]*\n)?\*\*\[(?P<tag>[DFM])\] [^\r\n]{1,100}:\*\*',
+)
 
 
 def _url_hostname(url: str) -> str:
@@ -175,15 +180,32 @@ def _format_bridged(tag: str, author: str, content: str, reply_quote: str = '') 
     If content is a bare URL (or URLs), put them on a new line so the platform
     can unfurl the link preview. Mixed text+URL stays on one line.
     """
-    header = f"**[{tag}] {author}:**"
+    safe_author = ' '.join(str(author or 'Unknown').split())[:80]
+    safe_author = discord.utils.escape_markdown(safe_author) or 'Unknown'
+    header = f"**[{tag}] {safe_author}:**"
     body = content.rstrip() if content else ''
     if reply_quote:
-        prefix = f"> {reply_quote}\n"
+        safe_quote = ' '.join(str(reply_quote).split())
+        prefix = f"> {safe_quote}\n"
     else:
         prefix = ''
     if body and _URL_ONLY_RE.match(body):
         return f"{prefix}{header}\n{body}"
     return f"{prefix}{header} {body}".rstrip()
+
+
+def _safe_bridge_edit(existing_content: str, pending_content: str) -> str | None:
+    """Keep trusted relay provenance while accepting a hub-formatted new body."""
+    existing_match = _PROVENANCE_HEADER_RE.match(existing_content or '')
+    pending_match = _PROVENANCE_HEADER_RE.match(pending_content or '')
+    if not existing_match or not pending_match:
+        return None
+    if existing_match.group('tag') != pending_match.group('tag'):
+        return None
+    return (
+        existing_content[:existing_match.end()]
+        + pending_content[pending_match.end():]
+    )
 
 
 def _resolve_discord_content(message: discord.Message) -> tuple[str, list]:
@@ -437,9 +459,21 @@ class BridgeCog(commands.Cog):
                 # Reference to a different channel = forward
                 is_forward = True
                 ref_msg = message.reference.resolved
+                if ref_msg is not None and not resource_belongs_to_guild(
+                    getattr(ref_msg, 'channel', None),
+                    message.guild.id,
+                    ref_channel_id,
+                ):
+                    ref_msg = None
                 if ref_msg is None:
                     try:
-                        channel = self.bot.get_channel(ref_channel_id) or await self.bot.fetch_channel(ref_channel_id)
+                        channel = await resolve_guild_channel(
+                            self.bot,
+                            message.guild.id,
+                            ref_channel_id,
+                        )
+                        if channel is None:
+                            raise ValueError("Referenced channel is outside the source guild")
                         ref_msg = await channel.fetch_message(message.reference.message_id)
                     except Exception:
                         pass
@@ -790,7 +824,12 @@ class BridgeCog(commands.Cog):
                     except Exception:
                         pass  # Reply target gone - send without reference
 
-                sent = await send_channel.send(formatted, reference=reference, files=discord_files or None)
+                sent = await send_channel.send(
+                    formatted,
+                    reference=reference,
+                    files=discord_files or None,
+                    allowed_mentions=_NO_MENTIONS,
+                )
                 # Record the sent message ID for reaction mapping
                 if relay_id and sent:
                     await self._store_message_map(relay_id, str(sent.id), str(send_channel.id))
@@ -899,6 +938,12 @@ class BridgeCog(commands.Cog):
                     logger.warning("BridgeCog: rejected deletion target channel %s", channel_id)
                     continue
                 message = await channel.fetch_message(int(message_id))
+                if not self.bot.user or message.author.id != self.bot.user.id:
+                    logger.warning("BridgeCog: rejected deletion of non-Warden message %s", message_id)
+                    continue
+                if not _PROVENANCE_HEADER_RE.match(message.content or ''):
+                    logger.warning("BridgeCog: rejected deletion of non-relay message %s", message_id)
+                    continue
                 await message.delete()
             except discord.NotFound:
                 pass  # already deleted, ignore
@@ -936,7 +981,14 @@ class BridgeCog(commands.Cog):
                     logger.warning("BridgeCog: rejected edit target channel %s", channel_id)
                     continue
                 message = await channel.fetch_message(int(message_id))
-                await message.edit(content=new_content)
+                if not self.bot.user or message.author.id != self.bot.user.id:
+                    logger.warning("BridgeCog: rejected edit of non-Warden message %s", message_id)
+                    continue
+                safe_content = _safe_bridge_edit(message.content, new_content)
+                if safe_content is None:
+                    logger.warning("BridgeCog: rejected edit with missing or changed relay provenance for %s", message_id)
+                    continue
+                await message.edit(content=safe_content, allowed_mentions=_NO_MENTIONS)
             except discord.NotFound:
                 pass  # message already deleted, ignore
             except discord.Forbidden:

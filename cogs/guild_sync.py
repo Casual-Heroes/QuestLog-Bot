@@ -5,13 +5,9 @@ Guild Sync Cog - Automatically syncs guild data when changes occur
 import asyncio
 import time
 import os
-from dotenv import load_dotenv
 from discord.ext import commands
 import discord
 from config import logger
-
-# Load environment variables
-load_dotenv()
 
 
 class AutoGuildSyncCog(commands.Cog):

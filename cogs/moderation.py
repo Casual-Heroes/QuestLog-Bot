@@ -25,6 +25,10 @@ from models import (
     Guild, GuildMember, Warning, WarningType,
     ModerationConfig, ModAction, AuditLog, AuditAction
 )
+from utils.role_security import (
+    automatic_role_execution_error,
+    delegated_role_grant_error,
+)
 
 
 # Slur/ism patterns - comprehensive list of offensive terms
@@ -370,6 +374,10 @@ class ModerationCog(commands.Cog):
         jail_role = guild.get_role(jail_role_id)
         if not jail_role:
             return False
+        role_error = automatic_role_execution_error(guild, jail_role)
+        if role_error:
+            logger.warning("Refusing unsafe jail role %s: %s", jail_role_id, role_error)
+            return False
 
         try:
             # Save current roles before removing (except @everyone and managed roles)
@@ -430,7 +438,10 @@ class ModerationCog(commands.Cog):
                 for role_id_str in saved_role_ids:
                     try:
                         role = guild.get_role(int(role_id_str))
-                        if role:
+                        role_error = automatic_role_execution_error(guild, role)
+                        if role_error:
+                            logger.warning("Refusing unsafe unjail restore role %s: %s", role_id_str, role_error)
+                        else:
                             roles_to_add.append(role)
                     except:
                         pass
@@ -881,6 +892,12 @@ class ModerationCog(commands.Cog):
         muted_role = ctx.guild.get_role(muted_role_id)
         if not muted_role:
             await ctx.respond("Muted role not found.", ephemeral=True)
+            return
+        role_error = delegated_role_grant_error(
+            ctx.guild, muted_role, actor=ctx.author, target=user
+        )
+        if role_error:
+            await ctx.respond(f"Cannot use the configured muted role: {role_error}", ephemeral=True)
             return
 
         if muted_role in user.roles:

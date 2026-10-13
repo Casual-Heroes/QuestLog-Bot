@@ -30,6 +30,7 @@ from models import (
     Guild, GuildMember, ReactRole, LevelRole,
     TempRole, RoleTemplate, RoleRequest, ModAction, ChannelTemplate
 )
+from utils.role_security import automatic_role_error, resolve_role_approver
 
 # Dangerous permissions that should trigger alerts
 DANGEROUS_PERMS = [
@@ -1044,6 +1045,11 @@ class RolesCog(commands.Cog):
         message_id: str, emoji: str, role: discord.Role
     ):
         """Add a reaction role to a message."""
+        role_error = automatic_role_error(ctx.guild, role, approver=ctx.author)
+        if role_error:
+            await ctx.respond(f"❌ {role_error}", ephemeral=True)
+            return
+
         try:
             msg_id = int(message_id)
         except ValueError:
@@ -1076,6 +1082,7 @@ class RolesCog(commands.Cog):
                 emoji=emoji,
                 role_id=role.id,
                 role_name=role.name,
+                approved_by=ctx.author.id,
             )
             session.add(react_role)
 
@@ -1107,6 +1114,7 @@ class RolesCog(commands.Cog):
                 return
 
             role_id = react_role.role_id
+            approved_by = react_role.approved_by
 
         guild = self.bot.get_guild(payload.guild_id)
         if not guild:
@@ -1114,8 +1122,19 @@ class RolesCog(commands.Cog):
 
         role = guild.get_role(role_id)
         member = payload.member or guild.get_member(payload.user_id)
+        approver = await resolve_role_approver(guild, approved_by)
 
-        if role and member and role not in member.roles:
+        role_error = automatic_role_error(guild, role, approver=approver)
+        if role_error:
+            logger.warning(
+                "Blocked unsafe reaction role %s in guild %s: %s",
+                role_id,
+                guild.id,
+                role_error,
+            )
+            return
+
+        if member and role not in member.roles:
             try:
                 await member.add_roles(role, reason="React role")
             except discord.Forbidden:

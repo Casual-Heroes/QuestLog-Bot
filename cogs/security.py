@@ -39,6 +39,7 @@ from models import (
     AuditAction,
     ModAction,
 )
+from utils.role_security import automatic_role_execution_error
 
 
 # Dangerous permissions that should trigger alerts
@@ -204,7 +205,10 @@ class SecurityCog(commands.Cog):
         # Auto-quarantine if enabled
         if auto_quarantine and quarantine_role_id:
             quarantine_role = guild.get_role(quarantine_role_id)
-            if quarantine_role:
+            role_error = automatic_role_execution_error(guild, quarantine_role)
+            if role_error:
+                logger.warning("Refusing unsafe raid quarantine role %s: %s", quarantine_role_id, role_error)
+            elif quarantine_role:
                 try:
                     await member.add_roles(
                         quarantine_role,

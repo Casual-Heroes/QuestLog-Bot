@@ -11,12 +11,13 @@ only public keys and rejects stale or replayed requests.
 - `WARDEN_API_TRUSTED_SIGNERS` contains only public keys and exists on Warden.
 - `WARDEN_API_LOCAL_SYNC_TOKEN` exists only on Warden and is accepted only
   from loopback for the `guilds.sync` scope.
-- `DISCORD_BOT_API_TOKEN` is a temporary migration credential. Remove it from
-  both services after signed traffic is verified.
+- `DISCORD_BOT_API_TOKEN` is a deprecated migration credential accepted only
+  for guild discovery. It never authorizes synchronization, moderation, or
+  creator actions, even in `dual` or `legacy` mode.
 
 Never paste generated credentials into source control, tickets, or chat.
 
-## Rollout without downtime
+## Coordinated secure rollout
 
 1. Generate a key pair on a trusted administrative host:
 
@@ -30,19 +31,21 @@ Never paste generated credentials into source control, tickets, or chat.
    python -c "import secrets; print(secrets.token_urlsafe(32))"
    ```
 
-3. On Warden, configure the generated public `WARDEN_API_TRUSTED_SIGNERS`, the
-   local sync token, and `WARDEN_API_AUTH_MODE=dual`. Keep the old bearer token
-   temporarily, then deploy Warden.
+3. Schedule a coordinated deployment window. On Warden, configure the generated
+   public `WARDEN_API_TRUSTED_SIGNERS`, the local sync token, and
+   `WARDEN_API_AUTH_MODE=signed`. Do not deploy Warden until the matching private
+   key is ready on QuestLog. Privileged legacy calls are intentionally rejected,
+   so an uncoordinated migration cannot preserve those insecure operations.
 
 4. On QuestLog, configure the generated `WARDEN_API_SIGNING_KEY_ID` and
-   `WARDEN_API_SIGNING_PRIVATE_KEY`, then deploy the website. Exercise guild
+   `WARDEN_API_SIGNING_PRIVATE_KEY`, then deploy the website and Warden together.
+   Exercise guild
    listing, manual sync, moderation, creator announcements, message deletion,
    and network announcements. Warden logs should show no new legacy bearer
    warnings for website routes.
 
-5. Set `WARDEN_API_AUTH_MODE=signed`, restart Warden, and repeat the smoke
-   tests. The process fails closed at startup if a route scope or the local
-   sync credential is missing.
+5. Repeat the smoke tests after restarting Warden. The process fails closed at
+   startup if a route scope or the local sync credential is missing.
 
 6. Remove `DISCORD_BOT_API_TOKEN` from both services and rotate any copy that
    may have existed outside the approved secret stores.

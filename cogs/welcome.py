@@ -25,6 +25,29 @@ from config import (
     get_debug_guilds,
 )
 from models import Guild, GuildMember, WelcomeConfig
+from utils.role_security import (
+    automatic_role_error,
+    automatic_role_execution_error,
+    resolve_role_approver,
+)
+
+
+def _welcome_allowed_mentions(member: discord.Member) -> discord.AllowedMentions:
+    """Allow only the joining member to be pinged by a welcome template."""
+    return discord.AllowedMentions(
+        everyone=False,
+        roles=False,
+        users=[member],
+        replied_user=False,
+    )
+
+
+async def _resolve_auto_role_approver(
+    guild: discord.Guild,
+    approver_id: int | None,
+) -> discord.Member | None:
+    """Resolve the approving member without treating a cache miss as removal."""
+    return await resolve_role_approver(guild, approver_id)
 
 
 def _sync_discord_member_count(session, guild: discord.Guild):
@@ -169,6 +192,7 @@ class WelcomeCog(commands.Cog):
             dm_enabled = config.dm_enabled
             dm_message = config.dm_message
             auto_role_id = config.auto_role_id
+            auto_role_approved_by = config.auto_role_approved_by
             verified_role_id = db_guild.verified_role_id
             welcome_channel_id = db_guild.welcome_channel_id
 
@@ -192,7 +216,10 @@ class WelcomeCog(commands.Cog):
                             embed.set_footer(text=format_message(embed_footer, member, join_number))
                         await dest_channel.send(embed=embed)
                     else:
-                        await dest_channel.send(formatted_message)
+                        await dest_channel.send(
+                            formatted_message,
+                            allowed_mentions=_welcome_allowed_mentions(member),
+                        )
 
                 if isinstance(welcome_channel, discord.TextChannel):
                     await send_payload(welcome_channel)
@@ -226,7 +253,16 @@ class WelcomeCog(commands.Cog):
         # Assign auto-role (only if different from verified role, since that's already assigned)
         if auto_role_id and auto_role_id != verified_role_id:
             auto_role = guild.get_role(auto_role_id)
-            if auto_role:
+            approver = await _resolve_auto_role_approver(guild, auto_role_approved_by)
+            role_error = automatic_role_error(guild, auto_role, approver=approver)
+            if role_error:
+                logger.warning(
+                    "Blocked unsafe post-verification auto-role %s in guild %s: %s",
+                    auto_role_id,
+                    guild.id,
+                    role_error,
+                )
+            else:
                 try:
                     await member.add_roles(auto_role, reason="Auto-role (post-verification)")
                 except discord.Forbidden:
@@ -279,6 +315,7 @@ class WelcomeCog(commands.Cog):
             dm_enabled = config.dm_enabled
             dm_message = config.dm_message
             auto_role_id = config.auto_role_id
+            auto_role_approved_by = config.auto_role_approved_by
             welcome_channel_id = db_guild.welcome_channel_id
 
             # Check for role persistence (for returning members)
@@ -316,7 +353,10 @@ class WelcomeCog(commands.Cog):
                             embed.set_footer(text=format_message(embed_footer, member, join_number))
                         await dest_channel.send(embed=embed)
                     else:
-                        await dest_channel.send(formatted_message)
+                        await dest_channel.send(
+                            formatted_message,
+                            allowed_mentions=_welcome_allowed_mentions(member),
+                        )
 
                 if isinstance(welcome_channel, discord.TextChannel):
                     await send_payload(welcome_channel)
@@ -352,7 +392,16 @@ class WelcomeCog(commands.Cog):
         # Auto-role
         if auto_role_id:
             auto_role = guild.get_role(auto_role_id)
-            if auto_role:
+            approver = await _resolve_auto_role_approver(guild, auto_role_approved_by)
+            role_error = automatic_role_error(guild, auto_role, approver=approver)
+            if role_error:
+                logger.warning(
+                    "Blocked unsafe welcome auto-role %s in guild %s: %s",
+                    auto_role_id,
+                    guild.id,
+                    role_error,
+                )
+            else:
                 try:
                     await member.add_roles(auto_role, reason="Auto-role on join")
                 except discord.Forbidden:
@@ -363,10 +412,16 @@ class WelcomeCog(commands.Cog):
             roles_to_add = []
             for role_id in saved_role_ids:
                 role = guild.get_role(role_id)
-                if role and not role.managed and role.id != guild.id:
-                    # Don't restore roles that are higher than bot's top role
-                    if role < guild.me.top_role:
-                        roles_to_add.append(role)
+                role_error = automatic_role_execution_error(guild, role)
+                if role_error:
+                    logger.warning(
+                        "Blocked unsafe persisted role %s in guild %s: %s",
+                        role_id,
+                        guild.id,
+                        role_error,
+                    )
+                    continue
+                roles_to_add.append(role)
 
             if roles_to_add:
                 try:
@@ -540,7 +595,10 @@ class WelcomeCog(commands.Cog):
 
             await welcome_channel.send(content="**[TEST]** This is a test welcome message:", embed=embed)
         else:
-            await welcome_channel.send(f"**[TEST]** {formatted_message}")
+            await welcome_channel.send(
+                f"**[TEST]** {formatted_message}",
+                allowed_mentions=_welcome_allowed_mentions(ctx.author),
+            )
 
         await ctx.respond(f"Test welcome message sent to {welcome_channel.mention}!", ephemeral=True)
 
@@ -701,15 +759,17 @@ class WelcomeCog(commands.Cog):
             config = self.get_welcome_config(session, ctx.guild.id)
 
             if role:
-                # Check if bot can assign this role
-                if role >= ctx.guild.me.top_role:
-                    await ctx.respond("I cannot assign a role that is higher than my top role.", ephemeral=True)
+                role_error = automatic_role_error(ctx.guild, role, approver=ctx.author)
+                if role_error:
+                    await ctx.respond(f"❌ {role_error}", ephemeral=True)
                     return
 
                 config.auto_role_id = role.id
+                config.auto_role_approved_by = ctx.author.id
                 await ctx.respond(f"Auto-role set to {role.mention}. New members will receive this role.", ephemeral=True)
             else:
                 config.auto_role_id = None
+                config.auto_role_approved_by = None
                 await ctx.respond("Auto-role disabled.", ephemeral=True)
 
     @welcome.command(name="variables", description="Show available message variables")

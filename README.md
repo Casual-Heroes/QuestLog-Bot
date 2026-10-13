@@ -1,5 +1,12 @@
 # QuestLog Bot
 
+> **Project status: maintenance closed after the final security release.**
+> This repository accepts no new features or routine code updates. The final
+> release must be deployed with its locked dependencies and production secret
+> files. Any operator who keeps the bot online remains responsible for future
+> dependency advisories, credential rotation, Discord policy changes, and
+> retiring the service when it can no longer be operated safely.
+
 The Discord bot that pairs with the [QuestLog platform](https://github.com/CasualHeroes/QuestLog). Handles server security, engagement, community discovery, XP/leveling, LFG, streaming integrations, and more - all fully open source and free.
 
 > "WardenBot" was the internal codename during development. The bot is publicly known as **QuestLog Bot**.
@@ -55,14 +62,12 @@ The Discord bot that pairs with the [QuestLog platform](https://github.com/Casua
 
 ---
 
-## Coming Soon
+## Project Closure
 
-QuestLog Bot is Discord-first, but the platform is expanding. Ports to other networks are actively in development:
-
-- **Matrix** - A QuestLog Bot for Matrix rooms, built on the same codebase
-- **Fluxer** - A QuestLog Bot for Fluxer, as the platform grows
-
-The goal is a single cohesive community toolkit that works across open and federated platforms - not just Discord.
+Warden/QuestLog Bot is feature-frozen. Fluxer, Matrix, and other platform work
+lives in their own projects and will not be ported back into this repository.
+Operational deployment, backups, monitoring, and eventual retirement are not
+automatically performed by a source release.
 
 ---
 
@@ -171,11 +176,35 @@ Copy `.env.example` for the full list. Key variables:
 
 | Variable | Description |
 |---|---|
-| `WARDEN_API_AUTH_MODE` | `dual` during migration; `signed` after cutover |
+| `WARDEN_API_AUTH_MODE` | `signed` (default); `dual` permits legacy only for guild discovery |
 | `WARDEN_API_TRUSTED_SIGNERS` | Ed25519 public keys and authorized API scopes |
 | `WARDEN_API_LOCAL_SYNC_TOKEN` | Loopback-only credential limited to internal sync jobs |
-| `DISCORD_BOT_API_TOKEN` | Temporary legacy dashboard credential; remove after cutover |
+| `DISCORD_BOT_API_TOKEN` | Deprecated low-risk migration credential; never authorizes moderation/creator actions |
+| `/etc/casual-heroes/amp-guild-bindings.json` | Root-owned, hot-reloaded AMP instance-to-guild registry (versioned JSON; `root:www-data`, mode `0640`) |
+| `WARDEN_AMP_GUILD_BINDINGS` | Deprecated migration fallback used only before the registry has been loaded |
 | `DJANGO_DB_NAME` / `DJANGO_DB_USER` / `DJANGO_DB_PASSWORD` | Access to the QuestLog web database for shared data |
+
+Create the registry once from the legacy environment mapping:
+
+```bash
+sudo ./wardenprj/bin/python scripts/manage_amp_guild_registry.py bootstrap-env
+```
+
+Provisioning can then bind or unbind instances atomically without restarting
+Warden. The bot hot-reloads the root-owned file but cannot modify it:
+
+```bash
+sudo ./wardenprj/bin/python scripts/manage_amp_guild_registry.py bind INSTANCE GUILD_ID
+sudo ./wardenprj/bin/python scripts/manage_amp_guild_registry.py unbind INSTANCE GUILD_ID
+```
+
+Public channels hide AMP passwords by default. For an intentionally public
+game server, grant that disclosure separately in the root-owned registry:
+
+```bash
+sudo ./wardenprj/bin/python scripts/manage_amp_guild_registry.py allow-public-password INSTANCE GUILD_ID
+sudo ./wardenprj/bin/python scripts/manage_amp_guild_registry.py deny-public-password INSTANCE GUILD_ID
+```
 
 ### Discord OAuth (optional - for web dashboard)
 

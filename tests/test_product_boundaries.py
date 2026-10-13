@@ -72,7 +72,11 @@ class ProductBoundaryTests(unittest.TestCase):
         self.assertIn("secrets.compare_digest", api)
         self.assertIn("client_max_size=64 * 1024", api)
         self.assertIn("len(API_TOKEN) < 32", api)
-        self.assertIn('WARDEN_API_AUTH_MODE", "dual"', api)
+        self.assertIn('WARDEN_API_AUTH_MODE", "signed"', api)
+        self.assertIn('LEGACY_ALLOWED_SCOPES = frozenset({"guilds.read"})', api)
+        self.assertIn("Signed authentication required", api)
+        self.assertIn('scope == "creator.network.write"', api)
+        self.assertIn("NETWORK_CREATOR_APPROVER_IDS", api)
         self.assertIn("verify_signed_request", api)
         self.assertIn("Ed25519PublicKey", signed_auth)
         self.assertIn("Request replay detected", signed_auth)
@@ -102,6 +106,8 @@ class ProductBoundaryTests(unittest.TestCase):
         self.assertIn("AUDIT_RETENTION_DAYS=90", example)
         self.assertIn("AUDIT_RETENTION_ENFORCEMENT_ENABLED=true", example)
         self.assertIn("AUDIT_DELETED_CONTENT_ENABLED=false", example)
+        cleanup = audit[audit.index("async def cleanup_old_logs_task"):audit.index("@cleanup_old_logs_task.before_loop")]
+        self.assertNotIn("if AUDIT_DELETED_CONTENT_ENABLED:", cleanup)
 
     def test_invite_codes_are_not_written_to_logs(self):
         invite = source("cogs/invite.py")

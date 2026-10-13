@@ -19,6 +19,7 @@ from discord.ext import commands, tasks
 
 from config import logger, db_session_scope
 from sqlalchemy import text
+from utils.guild_resources import resolve_guild_channel
 
 # ---------------------------------------------------------------------------
 # Twitch app-token helpers (client credentials - no user OAuth needed)
@@ -343,15 +344,12 @@ class LiveAlertsCog(commands.Cog):
             )
 
         # Resolve Discord channel
-        channel = self.bot.get_channel(int(channel_id))
+        channel = await resolve_guild_channel(self.bot, guild_id, channel_id)
         if channel is None:
-            try:
-                channel = await self.bot.fetch_channel(int(channel_id))
-            except Exception as e:
-                logger.warning(
-                    f"LiveAlerts: channel {channel_id} not found for guild {guild_id}: {e}"
-                )
-                return
+            logger.warning(
+                f"LiveAlerts: channel {channel_id} is not available in guild {guild_id}"
+            )
+            return
 
         try:
             await channel.send(content=content, embed=embed)

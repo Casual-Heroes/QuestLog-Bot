@@ -3002,7 +3002,7 @@ class DiscoveryCog(commands.Cog):
                 # Try to delete the featured message
                 if entry.featured_message_id:
                     try:
-                        channel = self.bot.get_channel(config.selfpromo_channel_id)
+                        channel = ctx.guild.get_channel(config.selfpromo_channel_id)
                         if channel:
                             msg = await channel.fetch_message(entry.featured_message_id)
                             await msg.delete()

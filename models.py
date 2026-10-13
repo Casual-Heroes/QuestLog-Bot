@@ -534,7 +534,19 @@ class AuditLog(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     guild_id = Column(BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"))
 
-    action = Column(SQLEnum(AuditAction, native_enum=False, length=50), nullable=False)
+    # The shared QuestLog database stores the public enum values (for example,
+    # ``message_delete``), not Python's upper-case enum member names.  Keep this
+    # mapping aligned with the website model so either service can safely read
+    # rows written by the other.
+    action = Column(
+        SQLEnum(
+            AuditAction,
+            values_callable=lambda enum_type: [item.value for item in enum_type],
+            native_enum=False,
+            length=50,
+        ),
+        nullable=False,
+    )
     action_category = Column(String(50), nullable=True)
 
     actor_id = Column(BigInteger, nullable=True)
@@ -573,6 +585,7 @@ class ReactRole(Base):
     emoji = Column(String(100), nullable=False)
     role_id = Column(BigInteger, nullable=False)
     role_name = Column(String(255), nullable=True)
+    approved_by = Column(BigInteger, nullable=True)
 
     remove_on_unreact = Column(Boolean, default=True)
     exclusive_group = Column(String(100), nullable=True)
@@ -1261,6 +1274,7 @@ class WelcomeConfig(Base):
 
     # Auto-role on join (separate from verified role)
     auto_role_id = Column(BigInteger, nullable=True)
+    auto_role_approved_by = Column(BigInteger, nullable=True)
 
     # Join counter - tracks total number of welcomed members (for {join_number})
     # This increments each time a welcome is sent, giving accurate "You are member #X" counts

@@ -34,6 +34,7 @@ from config import (
     QUESTLOG_BOT_SECRET,
     get_debug_guilds,
 )
+from utils.guild_resources import resolve_guild_channel
 
 CHECK_INTERVAL = 3600  # check once per hour
 
@@ -213,8 +214,13 @@ class NominationsCog(commands.Cog):
             if self._last_fired.get(fire_key):
                 continue
 
-            channel = self.bot.get_channel(int(channel_id))
+            channel = await resolve_guild_channel(self.bot, guild_id, channel_id)
             if not channel:
+                logger.warning(
+                    "NominationsCog: channel %s is not available in guild %s",
+                    channel_id,
+                    guild_id,
+                )
                 continue
 
             if day == 1:
