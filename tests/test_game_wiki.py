@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -17,12 +18,20 @@ class GameWikiCommandTests(unittest.IsolatedAsyncioTestCase):
     def test_all_game_groups_have_search_and_commands(self):
         commands = {command.name: command for command in self.cog.get_commands()}
         self.assertIn("games", commands)
-        self.assertEqual(set(GAME_INFO), set(commands) - {"games"})
+        self.assertEqual(set(GAME_INFO) | {"ff", "ens"}, set(commands) - {"games"})
         for game in GAME_INFO:
             self.assertEqual(
                 {"search", "commands"},
                 {command.name for command in commands[game].subcommands},
             )
+        self.assertEqual({
+            "commands", "collection", "deepdungeon", "fieldops", "tripletriad", "fc",
+            "gathering", "ocean", "status", "housing", "market", "resets",
+            "jobs", "hunts", "partyfinder", "apply",
+        }, {command.name for command in commands["ff"].subcommands})
+        self.assertEqual({
+            "commands", "server", "status", "uptime", "settings", "lastbackup", "whois",
+        }, {command.name for command in commands["ens"].subcommands})
 
     def test_category_choices_fit_discord_limit(self):
         for game, (_, _, categories, _) in GAME_INFO.items():
@@ -34,6 +43,8 @@ class GameWikiCommandTests(unittest.IsolatedAsyncioTestCase):
         embed = _directory_embed()
         self.assertIn("/dd2 search name:Cyclops", embed.description)
         self.assertIn("/err commands", embed.description)
+        self.assertIn("/ff commands", embed.description)
+        self.assertIn("/ens commands", embed.description)
         self.assertNotIn("!dd2", embed.description)
         self.assertNotIn("—", embed.description)
         self.assertLessEqual(len(embed.description), 4096)
@@ -69,6 +80,35 @@ class GameWikiCommandTests(unittest.IsolatedAsyncioTestCase):
         await self.cog._search(ctx, "ms2", "Axatana", "weapons")
         args = self.cog._hubs._run.await_args.args
         self.assertEqual(("ms2", "weapons Axatana"), args[1:])
+
+    async def test_ff_gathering_routes_to_live_service(self):
+        ctx = SimpleNamespace(
+            defer=AsyncMock(), followup=SimpleNamespace(send=AsyncMock()),
+            author=SimpleNamespace(id=42), guild=SimpleNamespace(id=99),
+        )
+        self.cog._hubs._ff_gathering = AsyncMock()
+        await self.cog._ff_call(ctx, "_ff_gathering", "cotton")
+        ctx.defer.assert_awaited_once()
+        args = self.cog._hubs._ff_gathering.await_args.args
+        self.assertEqual("cotton", args[1])
+
+    def test_ff_and_ens_help_are_live_data_guides(self):
+        ff_text = "\n".join(field.value for field in self.cog._ff_help_embed().fields)
+        ens_text = "\n".join(field.value for field in self.cog._ens_help_embed().fields)
+        self.assertIn("/ff gathering", ff_text)
+        self.assertIn("/ff collection", ff_text)
+        self.assertIn("/ens settings", ens_text)
+        self.assertIn("/ens whois", ens_text)
+        self.assertNotIn("—", ff_text + ens_text)
+
+    def test_linked_ffxiv_profile_uses_discord_identity(self):
+        source = Path("cogs/game_wiki_hubs.py").read_text()
+        self.assertIn("WHERE discord_id=:did", source)
+        self.assertNotIn("WHERE fluxer_id=:fid", source)
+
+    def test_ens_status_never_requests_server_password(self):
+        source = Path("cogs/game_wiki.py").read_text()
+        self.assertIn("build_serverinfo_embed(cfg, include_password=False)", source)
 
 
     def test_hub_fetches_are_restricted_to_questlog_https(self):
