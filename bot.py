@@ -482,6 +482,7 @@ def main():
         "cogs.nominations",            # Monthly community spotlight nominations + voting
         "cogs.creators",               # Creator of Week/Month spotlight commands
         "cogs.ffxiv_timers",           # FFXIV gathering/ocean/reset timer alerts
+        "cogs.game_wiki",              # QuestLog game database slash commands
         # "cogs.soulmask",              # Soulmask cluster management via AMP RCON - DISABLED, not an active game (2026-07-12)
     ]
 
