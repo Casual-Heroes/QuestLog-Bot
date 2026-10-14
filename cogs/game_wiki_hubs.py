@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from urllib.parse import quote, urlencode, urlparse
 
@@ -13,8 +15,9 @@ import aiohttp
 import discord
 from discord.ext import commands
 Cog = commands.Cog
+from sqlalchemy import text
 
-from config import logger
+from config import db_session_scope, logger
 
 QUESTLOG_PUBLIC_URL = "https://questlog.casual-heroes.com"
 
@@ -694,7 +697,7 @@ def command_directory_embed():
         "🌵 **Crimson Desert** - `!cd`",
     ])
     _add(embed, "Live tools", [
-        "✨ **Final Fantasy XIV** - `!ff`",
+        "✨ **Final Fantasy XIV** - `/ff`",
         "🔥 **Enshrouded** - `!ens`",
     ])
     _add(embed, "How to use", [
@@ -788,11 +791,173 @@ def record_embed(game, category, row):
     return embed
 
 
+FF_TOOLS = {
+    "jobs": ("Job Guides", "/ffxiv/tools/job-guides/"), "job": ("Job Guides", "/ffxiv/tools/job-guides/"),
+    "jobguides": ("Job Guides", "/ffxiv/tools/job-guides/"),
+    "housing": ("Housing Tracker", "/ffxiv/tools/housing/"), "deepdungeon": ("Deep Dungeon Tracker", "/ffxiv/tools/deep-dungeon/"),
+    "housingtracker": ("Housing Tracker", "/ffxiv/tools/housing/"),
+    "fieldops": ("Field Operations Tracker", "/ffxiv/tools/field-ops/"), "fieldoperations": ("Field Operations Tracker", "/ffxiv/tools/field-ops/"), "gatheringtimes": ("Gathering Timers", "/ffxiv/tools/gathering/"),
+    "gathering": ("Gathering Timers", "/ffxiv/tools/gathering/"), "hunts": ("Hunt Board", "/ffxiv/tools/hunt-board/"),
+    "mb": ("Market Board", "/ffxiv/tools/market-board/"), "ocean": ("Ocean Fishing", "/ffxiv/tools/ocean-fishing/"),
+    "pf": ("Party Finder", "/lfg/"), "tripletriad": ("Triple Triad", "/ffxiv/tools/triple-triad/"), "tripletraid": ("Triple Triad", "/ffxiv/tools/triple-triad/"),
+    "collection": ("Collection Tracker", "/ffxiv/tools/collection/"), "mounts": ("Mount Collection", "/ffxiv/tools/collection/"),
+    "minions": ("Minion Collection", "/ffxiv/tools/collection/"), "achievements": ("Achievement Collection", "/ffxiv/tools/collection/"),
+    "fc": ("FC Progression", "/ffxiv/tools/fc/"), "resets": ("Reset Checklist", "/ffxiv/tools/resets/"),
+    "apply": ("Apply to the FC", "/ffxiv/apply/"),
+}
+
+
+def _json_value(value, default):
+    try:
+        parsed = json.loads(value or "")
+        return parsed if isinstance(parsed, type(default)) else default
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return default
+
+
+def _ffxiv_profile_for_discord(discord_user_id):
+    """Return the requesting user's linked FFXIV data; never accepts another user."""
+    if not str(discord_user_id or "").strip():
+        return None
+    try:
+        with db_session_scope() as db:
+            user = db.execute(text(
+                "SELECT id, username FROM web_users "
+                "WHERE discord_id=:did AND is_banned=0 AND is_disabled=0 LIMIT 1"
+            ), {"did": str(discord_user_id)}).fetchone()
+            if not user:
+                return None
+            character = db.execute(text(
+                "SELECT lodestone_id, character_name, world, datacenter, avatar_url, active_job, "
+                "mount_count, minion_count, mounts_json, minions_json, achievements_json, "
+                "sync_status, last_synced_at FROM web_ffxiv_characters "
+                "WHERE user_id=:uid ORDER BY is_primary DESC, id ASC LIMIT 1"
+            ), {"uid": user.id}).fetchone()
+            if not character:
+                return {"account": user.username, "character": None}
+
+            mounts = _json_value(character.mounts_json, [])
+            minions = _json_value(character.minions_json, [])
+            achievements = _json_value(character.achievements_json, {})
+            achievement_total = sum(len(values) for values in achievements.values() if isinstance(values, list))
+            achievement_count = sum(
+                1 for values in achievements.values() if isinstance(values, list)
+                for item in values if isinstance(item, dict) and item.get("completed")
+            )
+            triad_count = db.execute(text(
+                "SELECT COUNT(*) FROM web_ffxiv_triad_cards WHERE user_id=:uid"
+            ), {"uid": user.id}).scalar() or 0
+            clear_count = db.execute(text(
+                "SELECT COUNT(*) FROM web_ffxiv_clears WHERE user_id=:uid"
+            ), {"uid": user.id}).scalar() or 0
+            deep_dungeon = db.execute(text(
+                "SELECT dungeon, floor_end, kos, job, party_size, is_clear, run_at "
+                "FROM web_ffxiv_dd_pb WHERE user_id=:uid ORDER BY dungeon"
+            ), {"uid": user.id}).fetchall()
+            field_ops = db.execute(text(
+                "SELECT zone, elemental_level, resistance_rank, knowledge_level, relic_stage, "
+                "phantom_unlocked, phantom_mastered, forked_clears, updated_at "
+                "FROM web_ffxiv_field_ops WHERE user_id=:uid ORDER BY zone"
+            ), {"uid": user.id}).fetchall()
+            return {
+                "account": user.username,
+                "character": {
+                    "lodestone_id": character.lodestone_id,
+                    "name": character.character_name,
+                    "world": character.world,
+                    "datacenter": character.datacenter,
+                    "avatar": character.avatar_url,
+                    "active_job": character.active_job,
+                    "mount_count": max(character.mount_count or 0, len(mounts)),
+                    "minion_count": max(character.minion_count or 0, len(minions)),
+                    "mounts": mounts,
+                    "minions": minions,
+                    "achievement_count": achievement_count,
+                    "achievement_total": achievement_total,
+                    "triad_count": triad_count,
+                    "clear_count": clear_count,
+                    "sync_status": character.sync_status,
+                    "last_synced_at": character.last_synced_at,
+                },
+                "deep_dungeon": [dict(row._mapping) for row in deep_dungeon],
+                "field_ops": [dict(row._mapping) for row in field_ops],
+            }
+    except Exception as exc:
+        logger.warning("FFXIV linked profile lookup failed for Discord user %s: %s", discord_user_id, exc)
+        return None
+
+
+def _ffxiv_node_status(node, now=None):
+    """Return live Eorzea-time state and real-world seconds until the next change."""
+    now = float(now if now is not None else time.time())
+    et_total_minutes = int(now * (3600 / 175) / 60)
+    et_minute = et_total_minutes % 1440
+    uptime = int(node.get("uptime") or 0)
+    best = None
+    for spawn_hour in node.get("times") or []:
+        spawn = int(spawn_hour) * 60
+        despawn = (spawn + uptime) % 1440
+        active = spawn <= et_minute < despawn if despawn > spawn else et_minute >= spawn or et_minute < despawn
+        if active:
+            remaining = (despawn - et_minute) % 1440 or 1440
+            candidate = (0, remaining, int(spawn_hour))
+        else:
+            candidate = ((spawn - et_minute) % 1440 or 1440, 0, int(spawn_hour))
+        if best is None or (candidate[0] == 0 and best[0] != 0) or (candidate[0] == best[0] == 0 and candidate[1] < best[1]) or (candidate[0] and best[0] and candidate[0] < best[0]):
+            best = candidate
+    wait_et, remaining_et, spawn_hour = best or (1440, 0, 0)
+    return {
+        "active": wait_et == 0,
+        "wait_et": wait_et,
+        "remaining_et": remaining_et,
+        "spawn_hour": spawn_hour,
+        "event_ts": int(now + (remaining_et if wait_et == 0 else wait_et) * 175 / 60),
+        "et_hour": et_minute // 60,
+        "et_minute": et_minute % 60,
+    }
+
+
+def _featured_housing_plots(districts, limit=8):
+    """Choose a deterministic preview balanced across districts and plot sizes."""
+    candidates = []
+    for district_index, district in enumerate(districts or []):
+        district_name = str(district.get("name") or "Unknown district")
+        for plot_index, plot in enumerate(district.get("plots") or []):
+            candidates.append({
+                **plot,
+                "district_name": district_name,
+                "_order": (district_index, plot_index),
+            })
+
+    chosen = []
+    district_counts = {}
+    size_counts = {}
+    remaining = list(candidates)
+    while remaining and len(chosen) < limit:
+        best = max(
+            remaining,
+            key=lambda plot: (
+                district_counts.get(plot["district_name"], 0) == 0,
+                size_counts.get(str(plot.get("size") or "?").upper(), 0) == 0,
+                -district_counts.get(plot["district_name"], 0),
+                -size_counts.get(str(plot.get("size") or "?").upper(), 0),
+                -plot["_order"][0],
+                -plot["_order"][1],
+            ),
+        )
+        remaining.remove(best)
+        chosen.append(best)
+        district = best["district_name"]
+        size = str(best.get("size") or "?").upper()
+        district_counts[district] = district_counts.get(district, 0) + 1
+        size_counts[size] = size_counts.get(size, 0) + 1
+    return chosen
+
 
 def _questlog_fetch_url(path):
     base = QUESTLOG_PUBLIC_URL.rstrip("/")
     path_text = str(path)
-    url = path_text if path_text.startswith("http") else f"{base}/{path_text.lstrip('/')}"
+    url = path_text if path_text.startswith("http") else f"{base}/{path_text.lstrip(chr(47))}"
     parsed = urlparse(url)
     if parsed.scheme != "https" or parsed.hostname != "questlog.casual-heroes.com" or parsed.username or parsed.password:
         raise ValueError("QuestLog data URL is not an approved HTTPS endpoint")
@@ -990,7 +1155,7 @@ class GameHubsCog(Cog):
             key = (category, _norm(name))
             if not name or key in seen:
                 continue
-            seen.add(key); lines.append(f"• `/{game} search name:{name} category:{category}`")
+            seen.add(key); lines.append(f"• `!{game} {category} {name}`")
             if len(lines) == 8:
                 break
         description = f"No exact {GAMES[game]['label']} match was found for `{_clean(query)}`."
@@ -1039,3 +1204,311 @@ class GameHubsCog(Cog):
 
     async def cd(self, ctx, *, lookup: str = ""):
         await self._run(ctx, "cd", lookup)
+
+    async def _ff_collection(self, ctx, topic):
+        url = _absolute("/ffxiv/tools/collection/")
+        profile = _ffxiv_profile_for_discord(getattr(getattr(ctx, "author", None), "id", ""))
+        if not profile:
+            await ctx.reply(embed=discord.Embed(
+                title="FFXIV Collection Tracker",
+                description=(
+                    "Your Discord account is not linked to a QuestLog account. "
+                    f"[Log in and connect it on QuestLog]({url}) to view your collections here."
+                ),
+                color=0x6D5ACF, url=url,
+            ))
+            return
+        character = profile.get("character")
+        if not character:
+            await ctx.reply(embed=discord.Embed(
+                title="FFXIV Collection Tracker",
+                description=f"Your QuestLog account is connected, but it has no linked Lodestone character. [Link one here]({url}).",
+                color=0x6D5ACF, url=url,
+            ))
+            return
+
+        embed = discord.Embed(
+            title=f"✨ {character['name']} - FFXIV Progress",
+            description=f"**World:** {character.get('world') or 'Unknown'} ({character.get('datacenter') or 'Unknown DC'})",
+            color=0x6D5ACF, url=url,
+        )
+        if character.get("avatar"):
+            embed.set_thumbnail(url=character["avatar"])
+        summary = [
+            f"• Mounts - **{character['mount_count']:,}**",
+            f"• Minions - **{character['minion_count']:,}**",
+            f"• Achievements - **{character['achievement_count']:,}/{character['achievement_total']:,}**",
+            f"• Triple Triad cards - **{character['triad_count']:,}/473**",
+            f"• Tracked raid clears - **{character['clear_count']:,}**",
+        ]
+        _add(embed, "Collection summary", summary)
+        if topic in {"mounts", "minions"}:
+            names = _list_labels(character.get(topic))
+            _add(embed, f"Synced {topic}", [f"• {name}" for name in names[:15]] or ["No synced entries are available."])
+        if character.get("active_job"):
+            _add(embed, "Character", [f"**Active job:** {character['active_job']}"])
+        sync = character.get("last_synced_at")
+        if sync:
+            synced = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(int(sync)))
+            embed.set_footer(text=f"Last synced {synced} - QuestLog FFXIV Data")
+        else:
+            embed.set_footer(text=f"Sync status: {character.get('sync_status') or 'unknown'} - QuestLog FFXIV Data")
+        await ctx.reply(embed=embed)
+
+    async def _ff_personal_tracker(self, ctx, topic):
+        paths = {
+            "deepdungeon": "/ffxiv/tools/deep-dungeon/",
+            "fieldops": "/ffxiv/tools/field-ops/",
+            "tripletriad": "/ffxiv/tools/triple-triad/",
+            "fc": "/ffxiv/tools/fc/",
+        }
+        url = _absolute(paths[topic])
+        profile = _ffxiv_profile_for_discord(getattr(getattr(ctx, "author", None), "id", ""))
+        character = (profile or {}).get("character")
+        if not profile or not character:
+            await ctx.reply(embed=discord.Embed(
+                title="FFXIV Tracker",
+                description=f"Connect your QuestLog account and Lodestone character to show personal progress here. [Open this tracker]({url}).",
+                color=0x6D5ACF, url=url,
+            ))
+            return
+        embed = discord.Embed(title=f"{character['name']} - FFXIV Progress", color=0x6D5ACF, url=url)
+        if character.get("avatar"):
+            embed.set_thumbnail(url=character["avatar"])
+        if topic == "deepdungeon":
+            names = {"potd": "Palace of the Dead", "hoh": "Heaven-on-High", "eo": "Eureka Orthos"}
+            rows = [
+                f"• **{names.get(row['dungeon'], _display_label(row['dungeon']))}:** Floor {row['floor_end']} - {row.get('job') or 'Unknown job'} - {row.get('party_size') or 1} player"
+                for row in profile.get("deep_dungeon") or []
+            ]
+            _add(embed, "Personal bests", rows or ["No Deep Dungeon runs have been logged yet."])
+        elif topic == "fieldops":
+            rows = []
+            for row in profile.get("field_ops") or []:
+                progress = next((value for value in (
+                    f"Elemental level {row['elemental_level']}" if row.get("elemental_level") else "",
+                    f"Resistance rank {row['resistance_rank']}" if row.get("resistance_rank") else "",
+                    f"Knowledge level {row['knowledge_level']}" if row.get("knowledge_level") else "",
+                ) if value), "Progress recorded")
+                rows.append(f"• **{_display_label(row['zone'])}:** {progress}")
+            _add(embed, "Field Operations", rows or ["No Field Operations progress has been logged yet."])
+        elif topic == "tripletriad":
+            _add(embed, "Triple Triad collection", [f"**{character['triad_count']:,}/473 cards collected**"])
+        else:
+            _add(embed, "FC progression", [f"**Tracked raid clears:** {character['clear_count']:,}"])
+        embed.set_footer(text="QuestLog - Personal FFXIV Data")
+        await ctx.reply(embed=embed)
+
+    async def _ff_gathering(self, ctx, query):
+        url = _absolute("/ffxiv/tools/gathering/")
+        status, nodes = await self._request("static/data/ffxiv_gathering_nodes.json")
+        if status != 200 or not isinstance(nodes, list):
+            await ctx.reply(embed=discord.Embed(title="FFXIV Gathering Timers", description=f"Timers are unavailable right now. [Open the live tracker]({url}).", color=ERROR_COLOR, url=url))
+            return
+        target = _norm(query)
+        if target:
+            nodes = [node for node in nodes if target in _norm(" ".join([
+                str(node.get("name") or ""), str(node.get("zone") or ""), " ".join(node.get("items") or []),
+            ]))]
+        ranked = []
+        for node in nodes:
+            state = _ffxiv_node_status(node)
+            ranked.append((0 if state["active"] else 1, state["event_ts"], node, state))
+        ranked.sort(key=lambda value: (value[0], value[1], str(value[2].get("name") or "")))
+        embed = discord.Embed(
+            title="🌿 FFXIV Gathering Timers",
+            description=(f"Results for **{_clean(query)}**" if target else "Active and upcoming timed gathering nodes."),
+            color=0x16A34A, url=url,
+        )
+        lines = []
+        for _, _, node, state in ranked[:10]:
+            timing = f"active until <t:{state['event_ts']}:R>" if state["active"] else f"spawns <t:{state['event_ts']}:R>"
+            items = ", ".join((node.get("items") or [])[:3])
+            lines.append(f"• **{node.get('name')}** - {node.get('zone')} - {timing}\n  {node.get('job')} · {items}")
+        _add(embed, "Nodes", lines or ["No gathering nodes matched that search."])
+        if ranked:
+            state = ranked[0][3]
+            embed.set_footer(text=f"Eorzea time {state['et_hour']:02d}:{state['et_minute']:02d} - QuestLog FFXIV Data")
+        await ctx.reply(embed=embed)
+
+    async def _ff_ocean(self, ctx):
+        url = _absolute("/ffxiv/tools/ocean-fishing/")
+        status, payload = await self._request("api/ffxiv/ocean-fishing/schedule/", {"count": 4})
+        windows = payload.get("windows") or [] if status == 200 else []
+        embed = discord.Embed(title="🎣 FFXIV Ocean Fishing", description="Upcoming Ocean Fishing departures.", color=0x2563EB, url=url)
+        lines = []
+        for window in windows[:4]:
+            timing = "Active now" if window.get("is_active") else f"Departs <t:{window.get('departure_ts')}:R>"
+            fish = ", ".join(window.get("blue_fish") or []) or "No blue fish listed"
+            lines.append(f"• **{window.get('route')}** - {timing}\n  Blue fish: {fish}")
+        _add(embed, "Schedule", lines or ["The Ocean Fishing schedule is unavailable right now."])
+        embed.set_footer(text="QuestLog - FFXIV Ocean Fishing Data")
+        await ctx.reply(embed=embed)
+
+    async def _ff_world_status(self, ctx, query):
+        url = _absolute("/ffxiv/")
+        status, payload = await self._request("api/ffxiv/world-status/")
+        worlds = []
+        for region in payload.get("regions") or [] if status == 200 else []:
+            for dc in region.get("dcs") or []:
+                for world in dc.get("worlds") or []:
+                    worlds.append((region.get("name"), dc.get("name"), world))
+        target = _norm(query)
+        if target:
+            worlds = [row for row in worlds if target in {_norm(row[1]), _norm(row[2].get("name"))}]
+        embed = discord.Embed(title="🌐 FFXIV World Status", color=0x6D5ACF, url=url)
+        lines = [
+            f"• {'🟢' if world.get('online') else '🔴'} **{world.get('name')}** ({dc}) - {world.get('label') or _display_label(world.get('status'))}"
+            for _, dc, world in worlds[:20]
+        ]
+        _add(embed, "Worlds", lines or ["No world status matched that search."])
+        await ctx.reply(embed=embed)
+
+    async def _ff_housing(self, ctx, requested_world):
+        url = _absolute("/ffxiv/tools/housing/")
+        world_name = requested_world.strip()
+        if not world_name:
+            profile = _ffxiv_profile_for_discord(getattr(getattr(ctx, "author", None), "id", ""))
+            world_name = str(((profile or {}).get("character") or {}).get("world") or "")
+        if not world_name:
+            await ctx.reply(embed=discord.Embed(
+                title="🏠 FFXIV Housing Tracker",
+                description=f"Usage: `/ff housing <world>`\n\nLink a Lodestone character on [QuestLog]({url}) to use your character's world automatically.",
+                color=0x6D5ACF, url=url,
+            ))
+            return
+        status, payload = await self._request("api/ffxiv/housing/worlds/")
+        worlds = [world for dc in payload.get("datacenters") or [] for world in dc.get("worlds") or []] if status == 200 else []
+        world = next((item for item in worlds if _norm(item.get("name")) == _norm(world_name)), None)
+        if not world:
+            await ctx.reply(embed=discord.Embed(title="FFXIV Housing Tracker", description=f"QuestLog could not find the world `{_clean(world_name)}`.", color=ERROR_COLOR, url=url))
+            return
+        status, plots = await self._request(f"api/ffxiv/housing/plots/{world['id']}/")
+        if status != 200:
+            plots = {}
+        embed = discord.Embed(
+            title=f"🏠 {world['name']} Housing",
+            description=f"**{int(plots.get('total_open') or 0):,} open plots** currently tracked.",
+            color=0x6D5ACF, url=url,
+        )
+        districts = []
+        plot_districts = plots.get("districts") or []
+        for district in plot_districts:
+            districts.append(f"• **{district.get('name')}:** {district.get('open_count') or 0} open")
+        featured = [
+            f"• {plot['district_name']} - Ward {plot.get('ward')}, Plot {plot.get('plot')} "
+            f"({plot.get('size')}) - {int(plot.get('price') or 0):,} gil"
+            for plot in _featured_housing_plots(plot_districts)
+        ]
+        _add(embed, "Districts", districts)
+        _add(embed, "Available plots", featured)
+        cached = plots.get("cached_at")
+        if cached:
+            embed.set_footer(text=f"Updated {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(int(cached)))} - QuestLog Housing Data")
+        await ctx.reply(embed=embed)
+
+    async def _ff_market_board(self, ctx, argument):
+        url = _absolute("/ffxiv/tools/market-board/")
+        item_query, separator, requested_world = argument.rpartition("|")
+        if not separator:
+            item_query, requested_world = argument, ""
+        item_query, requested_world = item_query.strip(), requested_world.strip()
+        profile = _ffxiv_profile_for_discord(getattr(getattr(ctx, "author", None), "id", ""))
+        world = requested_world or str(((profile or {}).get("character") or {}).get("world") or "")
+        if not item_query or not world:
+            await ctx.reply(embed=discord.Embed(
+                title="💰 FFXIV Market Board",
+                description=f"Usage: `/ff mb <item> | <world>`\n\nA linked Lodestone character supplies the world automatically. [Open Market Board]({url})",
+                color=0x6D5ACF, url=url,
+            ))
+            return
+        status, search = await self._request("api/ffxiv/mb/search/", {"q": item_query})
+        results = search.get("results") or [] if status == 200 else []
+        item = next((row for row in results if _norm(row.get("name")) == _norm(item_query)), results[0] if results else None)
+        if not item:
+            await ctx.reply(embed=discord.Embed(title="FFXIV Market Board", description=f"No item matched `{_clean(item_query)}`.", color=ERROR_COLOR, url=url)); return
+        status, prices = await self._request("api/ffxiv/mb/prices/", {"item_id": item["id"], "world": world})
+        if status != 200 or prices.get("error"):
+            await ctx.reply(embed=discord.Embed(title=f"💰 {item['name']}", description=prices.get("error") or "Market data is unavailable right now.", color=ERROR_COLOR, url=url)); return
+        embed = discord.Embed(
+            title=f"💰 {item['name']} - {world}",
+            description=f"**NQ minimum:** {int(prices.get('min_price_nq') or 0):,} gil\n**HQ minimum:** {int(prices.get('min_price_hq') or 0):,} gil",
+            color=0x6D5ACF, url=url,
+        )
+        if item.get("icon"):
+            embed.set_thumbnail(url=item["icon"])
+        listings = [
+            f"• {int(row.get('price') or 0):,} gil × {row.get('quantity') or 1}{' - HQ' if row.get('hq') else ''} - {row.get('retainer') or 'Unknown retainer'}"
+            for row in (prices.get("listings") or [])[:8]
+        ]
+        _add(embed, "Lowest listings", listings or ["No active listings."])
+        _add(embed, "Market activity", [
+            f"**Units for sale:** {int(prices.get('units_for_sale') or 0):,}",
+            f"**NQ sale velocity:** {prices.get('sale_velocity_nq') or 0}/day",
+            f"**HQ sale velocity:** {prices.get('sale_velocity_hq') or 0}/day",
+        ])
+        embed.set_footer(text="QuestLog - Universalis Market Data")
+        await ctx.reply(embed=embed)
+
+    async def _ff_resets(self, ctx):
+        url = _absolute("/ffxiv/tools/resets/")
+        now = datetime.now(timezone.utc)
+        daily = now.replace(hour=15, minute=0, second=0, microsecond=0)
+        if daily <= now:
+            daily += timedelta(days=1)
+        days_until_tuesday = (1 - now.weekday()) % 7
+        weekly = (now + timedelta(days=days_until_tuesday)).replace(hour=8, minute=0, second=0, microsecond=0)
+        if weekly <= now:
+            weekly += timedelta(days=7)
+        embed = discord.Embed(
+            title="⏱️ FFXIV Reset Timers",
+            description=(
+                f"**Daily reset:** <t:{int(daily.timestamp())}:R>\n"
+                f"**Weekly reset:** <t:{int(weekly.timestamp())}:R>"
+            ),
+            color=0x6D5ACF, url=url,
+        )
+        _add(embed, "Tracked tasks", ["Daily roulettes and tribal quests", "Weekly raids and currencies", "Wondrous Tails and Custom Deliveries"])
+        embed.set_footer(text="Daily: 15:00 UTC - Weekly: Tuesday 08:00 UTC")
+        await ctx.reply(embed=embed)
+
+    async def ff(self, ctx, *, topic: str = ""):
+        head, _, argument = " ".join(str(topic or "").split()).partition(" ")
+        key = _norm(head).replace(" ", "")
+        if key in {"collection", "mounts", "minions", "achievements"}:
+            await self._ff_collection(ctx, key); return
+        if key in {"gathering", "gatheringtimes", "timers"}:
+            await self._ff_gathering(ctx, argument); return
+        if key in {"ocean", "oceanfishing"}:
+            await self._ff_ocean(ctx); return
+        if key in {"status", "world", "worlds"}:
+            await self._ff_world_status(ctx, argument); return
+        if key in {"housing", "housingtracker"}:
+            await self._ff_housing(ctx, argument); return
+        if key in {"mb", "market", "marketboard"}:
+            await self._ff_market_board(ctx, argument); return
+        if key in {"resets", "reset"}:
+            await self._ff_resets(ctx); return
+        if key in {"deepdungeon", "fieldops", "tripletriad", "tripletraid", "fc"}:
+            canonical = "tripletriad" if key == "tripletraid" else key
+            await self._ff_personal_tracker(ctx, canonical); return
+        normalized_topic = _norm(topic).replace(" ", "")
+        if normalized_topic in FF_TOOLS:
+            label, path = FF_TOOLS[normalized_topic]
+            url = _absolute(path)
+            await ctx.reply(embed=discord.Embed(title=f"FFXIV - {label}", description=f"[Open {label} on QuestLog]({url})", color=0x6D5ACF, url=url)); return
+        unique = []
+        interactive_paths = {
+            "/ffxiv/tools/collection/", "/ffxiv/tools/gathering/", "/ffxiv/tools/resets/",
+            "/ffxiv/tools/fc/", "/ffxiv/tools/deep-dungeon/", "/ffxiv/tools/field-ops/",
+            "/ffxiv/tools/market-board/", "/ffxiv/tools/ocean-fishing/",
+            "/ffxiv/tools/triple-triad/", "/ffxiv/tools/housing/",
+        }
+        for label, path in FF_TOOLS.values():
+            if path not in interactive_paths and (label, path) not in unique:
+                unique.append((label, path))
+        embed = discord.Embed(title="Final Fantasy XIV commands", description="Use `/ff <tool>` for live QuestLog data. Personal trackers use your connected Discord and Lodestone accounts.", color=0x6D5ACF, url=_absolute("/ffxiv/tools/"))
+        _add(embed, "Live data", ["`/ff gathering [item or zone]` - live gathering nodes", "`/ff ocean` - upcoming Ocean Fishing departures", "`/ff status [world or DC]` - world status", "`/ff housing [world]` - open housing plots", "`/ff mb <item> | [world]` - live market prices", "`/ff resets` - daily and weekly reset timers"])
+        _add(embed, "Personal progress", ["`/ff collection` - collection summary", "`/ff mounts` / `/ff minions` - synced collections", "`/ff deepdungeon` - personal bests", "`/ff fieldops` - zone progress", "`/ff tripletriad` - card progress", "`/ff fc` - tracked clears"])
+        _add(embed, "QuestLog pages", [f"`/ff {next(key for key, value in FF_TOOLS.items() if value == (label, path))}` - [{label}]({_absolute(path)})" for label, path in unique])
+        await ctx.reply(embed=embed)
