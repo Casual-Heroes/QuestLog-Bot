@@ -306,7 +306,7 @@ async def force_guild_sync(request):
                             role_data = {
                                 'id': str(role.id),
                                 'name': role.name,
-                                'color': role.color.value,
+                                'color': role.colors.primary.value,
                                 'position': role.position
                             }
                             roles_data.append(role_data)

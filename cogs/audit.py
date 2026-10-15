@@ -878,7 +878,7 @@ class AuditCog(commands.Cog):
             target_id=role.id,
             target_name=role.name,
             target_type="role",
-            details=f"Color: {role.color} | Hoisted: {role.hoist}",
+            details=f"Color: {role.colors.primary} | Hoisted: {role.hoist}",
             category="role"
         )
 

@@ -168,7 +168,7 @@ async def sync_all_guilds():
                     roles_data.append({
                         'id': str(role.id),
                         'name': role.name,
-                        'color': role.color.value,
+                        'color': role.colors.primary.value,
                         'position': role.position
                     })
 
@@ -269,7 +269,7 @@ async def on_guild_join(guild: discord.Guild):
             roles_data.append({
                 'id': str(role.id),
                 'name': role.name,
-                'color': role.color.value,
+                'color': role.colors.primary.value,
                 'position': role.position
             })
 

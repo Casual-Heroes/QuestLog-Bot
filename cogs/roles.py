@@ -626,7 +626,7 @@ class RolesCog(commands.Cog):
                 description=description or f"Template from {role.name}",
                 template_data=json.dumps({"roles": [{
                     "name": role.name,
-                    "color": role.color.value,
+                    "color": role.colors.primary.value,
                     "hoist": role.hoist,
                     "mentionable": role.mentionable,
                     "permissions": role.permissions.value,
